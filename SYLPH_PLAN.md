@@ -3,7 +3,23 @@
 **Planning baseline:** 2026-09-08  
 **Primary platform:** Linux desktop  
 **Product mode:** local-first, single-user, native Rust/GPUI  
-**Status:** architecture and design plan; implementation has not started from this plan yet
+**Status:** active implementation plan; the current shell is usable as a visual prototype while the editor kernel and document model are being consolidated
+
+## Implementation ledger
+
+- [x] Repository, existing Rust/GPUI editor, storage layer, and core document model inspected.
+- [x] Stitch reference HTML/PNG states inspected and Editorial Precision tokens adopted.
+- [x] `feature/editor-kernel` branch established with recoverable checkpoints.
+- [x] Unicode-safe grapheme/word navigation foundation added to the text input.
+- [x] Debounced local text autosave foundation added (750 ms after edits).
+- [x] A4-first startup defaults and the native Linux window shell added.
+- [x] Initial Stitch-inspired workspace chrome, page canvas, navigator, inspector, overlays, and dark-theme tokens added.
+- [x] Independent left navigator and right inspector visibility controls added.
+- [x] Native center-canvas scroll container and visible page-break flow/status feedback added.
+- [x] First toolbar/command-palette actions wired to editor commands (clipboard, headings, table, image, and page break).
+- [ ] Replace the temporary visual document scaffold with one structured document source of truth.
+- [ ] Make center-canvas scrolling, pagination, page breaks, and block insertion pass interaction tests.
+- [ ] Persist structured documents, assets, settings, and revisions atomically.
 
 ## 1. Product decision
 

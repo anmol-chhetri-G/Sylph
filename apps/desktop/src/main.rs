@@ -5,8 +5,8 @@ use gpui::{
     Application, Bounds, ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     KeystrokeEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Point, ScrollWheelEvent, ShapedLine, Style, Subscription, Task, TextRun, UTF16Selection,
-    WeakEntity, Window, WindowBounds, WindowOptions,
+    Point, ScrollWheelEvent, ShapedLine, Style, Subscription, Task, TextRun, TitlebarOptions,
+    UTF16Selection, WeakEntity, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 
 use sylph_core::{
@@ -14,6 +14,10 @@ use sylph_core::{
     previous_word_boundary, snap_to_char_boundary, utf16_offset_from_byte, utf8_range_from_utf16,
 };
 use sylph_storage::Storage;
+
+mod ui;
+
+const STARTER_DRAFT: &str = "During the third fiscal quarter of 2024, our global architectural synchronization reached full operational parity. Core infrastructural latency decreased across all cluster nodes, while overall **operating efficiency surged by 18.4%** through targeted caching protocols and asynchronous thread dispatching. All internal ledger settlements were verified against Consolidated Ledger #419, ensuring absolute reconciliation consistency across all distributed database shards and sovereign edge endpoints.\n\nPreliminary telemetry gathered from the Frankfurt and Singapore availability zones corroborates these findings. The expansion across northern distribution hubs yielded substantial margin recovery, notably mitigating the elevated network egress expenditures observed during previous quarters. Operational teams have prioritized uninterrupted pipeline integrity across all key enterprise accounts.\n\nKey Strategic Initiatives Undertaken:\n1. Expansion of edge processing facilities across EMEA, lowering end-user roundtrip latency below 24ms.\n2. Strategic migration to low-latency Rust core infrastructure to minimize garbage collection pauses in financial indexing engines.\n3. Consolidation of vendor tier contracts, yielding an annualized recurrent saving of approximately $4.6M.";
 
 actions!(
     text_input,
@@ -1525,6 +1529,8 @@ impl Focusable for TextInput {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .w_full()
+            .h_full()
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
@@ -1599,6 +1605,27 @@ enum EditingField {
     ParagraphSpacing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavigatorTab {
+    Outline,
+    Pages,
+    Assets,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectorMode {
+    Paragraph,
+    Image,
+    History,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkspaceOverlay {
+    None,
+    CommandPalette,
+    ModalShowcase,
+}
+
 struct SylphApp {
     editor: Entity<TextInput>,
     document: sylph_core::document::Document,
@@ -1616,6 +1643,13 @@ struct SylphApp {
     editing_field: EditingField,
     field_input: String,
     paragraph_spacing: f32,
+    navigator_tab: NavigatorTab,
+    inspector_mode: InspectorMode,
+    inspector_visible: bool,
+    overlay: WorkspaceOverlay,
+    markdown_mode: bool,
+    ruler_visible: bool,
+    zoom_percent: u16,
     _keystroke_subscription: Subscription,
 }
 
@@ -1668,6 +1702,15 @@ actions!(
         InsertPageBreak,
         SetPageSize,
         SetPageMargins,
+        OpenCommandPalette,
+        CloseOverlay,
+        OpenModalShowcase,
+        ShowParagraphInspector,
+        ShowImageInspector,
+        ShowVersionHistory,
+        ToggleInspector,
+        ToggleMarkdownMode,
+        ToggleRuler,
     ]
 );
 
@@ -2075,51 +2118,51 @@ impl SylphApp {
 
     fn bg_color(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x1e1e1e)
+            rgb(0x0b1220)
         } else {
-            rgb(0xfafafa)
+            rgb(0xf8f9ff)
         }
     }
     fn surface_color(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x252525)
+            rgb(0x111c2e)
         } else {
-            rgb(0xf5f5f5)
+            rgb(0xffffff)
         }
     }
     fn sidebar_color(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x2a2a2a)
+            rgb(0x111c2e)
         } else {
-            rgb(0xeeeeee)
+            rgb(0xeff4ff)
         }
     }
     fn border_color(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x444444)
+            rgb(0x1e293b)
         } else {
-            rgb(0xdddddd)
+            rgb(0xc4c5d7)
         }
     }
     fn editor_bg(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x1e1e1e)
+            rgb(0x0b1220)
         } else {
             rgb(0xffffff)
         }
     }
     fn hover_color(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x333333)
+            rgb(0x1e293b)
         } else {
-            rgb(0xe8e8e8)
+            rgb(0xe5eeff)
         }
     }
     fn active_doc_color(&self) -> gpui::Rgba {
         if self.dark_mode {
-            rgb(0x3a3a3a)
+            rgb(0x1e3b73)
         } else {
-            rgb(0xd0d0d0)
+            rgb(0xdce9ff)
         }
     }
 
@@ -2338,8 +2381,9 @@ impl SylphApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Insert a page break block at the current cursor position
-        // For now, append to the end of the document blocks
+        // The structured block is the source for pagination. The current visual
+        // scaffold appends it to the active report flow until block positions are
+        // unified with TextInput in the editor-kernel phase.
         self.document
             .push_block(sylph_core::document::Block::page_break());
         self.status_message = Some("Page break inserted".to_string());
@@ -2527,8 +2571,9 @@ impl Focusable for SylphApp {
     }
 }
 
-impl Render for SylphApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl SylphApp {
+    #[allow(dead_code)]
+    fn legacy_render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = self.bg_color();
         let surface = self.surface_color();
         let sidebar_bg = self.sidebar_color();
@@ -3787,15 +3832,24 @@ fn main() {
             KeyBinding::new("cmd-shift-z", Redo, None),
             KeyBinding::new("ctrl-z", Undo, None),
             KeyBinding::new("ctrl-y", Redo, None),
-            // ── Escape ──
-            KeyBinding::new("escape", CloseFindBar, None),
+            // ── Workspace chrome ──
+            KeyBinding::new("ctrl-k", OpenCommandPalette, None),
+            KeyBinding::new("cmd-k", OpenCommandPalette, None),
+            KeyBinding::new("escape", CloseOverlay, None),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1600.0), px(1280.0)), cx);
         let window = cx
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Quarterly Report — Sylph".into()),
+                        appears_transparent: true,
+                        ..Default::default()
+                    }),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_min_size: Some(size(px(1100.0), px(760.0))),
                     ..Default::default()
                 },
                 |_, cx| {
@@ -3804,13 +3858,21 @@ fn main() {
                         Storage::default()
                     });
                     let doc_id = storage.create_document("Untitled").unwrap_or(1);
-                    let saved = storage
+                    let mut saved = storage
                         .load_text(doc_id)
                         .unwrap_or(None)
                         .unwrap_or_default();
-                    let doc_title = storage
+                    let mut doc_title = storage
                         .get_title(doc_id)
                         .unwrap_or_else(|_| "Untitled".to_string());
+
+                    // The first launch opens on the same editorial proof used by the Stitch
+                    // references. It remains ordinary editable Markdown, so a user can replace
+                    // it immediately or start a blank document from New.
+                    if saved.trim().is_empty() && doc_title == "Untitled" {
+                        saved = STARTER_DRAFT.to_string();
+                        doc_title = "Quarterly Report".to_string();
+                    }
 
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
@@ -3829,7 +3891,7 @@ fn main() {
                         doc_id,
                         undo_stack: Vec::new(),
                         redo_stack: Vec::new(),
-                        show_line_numbers: true,
+                        show_line_numbers: false,
                         word_wrap: true,
                         save_task: None,
                     });
@@ -3876,6 +3938,13 @@ fn main() {
                             editing_field: EditingField::None,
                             field_input: String::new(),
                             paragraph_spacing: 8.0,
+                            navigator_tab: NavigatorTab::Outline,
+                            inspector_mode: InspectorMode::Paragraph,
+                            inspector_visible: true,
+                            overlay: WorkspaceOverlay::None,
+                            markdown_mode: false,
+                            ruler_visible: true,
+                            zoom_percent: 100,
                             _keystroke_subscription: keystroke_subscription,
                         }
                     })
