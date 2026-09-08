@@ -1143,6 +1143,7 @@ impl SylphApp {
             .child(ticks)
     }
 
+    #[allow(dead_code)]
     fn render_sample_table(&self) -> Div {
         let border = self.ui_border();
         let text = self.ui_text();
@@ -1231,6 +1232,7 @@ impl SylphApp {
         table
     }
 
+    #[allow(dead_code)]
     fn render_sample_figure(&self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let muted = self.ui_muted();
@@ -1289,6 +1291,7 @@ impl SylphApp {
         )
     }
 
+    #[allow(dead_code)]
     fn render_page(&mut self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let text = self.ui_text();
@@ -1435,6 +1438,7 @@ impl SylphApp {
         page_content
     }
 
+    #[allow(dead_code)]
     fn render_second_page(&self) -> Div {
         let text = self.ui_text();
         let muted = self.ui_muted();
@@ -1485,7 +1489,176 @@ impl SylphApp {
             )
     }
 
+    fn render_blank_editor_page(&mut self, cx: &mut Context<Self>) -> Div {
+        let border = self.ui_border();
+        let text = self.ui_text();
+        let muted = self.ui_muted();
+        let page = self.ui_page();
+        let editor = div()
+            .w_full()
+            .h(px(864.0))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .font_family(PROSE_FONT)
+            .text_size(px(14.0))
+            .line_height(px(24.0))
+            .text_color(text)
+            .child(self.editor.clone())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.commit_field_edit(cx);
+                }),
+            );
+
+        let mut page_content = div()
+            .w(px(816.0))
+            .min_h(px(1056.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .relative()
+            .p(px(96.0))
+            .bg(page)
+            .text_color(text)
+            .font_family(PROSE_FONT)
+            .shadow_md()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(96.0))
+                    .left(px(96.0))
+                    .right(px(96.0))
+                    .bottom(px(96.0))
+                    .border_1()
+                    .border_color(border),
+            )
+            .child(editor);
+
+        for block in &self.document.blocks {
+            match block {
+                sylph_core::document::Block::PageBreak => {}
+                sylph_core::document::Block::Image { data } => {
+                    page_content = page_content.child(
+                        div()
+                            .mt(px(16.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(img(data.path.clone()).max_w(px(480.0)).max_h(px(300.0)))
+                            .child(
+                                label(
+                                    data.caption.clone().unwrap_or_else(|| "Figure 1".into()),
+                                    muted,
+                                    11.0,
+                                )
+                                .italic(),
+                            ),
+                    );
+                }
+                sylph_core::document::Block::Table { data } => {
+                    let mut table = div().w_full().mt(px(16.0)).border_1().border_color(border);
+                    for row in &data.rows {
+                        let mut row_div = div().flex().border_b_1().border_color(border);
+                        for cell in row {
+                            row_div = row_div.child(
+                                label(cell.text(), text, 12.0)
+                                    .flex_1()
+                                    .px(px(8.0))
+                                    .py(px(6.0)),
+                            );
+                        }
+                        table = table.child(row_div);
+                    }
+                    page_content = page_content.child(table);
+                }
+                _ => {}
+            }
+        }
+
+        page_content
+    }
+
+    fn render_blank_page(&self, _page_number: usize) -> Div {
+        let border = self.ui_border();
+        div()
+            .w(px(816.0))
+            .h(px(1056.0))
+            .flex_shrink_0()
+            .relative()
+            .bg(self.ui_page())
+            .shadow_md()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(96.0))
+                    .left(px(96.0))
+                    .right(px(96.0))
+                    .bottom(px(96.0))
+                    .border_1()
+                    .border_color(border),
+            )
+    }
+
     fn center_canvas(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let page_count = 1 + self
+            .document
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, sylph_core::document::Block::PageBreak))
+            .count();
+        let page_gap_border = self.ui_border();
+        let page_gap_muted = self.ui_muted();
+        let page_gap = || {
+            div()
+                .w(px(816.0))
+                .h(px(96.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .text_color(page_gap_muted)
+                .child(div().flex_1().h(px(1.0)).bg(page_gap_border))
+                .child(
+                    label("↵  PAGE BREAK · NEW PAGE", page_gap_muted, 10.0).font_family(MONO_FONT),
+                )
+                .child(div().flex_1().h(px(1.0)).bg(page_gap_border))
+        };
+        let mut pages = div()
+            .w_full()
+            .flex_shrink_0()
+            .py(px(32.0))
+            .px(px(16.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(self.render_blank_editor_page(cx));
+        for page_number in 2..=page_count {
+            pages = pages
+                .child(page_gap())
+                .child(self.render_blank_page(page_number));
+        }
+        let canvas = div()
+            .id("document-canvas")
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .overflow_y_scroll()
+            .scrollbar_width(px(8.0))
+            .bg(self.ui_workspace())
+            .child(if self.ruler_visible {
+                self.ruler()
+            } else {
+                div().h(px(0.0))
+            })
+            .child(pages);
+        canvas
+    }
+
+    /*
+    fn legacy_center_canvas(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let has_page_break = self
             .document
             .blocks
@@ -1550,6 +1723,7 @@ impl SylphApp {
             .child(pages);
         canvas
     }
+    */
 
     fn paragraph_inspector(&self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();

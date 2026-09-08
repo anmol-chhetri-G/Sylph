@@ -17,8 +17,11 @@
 - [x] Independent left navigator and right inspector visibility controls added.
 - [x] Native center-canvas scroll container and visible page-break flow/status feedback added.
 - [x] First toolbar/command-palette actions wired to editor commands (clipboard, headings, table, image, and page break).
+- [x] New documents now open as blank A4 pages; `Ctrl+Enter`/page-break insertion creates blank following pages.
+- [x] Image insertion supports clipboard data and a Linux file picker, copying assets into `output/images/`.
 - [ ] Replace the temporary visual document scaffold with one structured document source of truth.
 - [ ] Make center-canvas scrolling, pagination, page breaks, and block insertion pass interaction tests.
+- [ ] Add immutable revision metadata, history loading, comparison, and restore behavior.
 - [ ] Persist structured documents, assets, settings, and revisions atomically.
 
 ## 1. Product decision

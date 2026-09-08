@@ -1,12 +1,13 @@
-use std::ops::Range;
+use std::{ops::Range, path::PathBuf};
 
 use gpui::{
     actions, anchored, div, fill, hsla, img, point, prelude::*, px, rgb, rgba, size, App,
-    Application, Bounds, ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    KeystrokeEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Point, ScrollWheelEvent, ShapedLine, Style, Subscription, Task, TextRun, TitlebarOptions,
-    UTF16Selection, WeakEntity, Window, WindowBounds, WindowDecorations, WindowOptions,
+    Application, AsyncApp, Bounds, ClipboardEntry, ClipboardItem, Context, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    KeyBinding, KeystrokeEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, PathPromptOptions, Point, ScrollWheelEvent, ShapedLine, Style,
+    Subscription, Task, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds,
+    WindowDecorations, WindowOptions,
 };
 
 use sylph_core::{
@@ -16,8 +17,6 @@ use sylph_core::{
 use sylph_storage::Storage;
 
 mod ui;
-
-const STARTER_DRAFT: &str = "During the third fiscal quarter of 2024, our global architectural synchronization reached full operational parity. Core infrastructural latency decreased across all cluster nodes, while overall **operating efficiency surged by 18.4%** through targeted caching protocols and asynchronous thread dispatching. All internal ledger settlements were verified against Consolidated Ledger #419, ensuring absolute reconciliation consistency across all distributed database shards and sovereign edge endpoints.\n\nPreliminary telemetry gathered from the Frankfurt and Singapore availability zones corroborates these findings. The expansion across northern distribution hubs yielded substantial margin recovery, notably mitigating the elevated network egress expenditures observed during previous quarters. Operational teams have prioritized uninterrupted pipeline integrity across all key enterprise accounts.\n\nKey Strategic Initiatives Undertaken:\n1. Expansion of edge processing facilities across EMEA, lowering end-user roundtrip latency below 24ms.\n2. Strategic migration to low-latency Rust core infrastructure to minimize garbage collection pauses in financial indexing engines.\n3. Consolidation of vendor tier contracts, yielding an annualized recurrent saving of approximately $4.6M.";
 
 actions!(
     text_input,
@@ -1650,6 +1649,7 @@ struct SylphApp {
     markdown_mode: bool,
     ruler_visible: bool,
     zoom_percent: u16,
+    image_picker_task: Option<Task<()>>,
     _keystroke_subscription: Subscription,
 }
 
@@ -2080,6 +2080,10 @@ impl SylphApp {
             editor.redo_stack.clear();
             cx.notify();
         });
+        // Structured blocks are not persisted with the legacy text-only storage yet.
+        // Reset the transient block list when changing documents so a page break,
+        // table, or image cannot leak into the next document.
+        self.document = sylph_core::document::Document::new();
         self.doc_title = doc_title;
     }
 
@@ -2208,11 +2212,94 @@ impl SylphApp {
         cx.notify();
     }
 
+    fn add_image_asset(&mut self, bytes: &[u8], extension: &str, cx: &mut Context<Self>) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let filename = format!("image_{}.{}", timestamp, extension);
+        let dir = "output/images";
+        let _ = std::fs::create_dir_all(dir);
+        let path = format!("{}/{}", dir, filename);
+        if std::fs::write(&path, bytes).is_ok() {
+            self.document
+                .push_block(sylph_core::document::Block::image(&path));
+            self.status_message = Some(format!("Image added: {}", filename));
+        } else {
+            self.status_message = Some("Could not store the selected image".to_string());
+        }
+        cx.notify();
+    }
+
+    fn add_image_file(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+        let allowed = [
+            "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff",
+        ];
+        if !allowed.contains(&extension.as_str()) {
+            self.status_message = Some(format!("Unsupported image type: .{}", extension));
+            cx.notify();
+            return;
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let filename = format!("image_{}.{}", timestamp, extension);
+        let dir = PathBuf::from("output/images");
+        let _ = std::fs::create_dir_all(&dir);
+        let destination = dir.join(&filename);
+        if std::fs::copy(&source, &destination).is_ok() {
+            let path = destination.to_string_lossy().into_owned();
+            self.document
+                .push_block(sylph_core::document::Block::image(&path));
+            self.status_message = Some(format!("Image added: {}", filename));
+        } else {
+            self.status_message = Some("Could not copy the selected image".to_string());
+        }
+        cx.notify();
+    }
+
+    fn open_image_picker(&mut self, cx: &mut Context<Self>) {
+        self.status_message = Some("Choose an image file…".to_string());
+        let options = PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Insert image".into()),
+        };
+        let receiver = cx.prompt_for_paths(options);
+        let task = cx.spawn(async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
+            match receiver.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        let _ = this.update(cx, |this, cx| this.add_image_file(path, cx));
+                    }
+                }
+                Ok(Err(error)) => {
+                    let message = format!("Image picker unavailable: {}", error);
+                    let _ = this.update(cx, |this, cx| {
+                        this.status_message = Some(message);
+                        cx.notify();
+                    });
+                }
+                _ => {}
+            }
+        });
+        self.image_picker_task = Some(task);
+        cx.notify();
+    }
+
     fn paste_image(&mut self, _: &PasteImage, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = cx.read_from_clipboard() {
             for entry in item.entries() {
                 if let ClipboardEntry::Image(image) = entry {
-                    let ext = match image.format {
+                    let extension = match image.format {
                         gpui::ImageFormat::Png => "png",
                         gpui::ImageFormat::Jpeg => "jpg",
                         gpui::ImageFormat::Webp => "webp",
@@ -2221,30 +2308,12 @@ impl SylphApp {
                         gpui::ImageFormat::Bmp => "bmp",
                         gpui::ImageFormat::Tiff => "tiff",
                     };
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let filename = format!("paste_{}.{}", timestamp, ext);
-                    let dir = "output/images";
-                    let _ = std::fs::create_dir_all(dir);
-                    let path = format!("{}/{}", dir, filename);
-                    if std::fs::write(&path, &image.bytes).is_ok() {
-                        self.document
-                            .push_block(sylph_core::document::Block::image(&path));
-                        self.status_message = Some(format!("Image pasted: {}", filename));
-                        cx.notify();
-                    }
+                    self.add_image_asset(&image.bytes, extension, cx);
                     return;
                 }
             }
-            // No image found, fall through to text paste
-            if let Some(text) = item.text() {
-                self.editor.update(cx, |editor, cx| {
-                    editor.replace_text_in_range(None, &text, cx);
-                });
-            }
         }
+        self.open_image_picker(cx);
     }
 
     fn bold_text(&mut self, _: &BoldText, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3858,26 +3927,18 @@ fn main() {
                         Storage::default()
                     });
                     let doc_id = storage.create_document("Untitled").unwrap_or(1);
-                    let mut saved = storage
+                    let saved = storage
                         .load_text(doc_id)
                         .unwrap_or(None)
                         .unwrap_or_default();
-                    let mut doc_title = storage
+                    let doc_title = storage
                         .get_title(doc_id)
                         .unwrap_or_else(|_| "Untitled".to_string());
-
-                    // The first launch opens on the same editorial proof used by the Stitch
-                    // references. It remains ordinary editable Markdown, so a user can replace
-                    // it immediately or start a blank document from New.
-                    if saved.trim().is_empty() && doc_title == "Untitled" {
-                        saved = STARTER_DRAFT.to_string();
-                        doc_title = "Quarterly Report".to_string();
-                    }
 
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
                         content: saved,
-                        placeholder: "Start typing here...".into(),
+                        placeholder: String::new(),
                         selected_range: 0..0,
                         selection_reversed: false,
                         last_layout: None,
@@ -3945,6 +4006,7 @@ fn main() {
                             markdown_mode: false,
                             ruler_visible: true,
                             zoom_percent: 100,
+                            image_picker_task: None,
                             _keystroke_subscription: keystroke_subscription,
                         }
                     })
