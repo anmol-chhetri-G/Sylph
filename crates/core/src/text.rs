@@ -83,6 +83,64 @@ pub fn next_grapheme_boundary(text: &str, byte_offset: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Move to the beginning of the word to the left of `byte_offset`.
+pub fn previous_word_boundary(text: &str, byte_offset: usize) -> usize {
+    let offset = snap_to_char_boundary(text, byte_offset);
+    if offset == 0 {
+        return 0;
+    }
+
+    let mut candidate = 0;
+    for (start, segment) in text.split_word_bound_indices() {
+        if start >= offset {
+            break;
+        }
+
+        let end = start + segment.len();
+        if segment.chars().all(char::is_whitespace) {
+            continue;
+        }
+
+        candidate = start;
+        if end >= offset {
+            return start;
+        }
+    }
+
+    candidate
+}
+
+/// Move to the beginning of the next word to the right of `byte_offset`.
+pub fn next_word_boundary(text: &str, byte_offset: usize) -> usize {
+    let offset = snap_to_char_boundary(text, byte_offset);
+    if offset >= text.len() {
+        return text.len();
+    }
+
+    let mut passed_word = false;
+    for (start, segment) in text.split_word_bound_indices() {
+        let end = start + segment.len();
+        if end <= offset {
+            continue;
+        }
+
+        if segment.chars().all(char::is_whitespace) {
+            continue;
+        }
+
+        if start <= offset && offset < end {
+            passed_word = true;
+            continue;
+        }
+
+        if passed_word || start >= offset {
+            return start;
+        }
+    }
+
+    text.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +190,18 @@ mod tests {
         assert_eq!(utf16_offset_from_byte(text, 999), text.len());
         assert_eq!(next_grapheme_boundary(text, 999), text.len());
         assert_eq!(previous_grapheme_boundary(text, 0), 0);
+    }
+
+    #[test]
+    fn navigates_words_without_splitting_unicode() {
+        let text = "alpha 🌍 café";
+        let emoji_start = text.find('🌍').unwrap();
+        let cafe_start = text.find("café").unwrap();
+
+        assert_eq!(previous_word_boundary(text, text.len()), cafe_start);
+        assert_eq!(previous_word_boundary(text, emoji_start), 0);
+        assert_eq!(next_word_boundary(text, 0), emoji_start);
+        assert_eq!(next_word_boundary(text, emoji_start), cafe_start);
+        assert_eq!(next_word_boundary(text, cafe_start), text.len());
     }
 }

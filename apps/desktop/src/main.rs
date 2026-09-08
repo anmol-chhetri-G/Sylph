@@ -10,8 +10,8 @@ use gpui::{
 };
 
 use sylph_core::{
-    byte_offset_from_utf16, next_grapheme_boundary, previous_grapheme_boundary,
-    snap_to_char_boundary, utf16_offset_from_byte, utf8_range_from_utf16,
+    byte_offset_from_utf16, next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
+    previous_word_boundary, snap_to_char_boundary, utf16_offset_from_byte, utf8_range_from_utf16,
 };
 use sylph_storage::Storage;
 
@@ -973,58 +973,11 @@ impl TextInput {
     }
 
     fn previous_word_boundary(&self, pos: usize) -> usize {
-        let bytes = self.content.as_bytes();
-        if pos == 0 {
-            return 0;
-        }
-
-        let mut i = pos - 1;
-
-        while i > 0 && bytes[i].is_ascii_whitespace() {
-            i -= 1;
-        }
-
-        let start_char_is_alphanumeric = bytes[i].is_ascii_alphanumeric();
-        while i > 0 {
-            let prev = bytes[i - 1];
-            if prev.is_ascii_whitespace() {
-                break;
-            }
-            if prev.is_ascii_alphanumeric() != start_char_is_alphanumeric {
-                break;
-            }
-            i -= 1;
-        }
-
-        i
+        previous_word_boundary(&self.content, pos)
     }
 
     fn next_word_boundary(&self, pos: usize) -> usize {
-        let bytes = self.content.as_bytes();
-        let len = bytes.len();
-        if pos >= len {
-            return len;
-        }
-
-        let mut i = pos;
-
-        let start_char_is_alphanumeric = bytes[i].is_ascii_alphanumeric();
-        while i < len {
-            let curr = bytes[i];
-            if curr.is_ascii_whitespace() {
-                break;
-            }
-            if curr.is_ascii_alphanumeric() != start_char_is_alphanumeric {
-                break;
-            }
-            i += 1;
-        }
-
-        while i < len && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-
-        i
+        next_word_boundary(&self.content, pos)
     }
 }
 
