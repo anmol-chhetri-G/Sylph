@@ -1,0 +1,11 @@
+[package]
+name = "sylph-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Sylph - A native document editor built with GPUI"
+
+[dependencies]
+sylph-core = { path = "../../crates/core" }
+sylph-storage = { path = "../../crates/storage" }
+sylph-py-bridge = { path = "../../crates/py_bridge" }
+gpui = { version = "0.2.2", features = ["wayland", "x11"] }

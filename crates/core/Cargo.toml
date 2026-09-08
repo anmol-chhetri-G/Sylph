@@ -1,0 +1,9 @@
+[package]
+name = "sylph-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core document model and logic for Sylph"
+
+[dependencies]
+yrs = "0.25"
+serde = { version = "1", features = ["derive"] }

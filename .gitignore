@@ -1,0 +1,42 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project output
+/output/
+*.docx
+*.pdf
+training_data/
+
+# Skills (agent configs, review before committing)
+skills/
+
+# Secrets and env
+.env
+*.key
+*.pem
+
+# Build artifacts
+*.so
+*.dylib
+*.dll

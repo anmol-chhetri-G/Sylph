@@ -1,0 +1,8 @@
+[package]
+name = "sylph-py-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 bridge for Python AI integration"
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["auto-initialize"] }

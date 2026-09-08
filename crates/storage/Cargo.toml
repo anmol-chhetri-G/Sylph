@@ -1,0 +1,8 @@
+[package]
+name = "sylph-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first SQLite storage for Sylph"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
