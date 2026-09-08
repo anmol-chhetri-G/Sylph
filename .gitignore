@@ -24,6 +24,7 @@ Thumbs.db
 
 # Project output
 /output/
+/crates/storage/output/
 *.docx
 *.pdf
 training_data/

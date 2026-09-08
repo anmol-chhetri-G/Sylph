@@ -371,22 +371,17 @@ impl Block {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum PageSize {
+    #[default]
     A4,
     Letter,
-}
-
-impl Default for PageSize {
-    fn default() -> Self {
-        PageSize::A4
-    }
 }
 
 impl PageSize {
     pub fn dimensions(&self) -> (f32, f32) {
         match self {
-            PageSize::A4 => (595.0, 842.0), // points (210mm x 297mm)
+            PageSize::A4 => (595.0, 842.0),     // points (210mm x 297mm)
             PageSize::Letter => (612.0, 792.0), // points (8.5" x 11")
         }
     }
@@ -410,7 +405,7 @@ pub struct PageMargins {
 impl Default for PageMargins {
     fn default() -> Self {
         Self {
-            top: 72.0,    // 1 inch = 72 points
+            top: 72.0, // 1 inch = 72 points
             bottom: 72.0,
             left: 72.0,
             right: 72.0,
@@ -513,7 +508,7 @@ impl Document {
 
     pub fn from_plaintext(text: &str) -> Self {
         let blocks = text
-            .lines()
+            .split('\n')
             .map(|line| Block::paragraph(line.to_string()))
             .collect();
         Self {
@@ -875,6 +870,20 @@ mod tests {
         assert_eq!(doc.blocks[0].plain_text(), "line1");
         assert_eq!(doc.blocks[1].plain_text(), "line2");
         assert_eq!(doc.blocks[2].plain_text(), "line3");
+    }
+
+    #[test]
+    fn test_document_from_empty_plaintext_keeps_editable_block() {
+        let doc = Document::from_plaintext("");
+        assert_eq!(doc.block_count(), 1);
+        assert!(doc.is_empty());
+    }
+
+    #[test]
+    fn test_document_from_plaintext_preserves_trailing_newline() {
+        let doc = Document::from_plaintext("line1\n");
+        assert_eq!(doc.block_count(), 2);
+        assert_eq!(doc.blocks[1].plain_text(), "");
     }
 
     #[test]

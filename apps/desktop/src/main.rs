@@ -9,7 +9,10 @@ use gpui::{
     WeakEntity, Window, WindowBounds, WindowOptions,
 };
 
-use sylph_core::CrdtDocument;
+use sylph_core::{
+    byte_offset_from_utf16, next_grapheme_boundary, previous_grapheme_boundary,
+    snap_to_char_boundary, utf16_offset_from_byte, utf8_range_from_utf16,
+};
 use sylph_storage::Storage;
 
 actions!(
@@ -63,7 +66,6 @@ struct TextInput {
     line_height: gpui::Pixels,
     scroll_offset_y: gpui::Pixels,
     is_selecting: bool,
-    crdt: CrdtDocument,
     storage: Storage,
     doc_id: i64,
     undo_stack: Vec<EditAction>,
@@ -280,7 +282,7 @@ impl TextInput {
     }
 
     fn vertically_navigate(&mut self, direction: i32, select: bool, cx: &mut Context<Self>) {
-        let cursor = self.cursor_offset();
+        let cursor = snap_to_char_boundary(&self.content, self.cursor_offset());
         let (line_idx, byte_col) = self.cursor_line_and_column(cursor);
         let new_line_idx = (line_idx as i32 + direction).max(0) as usize;
         // Use a line counting method that includes trailing empty lines
@@ -301,7 +303,7 @@ impl TextInput {
             0
         };
         let new_col = byte_col.min(target_line_len);
-        let new_offset = new_line_start + new_col;
+        let new_offset = snap_to_char_boundary(&self.content, new_line_start + new_col);
         if select {
             self.select_to(new_offset, cx);
         } else {
@@ -318,6 +320,7 @@ impl TextInput {
     }
 
     fn cursor_line_and_column(&self, offset: usize) -> (usize, usize) {
+        let offset = snap_to_char_boundary(&self.content, offset);
         let before = &self.content[..offset];
         // Count lines including trailing empty line (lines() doesn't count trailing \n)
         let line_count = before.matches('\n').count();
@@ -328,6 +331,7 @@ impl TextInput {
     }
 
     fn line_start(&self, offset: usize) -> usize {
+        let offset = snap_to_char_boundary(&self.content, offset);
         self.content[..offset]
             .rfind('\n')
             .map(|p| p + 1)
@@ -335,6 +339,7 @@ impl TextInput {
     }
 
     fn line_end(&self, offset: usize) -> usize {
+        let offset = snap_to_char_boundary(&self.content, offset);
         self.content[offset..]
             .find('\n')
             .map(|p| offset + p)
@@ -839,10 +844,10 @@ impl TextInput {
         let dedented_lines: Vec<String> = lines
             .iter()
             .map(|line| {
-                if line.starts_with(indent_str) {
-                    line[indent_str.len()..].to_string()
-                } else if line.starts_with('\t') {
-                    line[1..].to_string()
+                if let Some(stripped) = line.strip_prefix(indent_str) {
+                    stripped.to_string()
+                } else if let Some(stripped) = line.strip_prefix('\t') {
+                    stripped.to_string()
                 } else if line.starts_with(' ') {
                     let trim = line.len().min(4);
                     let spaces = line.chars().take_while(|c| *c == ' ').count().min(trim);
@@ -861,13 +866,12 @@ impl TextInput {
             .sum();
 
         self.replace_text_in_range(Some(range_start..end), &final_new_text, cx);
-        self.selected_range = start.saturating_sub(if start > range_start { 0 } else { 0 })
-            ..end.saturating_sub(removed);
+        self.selected_range = start..end.saturating_sub(removed);
         cx.notify();
     }
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.crdt.get_text();
+        let text = self.content.clone();
         let _ = std::fs::create_dir_all("output");
         let _ = std::fs::write("output/document.txt", &text);
         let _ = self.storage.save_text(self.doc_id, &text);
@@ -877,10 +881,12 @@ impl TextInput {
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.save_task.take();
         let doc_id = self.doc_id;
-        let text = self.crdt.get_text();
+        let text = self.content.clone();
         self.save_task = Some(cx.spawn(
             move |_this: WeakEntity<TextInput>, _cx: &mut gpui::AsyncApp| async move {
-                gpui::Timer::after(std::time::Duration::from_secs(2)).await;
+                // Keep writes out of the typing path while saving shortly after
+                // the user pauses. Dropping the previous task debounces bursts.
+                gpui::Timer::after(std::time::Duration::from_millis(750)).await;
                 let _ = std::fs::create_dir_all("output");
                 let _ = std::fs::write("output/document.txt", &text);
                 if let Ok(storage) = sylph_storage::Storage::open() {
@@ -891,7 +897,7 @@ impl TextInput {
     }
 
     fn summarize(&mut self, _: &Summarize, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.crdt.get_text();
+        let text = self.content.clone();
         let summary = sylph_py_bridge::summarize_text(&text);
         let _ = std::fs::create_dir_all("output");
         let _ = std::fs::write("output/summary.txt", &summary);
@@ -905,8 +911,8 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         let range = range_utf16.unwrap_or(self.selected_range.clone());
-        let start = range.start;
-        let end = range.end;
+        let start = snap_to_char_boundary(&self.content, range.start);
+        let end = snap_to_char_boundary(&self.content, range.end).max(start);
 
         let old_text = self.content[start..end].to_string();
         let selection_before = self.selected_range.clone();
@@ -923,26 +929,15 @@ impl TextInput {
     }
 
     fn apply_edit(&mut self, start: usize, end: usize, new_text: &str, cx: &mut Context<Self>) {
-        let start = start.min(self.content.len());
-        let end = end.min(self.content.len());
+        let start = snap_to_char_boundary(&self.content, start);
+        let end = snap_to_char_boundary(&self.content, end)
+            .max(start)
+            .min(self.content.len());
         if start > end {
             return;
         }
-        let len = (end - start) as u32;
 
-        if len > 0 {
-            self.crdt.delete(start as u32, len);
-        }
-        if !new_text.is_empty() {
-            self.crdt.insert(start as u32, new_text);
-        }
-
-        self.content = format!(
-            "{}{}{}",
-            &self.content[0..start],
-            new_text,
-            &self.content[end..]
-        );
+        self.content.replace_range(start..end, new_text);
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.schedule_save(cx);
         cx.notify();
@@ -970,28 +965,11 @@ impl TextInput {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
-        if offset == 0 {
-            return 0;
-        }
-        let bytes = self.content.as_bytes();
-        let mut i = offset - 1;
-        while i > 0 && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
-            i -= 1;
-        }
-        i
+        previous_grapheme_boundary(&self.content, offset)
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
-        let len = self.content.len();
-        if offset >= len {
-            return len;
-        }
-        let bytes = self.content.as_bytes();
-        let mut i = offset + 1;
-        while i < len && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
-            i += 1;
-        }
-        i
+        next_grapheme_boundary(&self.content, offset)
     }
 
     fn previous_word_boundary(&self, pos: usize) -> usize {
@@ -1058,7 +1036,8 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        Some(self.content[range_utf16].to_string())
+        let range = utf8_range_from_utf16(&self.content, range_utf16);
+        Some(self.content[range].to_string())
     }
 
     fn selected_text_range(
@@ -1068,7 +1047,8 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.selected_range.clone(),
+            range: utf16_offset_from_byte(&self.content, self.selected_range.start)
+                ..utf16_offset_from_byte(&self.content, self.selected_range.end),
             reversed: self.selection_reversed,
         })
     }
@@ -1090,7 +1070,8 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        TextInput::replace_text_in_range(self, range_utf16, new_text, cx);
+        let range = range_utf16.map(|range| utf8_range_from_utf16(&self.content, range));
+        TextInput::replace_text_in_range(self, range, new_text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1101,9 +1082,19 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        TextInput::replace_text_in_range(self, range_utf16, new_text, cx);
+        let replacement_range = range_utf16
+            .clone()
+            .map(|range| utf8_range_from_utf16(&self.content, range));
+        let replacement_start = replacement_range
+            .as_ref()
+            .map(|range| range.start)
+            .unwrap_or(self.selected_range.start);
+        TextInput::replace_text_in_range(self, replacement_range, new_text, cx);
         if let Some(sel) = new_selected_range_utf16 {
-            self.selected_range = sel;
+            let start = replacement_start + byte_offset_from_utf16(new_text, sel.start);
+            let end = replacement_start + byte_offset_from_utf16(new_text, sel.end);
+            self.selected_range = start..end;
+            self.selection_reversed = false;
         }
         cx.notify();
     }
@@ -1116,13 +1107,14 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<gpui::Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
+        let range = utf8_range_from_utf16(&self.content, range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range_utf16.start),
+                bounds.left() + last_layout.x_for_index(range.start),
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range_utf16.end),
+                bounds.left() + last_layout.x_for_index(range.end),
                 bounds.bottom(),
             ),
         ))
@@ -1136,7 +1128,9 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        last_layout.index_for_x(point.x - line_point.x)
+        last_layout
+            .index_for_x(point.x - line_point.x)
+            .map(|byte_offset| utf16_offset_from_byte(&self.content, byte_offset))
     }
 }
 
@@ -1727,7 +1721,7 @@ actions!(
 impl SylphApp {
     fn save_doc(&mut self, _: &SaveDoc, _window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
-            let text = editor.crdt.get_text();
+            let text = editor.content.clone();
             let _ = std::fs::create_dir_all("output");
             let _ = std::fs::write("output/document.txt", &text);
             let _ = editor.storage.save_text(editor.doc_id, &text);
@@ -2062,7 +2056,7 @@ impl SylphApp {
 
     fn save_current_document(&mut self, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, _cx| {
-            let text = editor.crdt.get_text();
+            let text = editor.content.clone();
             let _ = editor.storage.save_text(editor.doc_id, &text);
         });
     }
@@ -2085,10 +2079,6 @@ impl SylphApp {
         self.editor.update(cx, |editor, cx| {
             editor.doc_id = doc_id;
             editor.content = saved.clone();
-            editor.crdt = CrdtDocument::new();
-            if !saved.is_empty() {
-                editor.crdt.insert(0, &saved);
-            }
             editor.selected_range = 0..0;
             editor.undo_stack.clear();
             editor.redo_stack.clear();
@@ -2181,7 +2171,7 @@ impl SylphApp {
     }
 
     fn export_document(&mut self, to_pdf: bool, cx: &mut Context<Self>) {
-        let text = self.editor.read(cx).crdt.get_text();
+        let text = self.editor.read(cx).content.clone();
         let ext = if to_pdf { "pdf" } else { "docx" };
         let path = format!("output/{}.{}", self.doc_title.replace(' ', "_"), ext);
         let _ = std::fs::create_dir_all("output");
@@ -2327,7 +2317,7 @@ impl SylphApp {
             return;
         }
         let query = self.ai_panel.query.clone();
-        let doc_text = self.editor.read(cx).crdt.get_text();
+        let doc_text = self.editor.read(cx).content.clone();
         let response = sylph_py_bridge::chat_with_doc(&query, &doc_text);
         self.ai_panel.history.push((query, response.clone()));
         self.ai_panel.response = response;
@@ -2397,17 +2387,13 @@ impl SylphApp {
     ) {
         // Insert a page break block at the current cursor position
         // For now, append to the end of the document blocks
-        self.document.push_block(sylph_core::document::Block::page_break());
+        self.document
+            .push_block(sylph_core::document::Block::page_break());
         self.status_message = Some("Page break inserted".to_string());
         cx.notify();
     }
 
-    fn set_page_size(
-        &mut self,
-        _: &SetPageSize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_page_size(&mut self, _: &SetPageSize, _window: &mut Window, cx: &mut Context<Self>) {
         // Toggle between A4 and Letter
         self.document.set_page_size(match self.document.page_size {
             sylph_core::document::PageSize::A4 => sylph_core::document::PageSize::Letter,
@@ -3015,7 +3001,7 @@ impl Render for SylphApp {
                                             this.set_page_size(&SetPageSize, _window, cx);
                                         }),
                                     )
-                                    .child(format!("{}", self.document.page_size.name())),
+                                    .child(self.document.page_size.name().to_string()),
                             )
                             .child(
                                 div()
@@ -3873,11 +3859,6 @@ fn main() {
                         .get_title(doc_id)
                         .unwrap_or_else(|_| "Untitled".to_string());
 
-                    let crdt = CrdtDocument::new();
-                    if !saved.is_empty() {
-                        crdt.insert(0, &saved);
-                    }
-
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
                         content: saved,
@@ -3891,7 +3872,6 @@ fn main() {
                         line_height: px(20.0),
                         scroll_offset_y: px(0.0),
                         is_selecting: false,
-                        crdt,
                         storage,
                         doc_id,
                         undo_stack: Vec::new(),

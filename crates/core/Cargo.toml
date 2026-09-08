@@ -7,3 +7,4 @@ description = "Core document model and logic for Sylph"
 [dependencies]
 yrs = "0.25"
 serde = { version = "1", features = ["derive"] }
+unicode-segmentation = "1.12"
