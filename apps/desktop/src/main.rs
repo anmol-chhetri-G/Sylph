@@ -62,6 +62,7 @@ struct TextInput {
     placeholder: String,
     selected_range: Range<usize>,
     selection_reversed: bool,
+    preferred_column: Option<usize>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<gpui::Pixels>>,
     all_lines: Vec<ShapedLine>,
@@ -88,11 +89,16 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = snap_to_char_boundary(&self.content, offset.min(self.content.len()));
         self.selected_range = offset..offset;
+        self.selection_reversed = false;
+        self.preferred_column = None;
+        self.ensure_cursor_visible();
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = snap_to_char_boundary(&self.content, offset.min(self.content.len()));
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -102,14 +108,49 @@ impl TextInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.preferred_column = None;
+        self.ensure_cursor_visible();
         cx.notify();
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let (Some(bounds), Some(line_height)) = (self.last_bounds, Some(self.line_height)) else {
+            return;
+        };
+        if line_height <= px(0.0) || self.all_lines.is_empty() {
+            return;
+        }
+
+        let cursor = self.cursor_offset().min(self.content.len());
+        let mut line_index = 0;
+        for (index, offset) in self.line_char_offsets.iter().enumerate() {
+            if *offset > cursor {
+                break;
+            }
+            line_index = index;
+        }
+
+        let line_top = line_height * line_index as f32;
+        let line_bottom = line_top + line_height;
+        let visible_height = bounds.size.height;
+        let content_height = line_height * self.all_lines.len() as f32;
+        let max_scroll = (content_height - visible_height).max(px(0.0));
+        let mut scroll = self.scroll_offset_y;
+
+        if line_top < scroll {
+            scroll = line_top;
+        } else if line_bottom > scroll + visible_height {
+            scroll = line_bottom - visible_height;
+        }
+
+        self.scroll_offset_y = scroll.max(px(0.0)).min(max_scroll);
     }
 
     fn index_for_mouse_position(&self, position: Point<gpui::Pixels>) -> usize {
         if self.content.is_empty() {
             return 0;
         }
-        let (Some(bounds), _) = (self.last_bounds.as_ref(), self.last_layout.as_ref()) else {
+        let Some(bounds) = self.last_bounds.as_ref() else {
             return 0;
         };
         let line_height = if self.line_height > px(0.0) {
@@ -121,24 +162,35 @@ impl TextInput {
         if local_y < px(0.0) {
             return 0;
         }
-        let line_idx = (local_y / line_height).floor() as usize;
+        let line_idx = (local_y / line_height).floor().max(0.0) as usize;
         if line_idx >= self.all_lines.len() {
             return self.content.len();
         }
         let line = &self.all_lines[line_idx];
         let char_offset = self.line_char_offsets.get(line_idx).copied().unwrap_or(0);
-        let local_x = position.x - bounds.left();
+        let local_x = (position.x - bounds.left()).max(px(0.0));
         let local_idx = line.closest_index_for_x(local_x);
-        char_offset + local_idx
+        snap_to_char_boundary(
+            &self.content,
+            (char_offset + local_idx).min(self.content.len()),
+        )
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        let prev = self.previous_boundary(self.cursor_offset());
+        let prev = if self.selected_range.is_empty() {
+            self.previous_boundary(self.cursor_offset())
+        } else {
+            self.selected_range.start
+        };
         self.move_to(prev, cx);
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        let next = self.next_boundary(self.cursor_offset());
+        let next = if self.selected_range.is_empty() {
+            self.next_boundary(self.cursor_offset())
+        } else {
+            self.selected_range.end
+        };
         self.move_to(next, cx);
     }
 
@@ -176,7 +228,7 @@ impl TextInput {
 
         self.scroll_offset_y = (self.scroll_offset_y - scroll_delta).max(px(0.));
 
-        let old_pos = self.selected_range.start;
+        let old_pos = self.cursor_offset();
         let current_line_idx = self
             .line_char_offsets
             .iter()
@@ -205,8 +257,7 @@ impl TextInput {
         let new_col = old_col.min(target_line_len);
         let new_pos = self.line_char_offsets[new_line_idx] + new_col;
 
-        self.selected_range = new_pos..new_pos;
-        cx.notify();
+        self.move_to(new_pos, cx);
     }
 
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -227,7 +278,7 @@ impl TextInput {
         let max_scroll = (total_content_height - px(visible_height)).max(px(0.));
         self.scroll_offset_y = (self.scroll_offset_y + scroll_delta).min(max_scroll);
 
-        let old_pos = self.selected_range.start;
+        let old_pos = self.cursor_offset();
         let current_line_idx = self
             .line_char_offsets
             .iter()
@@ -254,8 +305,7 @@ impl TextInput {
         let new_col = old_col.min(target_line_len);
         let new_pos = self.line_char_offsets[new_line_idx] + new_col;
 
-        self.selected_range = new_pos..new_pos;
-        cx.notify();
+        self.move_to(new_pos, cx);
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
@@ -287,30 +337,27 @@ impl TextInput {
     fn vertically_navigate(&mut self, direction: i32, select: bool, cx: &mut Context<Self>) {
         let cursor = snap_to_char_boundary(&self.content, self.cursor_offset());
         let (line_idx, byte_col) = self.cursor_line_and_column(cursor);
+        let desired_column = self.preferred_column.unwrap_or(byte_col);
         let new_line_idx = (line_idx as i32 + direction).max(0) as usize;
         // Use a line counting method that includes trailing empty lines
         let line_count = self.content.matches('\n').count() + 1;
         if new_line_idx >= line_count {
             return;
         }
-        let lines: Vec<&str> = self.content.lines().collect();
-        // Handle trailing empty line case
-        let new_line_start = if new_line_idx < lines.len() {
-            lines[..new_line_idx].iter().map(|l| l.len() + 1).sum()
-        } else {
-            self.content.len()
-        };
-        let target_line_len = if new_line_idx < lines.len() {
-            lines[new_line_idx].len()
-        } else {
-            0
-        };
-        let new_col = byte_col.min(target_line_len);
+        let lines: Vec<&str> = self.content.split('\n').collect();
+        let new_line_start: usize = lines
+            .iter()
+            .take(new_line_idx)
+            .map(|line| line.len() + 1)
+            .sum();
+        let target_line_len = lines.get(new_line_idx).map(|line| line.len()).unwrap_or(0);
+        let new_col = desired_column.min(target_line_len);
         let new_offset = snap_to_char_boundary(&self.content, new_line_start + new_col);
         if select {
             self.select_to(new_offset, cx);
         } else {
             self.move_to(new_offset, cx);
+            self.preferred_column = Some(desired_column);
         }
     }
 
@@ -711,31 +758,35 @@ impl TextInput {
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        window.focus(&self.focus_handle);
+        let pos = self.index_for_mouse_position(event.position);
         if event.click_count == 2 {
-            let pos = self.index_for_mouse_position(event.position);
             let start = self.previous_word_boundary(pos);
             let end = self.next_word_boundary(pos);
             if start == end {
-                self.selected_range = pos..(pos + 1).min(self.content.len());
+                self.selected_range = pos..self.next_boundary(pos);
             } else {
                 self.selected_range = start..end;
             }
+            self.selection_reversed = false;
+            self.preferred_column = None;
             self.is_selecting = true;
             cx.notify();
             return;
         }
 
         if event.click_count == 3 {
-            let pos = self.index_for_mouse_position(event.position);
             let line_start = self.content[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let line_end = self.content[pos..]
                 .find('\n')
                 .map(|i| pos + i)
                 .unwrap_or(self.content.len());
             self.selected_range = line_start..line_end;
+            self.selection_reversed = false;
+            self.preferred_column = None;
             self.is_selecting = false;
             cx.notify();
             return;
@@ -743,9 +794,9 @@ impl TextInput {
 
         self.is_selecting = true;
         if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.select_to(pos, cx);
         } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx);
+            self.move_to(pos, cx);
         }
     }
 
@@ -942,6 +993,9 @@ impl TextInput {
 
         self.content.replace_range(start..end, new_text);
         self.selected_range = start + new_text.len()..start + new_text.len();
+        self.selection_reversed = false;
+        self.preferred_column = None;
+        self.ensure_cursor_visible();
         self.schedule_save(cx);
         cx.notify();
     }
@@ -1128,15 +1182,13 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let input = self.input.read(cx);
-        let line_count = if input.content.is_empty() {
-            1
-        } else {
-            input.content.matches('\n').count() + 1
-        };
+        let _input = self.input.read(cx);
         let mut style = Style::default();
         style.size.width = gpui::relative(1.).into();
-        style.size.height = (window.line_height() * line_count as f32).into();
+        // The custom element is the editor viewport, not a content-sized child.
+        // Keeping this at the parent's height makes scrolling and caret visibility
+        // use the actual visible area instead of a one-line/content-sized bounds.
+        style.size.height = gpui::relative(1.).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -1211,7 +1263,7 @@ impl Element for TextElement {
             let line_start = char_offset;
             let line_end = char_offset + line_text.len();
 
-            if word_wrap && available_width > px(0.0) {
+            if word_wrap && available_width > px(0.0) && !line_text.is_empty() {
                 let mut remaining = line_text.as_str();
                 let mut local_offset = 0usize;
 
@@ -2076,6 +2128,9 @@ impl SylphApp {
             editor.doc_id = doc_id;
             editor.content = saved.clone();
             editor.selected_range = 0..0;
+            editor.selection_reversed = false;
+            editor.preferred_column = None;
+            editor.scroll_offset_y = px(0.0);
             editor.undo_stack.clear();
             editor.redo_stack.clear();
             cx.notify();
@@ -3941,6 +3996,7 @@ fn main() {
                         placeholder: String::new(),
                         selected_range: 0..0,
                         selection_reversed: false,
+                        preferred_column: None,
                         last_layout: None,
                         last_bounds: None,
                         all_lines: Vec::new(),

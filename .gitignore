@@ -18,6 +18,11 @@ venv/
 *.swo
 *~
 
+# Research
+/research/
+./research/
+
+
 # OS
 .DS_Store
 Thumbs.db
@@ -31,6 +36,12 @@ training_data/
 
 # Skills (agent configs, review before committing)
 skills/
+
+# Agent/session files
+AGENT.md
+codex-session-*
+WORKFLOW.md
+SYLPH_PLAN.md
 
 # Secrets and env
 .env
