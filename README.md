@@ -2,6 +2,8 @@
 
 A native, local-first document editor for Linux. Focused on reports and long-form writing with a calm, editorial workstation feel.
 
+> **Note:** I am doing this as a hobby project and learning material as i go and can only give time to it in weekends.
+
 ## Features
 
 - A4 page-centered workspace
@@ -81,7 +83,7 @@ flowchart TD
 
     FILES --> OPEN[Open / Save As<br/>.docx · .md · .pdf]
     FILES --> RT1[DOCX round-trip]
-    FILES --> SYNC[CRDT sync]<br/>
+    FILES --> SYNC[CRDT sync]
     FILES --> REV[Revision history]
 
 ```
