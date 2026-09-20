@@ -419,6 +419,9 @@ pub struct Document {
     pub title: String,
     pub page_size: PageSize,
     pub page_margins: PageMargins,
+    pub line_spacing: f32,
+    pub body_font: String,
+    pub body_font_size: f32,
 }
 
 impl Document {
@@ -428,6 +431,9 @@ impl Document {
             title: "Untitled".to_string(),
             page_size: PageSize::A4,
             page_margins: PageMargins::default(),
+            line_spacing: 1.15,
+            body_font: "Noto Serif".to_string(),
+            body_font_size: 11.0,
         }
     }
 
@@ -437,6 +443,9 @@ impl Document {
             title: title.into(),
             page_size: PageSize::A4,
             page_margins: PageMargins::default(),
+            line_spacing: 1.15,
+            body_font: "Noto Serif".to_string(),
+            body_font_size: 11.0,
         }
     }
 
@@ -446,6 +455,18 @@ impl Document {
 
     pub fn set_margins(&mut self, margins: PageMargins) {
         self.page_margins = margins;
+    }
+
+    pub fn set_line_spacing(&mut self, spacing: f32) {
+        self.line_spacing = spacing.clamp(0.5, 3.0);
+    }
+
+    pub fn set_body_font(&mut self, font: impl Into<String>) {
+        self.body_font = font.into();
+    }
+
+    pub fn set_body_font_size(&mut self, size: f32) {
+        self.body_font_size = size.clamp(8.0, 72.0);
     }
 
     pub fn page_width(&self) -> f32 {
@@ -516,6 +537,9 @@ impl Document {
             title: "Untitled".to_string(),
             page_size: PageSize::A4,
             page_margins: PageMargins::default(),
+            line_spacing: 1.15,
+            body_font: "Noto Serif".to_string(),
+            body_font_size: 11.0,
         }
     }
 

@@ -1,9 +1,10 @@
 use crate::{
-    BoldText, CloseOverlay, ContextMenuCopy, ContextMenuCut, ContextMenuPaste, ExportPdf,
-    InsertPageBreak, InsertTable, InspectorMode, ItalicText, NavigatorTab, NewDocument,
-    OpenCommandPalette, OpenFindBar, OpenModalShowcase, PasteImage, Redo, SaveDoc, SetPageSize,
-    ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, SylphApp, ToggleDarkMode,
-    ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo, WorkspaceOverlay,
+    BoldText, CloseOverlay, ContextMenuCopy, ContextMenuCut, ContextMenuPaste, CycleBodyFont,
+    CycleHeading, ExportPdf, InsertPageBreak, InsertTable, InspectorMode, ItalicText,
+    NavigatorTab, NewDocument, OpenCommandPalette, OpenFindBar, OpenModalShowcase, PasteImage,
+    Redo, SaveDoc, SetPageMargins, SetPageSize, ShowImageInspector, ShowParagraphInspector,
+    ShowVersionHistory, SylphApp, ToggleDarkMode, ToggleInspector, ToggleMarkdownMode,
+    ToggleRuler, ToggleSidebar, Undo, WorkspaceOverlay,
 };
 use gpui::prelude::*;
 use gpui::{div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels, Rgba, Stateful, Window};
@@ -197,15 +198,32 @@ impl SylphApp {
         }
     }
 
-    /// Returns (width, height, margin) for the current page size.
-    /// A4: 210×297mm (793×1122px at 96dpi), 2in (192px) margins.
-    /// Letter: 816×1056px, 2in (192px) margins.
-    fn page_dims(&self) -> (Pixels, Pixels, Pixels) {
-        let margin = px(192.0);
+    /// Returns width in pixels for the current page size.
+    fn page_width(&self) -> Pixels {
         match self.document.page_size {
-            sylph_core::document::PageSize::A4 => (px(793.0), px(1122.0), margin),
-            sylph_core::document::PageSize::Letter => (px(816.0), px(1056.0), margin),
+            sylph_core::document::PageSize::A4 => px(793.0),
+            sylph_core::document::PageSize::Letter => px(816.0),
         }
+    }
+
+    /// Returns height in pixels for the current page size.
+    fn page_height(&self) -> Pixels {
+        match self.document.page_size {
+            sylph_core::document::PageSize::A4 => px(1122.0),
+            sylph_core::document::PageSize::Letter => px(1056.0),
+        }
+    }
+
+    /// Returns (top, right, bottom, left) margins in pixels, converting from points.
+    fn page_margins_px(&self) -> (Pixels, Pixels, Pixels, Pixels) {
+        let m = &self.document.page_margins;
+        let s = 96.0 / 72.0;
+        (
+            px(m.top * s),
+            px(m.right * s),
+            px(m.bottom * s),
+            px(m.left * s),
+        )
     }
 
     fn tool_button(&self, glyph: &str, active: bool) -> Div {
@@ -706,6 +724,14 @@ impl SylphApp {
             .border_b_1()
             .border_color(border);
 
+        let heading_label = match self.current_heading_level(cx) {
+            0 => "Normal",
+            1 => "Heading 1",
+            2 => "Heading 2",
+            3 => "Heading 3",
+            _ => "Normal",
+        };
+        let font_size_display = self.document.body_font_size.round() as i32;
         let controls = div()
             .flex()
             .items_center()
@@ -722,7 +748,15 @@ impl SylphApp {
                     .border_1()
                     .border_color(border)
                     .rounded(px(2.0))
-                    .child(label("Heading 1", text, 12.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(self.hover_color()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.cycle_heading(&CycleHeading, window, cx);
+                        }),
+                    )
+                    .child(label(heading_label, text, 12.0))
                     .child(icon("⌄", muted, 12.0)),
             )
             .child(
@@ -737,7 +771,15 @@ impl SylphApp {
                     .border_1()
                     .border_color(border)
                     .rounded(px(2.0))
-                    .child(label("Source Serif 4", text, 12.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(self.hover_color()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.cycle_body_font(&CycleBodyFont, window, cx);
+                        }),
+                    )
+                    .child(label(self.document.body_font.clone(), text, 12.0))
                     .child(icon("⌄", muted, 12.0)),
             )
             .child(
@@ -752,9 +794,33 @@ impl SylphApp {
                     .border_1()
                     .border_color(border)
                     .rounded(px(2.0))
-                    .child(icon("−", muted, 12.0))
-                    .child(label("11", text, 12.0))
-                    .child(icon("＋", muted, 12.0)),
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(self.hover_color()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.adjust_body_font_size(-1, window, cx);
+                                }),
+                            )
+                            .child(icon("−", muted, 12.0)),
+                    )
+                    .child(label(font_size_display.to_string(), text, 12.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(self.hover_color()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.adjust_body_font_size(1, window, cx);
+                                }),
+                            )
+                            .child(icon("＋", muted, 12.0)),
+                    ),
             )
             .child(divider(border));
 
@@ -793,7 +859,15 @@ impl SylphApp {
                 .border_1()
                 .border_color(border)
                 .rounded(px(2.0))
-                .child(label("1.15", text, 12.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(self.hover_color()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.cycle_line_spacing(window, cx);
+                    }),
+                )
+                .child(label(format!("{:.2}", self.document.line_spacing), text, 12.0))
                 .child(icon("↕", muted, 12.0)),
         );
 
@@ -1101,7 +1175,7 @@ impl SylphApp {
     fn ruler(&self) -> Div {
         let muted = self.ui_muted();
         let primary = self.ui_primary();
-        let (page_w, _, _) = self.page_dims();
+        let page_w = self.page_width();
         let mut ticks = div()
             .w(page_w)
             .h(px(20.0))
@@ -1506,16 +1580,20 @@ impl SylphApp {
         let text = self.ui_text();
         let muted = self.ui_muted();
         let page = self.ui_page();
-        let (page_w, page_h, margin) = self.page_dims();
-        let editor_h = page_h - margin * 2.0;
+        let page_w = self.page_width();
+        let page_h = self.page_height();
+        let (margin_top, margin_right, margin_bottom, margin_left) = self.page_margins_px();
+        let editor_h = page_h - margin_top - margin_bottom;
+        let text_size = px(self.document.body_font_size);
+        let line_height = text_size * self.document.line_spacing;
         let editor = div()
             .w_full()
             .h(editor_h)
             .flex_shrink_0()
             .overflow_hidden()
-            .font_family(PROSE_FONT)
-            .text_size(px(14.0))
-            .line_height(px(24.0))
+            .font_family(self.document.body_font.clone())
+            .text_size(text_size)
+            .line_height(line_height)
             .text_color(text)
             .child(self.editor.clone())
             .on_mouse_down(
@@ -1532,7 +1610,10 @@ impl SylphApp {
             .flex()
             .flex_col()
             .relative()
-            .p(margin)
+            .pt(margin_top)
+            .pb(margin_bottom)
+            .pl(margin_left)
+            .pr(margin_right)
             .bg(page)
             .text_color(text)
             .font_family(PROSE_FONT)
@@ -1540,10 +1621,10 @@ impl SylphApp {
             .child(
                 div()
                     .absolute()
-                    .top(margin)
-                    .left(margin)
-                    .right(margin)
-                    .bottom(margin)
+                    .top(margin_top)
+                    .left(margin_left)
+                    .right(margin_right)
+                    .bottom(margin_bottom)
                     .border_1()
                     .border_color(border),
             )
@@ -1596,7 +1677,7 @@ impl SylphApp {
                 .absolute()
                 .left(px(0.0))
                 .right(px(0.0))
-                .bottom(px(48.0))
+                .bottom(margin_bottom - px(24.0))
                 .flex()
                 .justify_center()
                 .font_family(MONO_FONT)
@@ -1611,7 +1692,9 @@ impl SylphApp {
     fn render_blank_page(&self, page_number: usize) -> Div {
         let border = self.ui_border();
         let muted = self.ui_muted();
-        let (page_w, page_h, margin) = self.page_dims();
+        let page_w = self.page_width();
+        let page_h = self.page_height();
+        let (margin_top, margin_right, margin_bottom, margin_left) = self.page_margins_px();
         div()
             .w(page_w)
             .h(page_h)
@@ -1622,19 +1705,19 @@ impl SylphApp {
             .child(
                 div()
                     .absolute()
-                    .top(margin)
-                    .left(margin)
-                    .right(margin)
-                    .bottom(margin)
+                    .top(margin_top)
+                    .left(margin_left)
+                    .right(margin_right)
+                    .bottom(margin_bottom)
                     .border_1()
                     .border_color(border),
             )
             .child(
                 div()
                     .absolute()
-                    .left(margin)
-                    .right(margin)
-                    .bottom(px(48.0))
+                    .left(margin_left)
+                    .right(margin_right)
+                    .bottom(margin_bottom - px(24.0))
                     .flex()
                     .justify_center()
                     .font_family(MONO_FONT)
@@ -1651,7 +1734,7 @@ impl SylphApp {
             .iter()
             .filter(|block| matches!(block, sylph_core::document::Block::PageBreak))
             .count();
-        let (page_w, _, _) = self.page_dims();
+        let page_w = self.page_width();
         let page_gap_border = self.ui_border();
         let page_gap_muted = self.ui_muted();
         let page_gap = || {
@@ -1800,6 +1883,7 @@ impl SylphApp {
                         ),
                 )
         };
+        let current_ls = self.document.line_spacing;
         let line_spacing = div()
             .flex()
             .items_center()
@@ -1810,18 +1894,28 @@ impl SylphApp {
                 ["1.0", "1.15", "1.5", "2.0"]
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| {
+                    .map(|(_i, v)| {
+                        let val: f32 = v.parse().unwrap_or(1.0);
+                        let is_active = (current_ls - val).abs() < 0.01;
                         div()
                             .flex_1()
                             .py(px(10.0))
                             .text_center()
                             .font_family(MONO_FONT)
                             .text_size(px(11.0))
-                            .text_color(if i == 1 { primary } else { muted })
-                            .when(i == 1, |s| {
+                            .text_color(if is_active { primary } else { muted })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(self.surface_color()))
+                            .when(is_active, |s| {
                                 s.bg(self.surface_color())
                                     .font_weight(gpui::FontWeight(700.0))
                             })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.set_line_spacing_value(val, window, cx);
+                                }),
+                            )
                             .child(*v)
                     }),
             );
@@ -1950,26 +2044,50 @@ impl SylphApp {
                             .child(self.compact_button("▣  Portrait", true))
                             .child(self.compact_button("▱  Landscape", false)),
                     )
-                    .child(label("Margins (ISO standard)", muted, 11.0).mt(px(12.0)))
-                    .child(
+                    .child(label("Margins", muted, 11.0).mt(px(12.0)))
+                    .child({
+                        let m = &self.document.page_margins;
+                        let cm = 2.54 / 72.0; // 1pt = 2.54/72 cm
+                        let mt = format!("Top     {:.2} cm", m.top * cm);
+                        let mb = format!("Bottom  {:.2} cm", m.bottom * cm);
+                        let ml = format!("Left    {:.2} cm", m.left * cm);
+                        let mr = format!("Right   {:.2} cm", m.right * cm);
                         div().grid().grid_cols(2).gap(px(4.0)).children(
-                            [
-                                "Top     2.54 cm",
-                                "Bottom  2.54 cm",
-                                "Left    2.54 cm",
-                                "Right   2.54 cm",
-                            ]
-                            .iter()
-                            .map(|v| {
-                                div()
-                                    .p(px(10.0))
-                                    .bg(panel)
-                                    .font_family(MONO_FONT)
-                                    .text_size(px(10.0))
-                                    .text_color(text)
-                                    .child(*v)
-                            }),
-                        ),
+                            [mt, mb, ml, mr]
+                                .iter()
+                                .map(|v| {
+                                    div()
+                                        .p(px(10.0))
+                                        .bg(panel)
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(10.0))
+                                        .text_color(text)
+                                        .child(v.clone())
+                                }),
+                        )
+                    })
+                    .child(label("Presets (click to cycle: Narrow → Normal → Wide)", muted, 10.0).mt(px(4.0)))
+                    .child(
+                        div()
+                            .h(px(44.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .bg(panel)
+                            .border_1()
+                            .border_color(border)
+                            .rounded(px(2.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(self.hover_color()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.set_page_margins(&SetPageMargins, window, cx);
+                                }),
+                            )
+                            .child(label("Cycle Margins", text, 11.0))
+                            .child(icon("⌄", muted, 12.0)),
                     )
                     .child(label("Pagination Style", muted, 11.0).mt(px(12.0)))
                     .child(
@@ -2459,7 +2577,13 @@ impl SylphApp {
                     .items_center()
                     .justify_between()
                     .bg(self.ui_panel_low())
-                    .child(label("A4 · 210 × 297 mm", text, 13.0))
+                    .child(label(
+                        format!("{} · {} × {} mm", self.document.page_size.name(),
+                            if self.document.page_size == sylph_core::document::PageSize::A4 { 210 } else { 216 },
+                            if self.document.page_size == sylph_core::document::PageSize::A4 { 297 } else { 279 }),
+                        text,
+                        13.0,
+                    ))
                     .child(icon("⌄", muted, 14.0)),
             )
             .child(label("Orientation", muted, 11.0).mt(px(16.0)))
@@ -2471,25 +2595,26 @@ impl SylphApp {
                     .child(self.compact_button("▱  Landscape", false)),
             )
             .child(label("Margins", muted, 11.0).mt(px(16.0)))
-            .child(
+            .child({
+                let m = &self.document.page_margins;
+                let cm = 2.54 / 72.0;
+                let mt = format!("Top     {:.2} cm", m.top * cm);
+                let mb = format!("Bottom  {:.2} cm", m.bottom * cm);
+                let ml = format!("Left    {:.2} cm", m.left * cm);
+                let mr = format!("Right   {:.2} cm", m.right * cm);
                 div().grid().grid_cols(2).gap(px(4.0)).children(
-                    [
-                        "Top     2.54 cm",
-                        "Bottom  2.54 cm",
-                        "Left    2.54 cm",
-                        "Right   2.54 cm",
-                    ]
-                    .iter()
-                    .map(|v| {
-                        div()
-                            .p(px(12.0))
-                            .bg(self.ui_panel_low())
-                            .font_family(MONO_FONT)
-                            .text_size(px(11.0))
-                            .child(*v)
-                    }),
-                ),
-            )
+                    [mt, mb, ml, mr]
+                        .iter()
+                        .map(|v| {
+                            div()
+                                .p(px(12.0))
+                                .bg(self.ui_panel_low())
+                                .font_family(MONO_FONT)
+                                .text_size(px(11.0))
+                                .child(v.clone())
+                        }),
+                )
+            })
             .child(
                 div()
                     .absolute()
@@ -2741,6 +2866,9 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::show_version_history))
             .on_action(cx.listener(Self::toggle_markdown_mode))
             .on_action(cx.listener(Self::toggle_ruler))
+            .on_action(cx.listener(Self::set_page_margins))
+            .on_action(cx.listener(Self::cycle_heading))
+            .on_action(cx.listener(Self::cycle_body_font))
             .child(self.title_bar(window))
             .child(self.menu_bar(cx))
             .child(self.utility_bar(cx))

@@ -1763,6 +1763,8 @@ actions!(
         ToggleInspector,
         ToggleMarkdownMode,
         ToggleRuler,
+        CycleHeading,
+        CycleBodyFont,
     ]
 );
 
@@ -2522,6 +2524,183 @@ impl SylphApp {
         });
         self.status_message = Some(format!("Page size: {}", self.document.page_size.name()));
         cx.notify();
+    }
+
+    fn set_page_margins(
+        &mut self,
+        _: &SetPageMargins,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Cycle through margin presets: Normal -> Narrow -> Wide -> Normal
+        let m = &self.document.page_margins;
+        let new_margins = if (m.top - 72.0).abs() < 1.0 {
+            // Normal (72pt = 1in) -> Narrow (36pt = 0.5in)
+            sylph_core::document::PageMargins {
+                top: 36.0,
+                bottom: 36.0,
+                left: 36.0,
+                right: 36.0,
+            }
+        } else if (m.top - 36.0).abs() < 1.0 {
+            // Narrow -> Wide (144pt = 2in)
+            sylph_core::document::PageMargins {
+                top: 144.0,
+                bottom: 144.0,
+                left: 144.0,
+                right: 144.0,
+            }
+        } else {
+            // Wide or other -> Normal
+            sylph_core::document::PageMargins::default()
+        };
+        self.document.set_margins(new_margins);
+        self.status_message = Some(format!(
+            "Margins: {:.1}pt",
+            self.document.page_margins.top
+        ));
+        cx.notify();
+    }
+
+    fn cycle_line_spacing(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.document.line_spacing;
+        let next = if (current - 1.0).abs() < 0.01 {
+            1.15
+        } else if (current - 1.15).abs() < 0.01 {
+            1.5
+        } else if (current - 1.5).abs() < 0.01 {
+            2.0
+        } else {
+            1.0
+        };
+        self.document.set_line_spacing(next);
+        self.status_message = Some(format!("Line spacing: {:.2}", next));
+        cx.notify();
+    }
+
+    fn set_line_spacing_value(
+        &mut self,
+        value: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.set_line_spacing(value);
+        self.status_message = Some(format!("Line spacing: {:.2}", value));
+        cx.notify();
+    }
+
+    fn cycle_heading(&mut self, _: &CycleHeading, _window: &mut Window, cx: &mut Context<Self>) {
+        let level = self.current_heading_level(cx);
+        let new_level = match level {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            _ => 0, // 3 or more -> Normal
+        };
+
+        // Modify the current line in the editor
+        self.editor.update(cx, |editor, cx| {
+            let cursor = editor.cursor_offset();
+            let content = editor.content.clone();
+            let line_start = content[..cursor]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let line_end = content[cursor..]
+                .find('\n')
+                .map(|p| cursor + p)
+                .unwrap_or(content.len());
+            let line = &content[line_start..line_end];
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+
+            // Strip existing heading prefix
+            let stripped = if trimmed.starts_with("### ") {
+                &trimmed[4..]
+            } else if trimmed.starts_with("## ") {
+                &trimmed[3..]
+            } else if trimmed.starts_with("# ") {
+                &trimmed[2..]
+            } else {
+                trimmed
+            };
+
+            let new_line = if new_level == 0 {
+                format!("{}{}", indent, stripped)
+            } else {
+                let prefix = "#".repeat(new_level as usize);
+                format!("{}{} {}", indent, prefix, stripped)
+            };
+
+            editor.selected_range = line_start..line_end;
+            editor.replace_text_in_range(Some(line_start..line_end), &new_line, cx);
+        });
+
+        let label = match new_level {
+            0 => "Normal",
+            1 => "Heading 1",
+            2 => "Heading 2",
+            3 => "Heading 3",
+            _ => "Normal",
+        };
+        self.status_message = Some(format!("Style: {}", label));
+        cx.notify();
+    }
+
+    fn cycle_body_font(&mut self, _: &CycleBodyFont, _window: &mut Window, cx: &mut Context<Self>) {
+        let fonts = [
+            "Noto Serif",
+            "Noto Sans",
+            "Liberation Serif",
+            "Liberation Sans",
+            "DejaVu Serif",
+            "DejaVu Sans",
+        ];
+        let current = &self.document.body_font;
+        let next_idx = fonts
+            .iter()
+            .position(|f| *f == current.as_str())
+            .map(|i| (i + 1) % fonts.len())
+            .unwrap_or(0);
+        self.document.set_body_font(fonts[next_idx]);
+        self.status_message = Some(format!("Font: {}", fonts[next_idx]));
+        cx.notify();
+    }
+
+    fn adjust_body_font_size(
+        &mut self,
+        delta: i8,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new_size = (self.document.body_font_size + delta as f32).clamp(8.0, 72.0);
+        self.document.set_body_font_size(new_size);
+        self.status_message = Some(format!("Font size: {}", new_size.round() as i32));
+        cx.notify();
+    }
+
+    fn current_heading_level(&self, cx: &mut Context<Self>) -> u8 {
+        let content = self.editor.read(cx).content.clone();
+        let cursor = self.editor.read(cx).cursor_offset();
+        let line_start = content[..cursor]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line_end = content[cursor..]
+            .find('\n')
+            .map(|p| cursor + p)
+            .unwrap_or(content.len());
+        let line = &content[line_start..line_end];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("### ") {
+            3
+        } else if trimmed.starts_with("## ") {
+            2
+        } else if trimmed.starts_with("# ") {
+            1
+        } else {
+            0
+        }
     }
 
     fn editing_cover_title(
