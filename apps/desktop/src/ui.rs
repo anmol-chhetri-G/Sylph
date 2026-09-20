@@ -6,7 +6,7 @@ use crate::{
     ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo, WorkspaceOverlay,
 };
 use gpui::prelude::*;
-use gpui::{div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Rgba, Stateful, Window};
+use gpui::{div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels, Rgba, Stateful, Window};
 
 const UI_FONT: &str = "Hanken Grotesk";
 const PROSE_FONT: &str = "EB Garamond";
@@ -197,6 +197,17 @@ impl SylphApp {
         }
     }
 
+    /// Returns (width, height, margin) for the current page size.
+    /// A4: 210×297mm (793×1122px at 96dpi), 2in (192px) margins.
+    /// Letter: 816×1056px, 2in (192px) margins.
+    fn page_dims(&self) -> (Pixels, Pixels, Pixels) {
+        let margin = px(192.0);
+        match self.document.page_size {
+            sylph_core::document::PageSize::A4 => (px(793.0), px(1122.0), margin),
+            sylph_core::document::PageSize::Letter => (px(816.0), px(1056.0), margin),
+        }
+    }
+
     fn tool_button(&self, glyph: &str, active: bool) -> Div {
         let text = self.ui_text();
         let primary = self.ui_primary();
@@ -248,7 +259,7 @@ impl SylphApp {
 
     fn title_bar(&self, _window: &mut Window) -> Div {
         let title = if self.doc_title.is_empty() {
-            "Quarterly Report — Sylph".to_string()
+            "Untitled — Sylph".to_string()
         } else {
             format!("{} — Sylph", self.doc_title)
         };
@@ -1090,8 +1101,9 @@ impl SylphApp {
     fn ruler(&self) -> Div {
         let muted = self.ui_muted();
         let primary = self.ui_primary();
+        let (page_w, _, _) = self.page_dims();
         let mut ticks = div()
-            .w(px(816.0))
+            .w(page_w)
             .h(px(20.0))
             .flex()
             .items_end()
@@ -1494,9 +1506,11 @@ impl SylphApp {
         let text = self.ui_text();
         let muted = self.ui_muted();
         let page = self.ui_page();
+        let (page_w, page_h, margin) = self.page_dims();
+        let editor_h = page_h - margin * 2.0;
         let editor = div()
             .w_full()
-            .h(px(864.0))
+            .h(editor_h)
             .flex_shrink_0()
             .overflow_hidden()
             .font_family(PROSE_FONT)
@@ -1512,13 +1526,13 @@ impl SylphApp {
             );
 
         let mut page_content = div()
-            .w(px(816.0))
-            .min_h(px(1056.0))
+            .w(page_w)
+            .min_h(page_h)
             .flex_shrink_0()
             .flex()
             .flex_col()
             .relative()
-            .p(px(96.0))
+            .p(margin)
             .bg(page)
             .text_color(text)
             .font_family(PROSE_FONT)
@@ -1526,10 +1540,10 @@ impl SylphApp {
             .child(
                 div()
                     .absolute()
-                    .top(px(96.0))
-                    .left(px(96.0))
-                    .right(px(96.0))
-                    .bottom(px(96.0))
+                    .top(margin)
+                    .left(margin)
+                    .right(margin)
+                    .bottom(margin)
                     .border_1()
                     .border_color(border),
             )
@@ -1576,14 +1590,31 @@ impl SylphApp {
             }
         }
 
+        // Page number footer — page 1
+        page_content = page_content.child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(48.0))
+                .flex()
+                .justify_center()
+                .font_family(MONO_FONT)
+                .text_size(px(10.0))
+                .text_color(muted)
+                .child("1"),
+        );
+
         page_content
     }
 
-    fn render_blank_page(&self, _page_number: usize) -> Div {
+    fn render_blank_page(&self, page_number: usize) -> Div {
         let border = self.ui_border();
+        let muted = self.ui_muted();
+        let (page_w, page_h, margin) = self.page_dims();
         div()
-            .w(px(816.0))
-            .h(px(1056.0))
+            .w(page_w)
+            .h(page_h)
             .flex_shrink_0()
             .relative()
             .bg(self.ui_page())
@@ -1591,12 +1622,25 @@ impl SylphApp {
             .child(
                 div()
                     .absolute()
-                    .top(px(96.0))
-                    .left(px(96.0))
-                    .right(px(96.0))
-                    .bottom(px(96.0))
+                    .top(margin)
+                    .left(margin)
+                    .right(margin)
+                    .bottom(margin)
                     .border_1()
                     .border_color(border),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(margin)
+                    .right(margin)
+                    .bottom(px(48.0))
+                    .flex()
+                    .justify_center()
+                    .font_family(MONO_FONT)
+                    .text_size(px(10.0))
+                    .text_color(muted)
+                    .child(page_number.to_string()),
             )
     }
 
@@ -1607,11 +1651,12 @@ impl SylphApp {
             .iter()
             .filter(|block| matches!(block, sylph_core::document::Block::PageBreak))
             .count();
+        let (page_w, _, _) = self.page_dims();
         let page_gap_border = self.ui_border();
         let page_gap_muted = self.ui_muted();
         let page_gap = || {
             div()
-                .w(px(816.0))
+                .w(page_w)
                 .h(px(96.0))
                 .flex_shrink_0()
                 .flex()

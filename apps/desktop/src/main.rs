@@ -3968,7 +3968,7 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Quarterly Report — Sylph".into()),
+                        title: Some("Untitled — Sylph".into()),
                         appears_transparent: true,
                         ..Default::default()
                     }),
@@ -3993,7 +3993,7 @@ fn main() {
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
                         content: saved,
-                        placeholder: String::new(),
+                        placeholder: "Start typing to begin…  ·  Ctrl+K for commands".into(),
                         selected_range: 0..0,
                         selection_reversed: false,
                         preferred_column: None,

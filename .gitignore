@@ -1,7 +1,7 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock intentionally kept — this is an application workspace
 
 # Python
 __pycache__/
@@ -20,7 +20,6 @@ venv/
 
 # Research
 /research/
-./research/
 
 
 # OS
@@ -37,7 +36,7 @@ training_data/
 # Skills (agent configs, review before committing)
 skills/
 
-# Agent/session files
+# Agent/session files (untracked, not committed)
 AGENT.md
 codex-session-*
 WORKFLOW.md
