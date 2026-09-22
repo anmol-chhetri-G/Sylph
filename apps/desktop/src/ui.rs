@@ -1006,90 +1006,70 @@ impl SylphApp {
             NavigatorTab::Outline => {
                 body = body
                     .child(label("DOCUMENT MAP", muted, 11.0).font_weight(gpui::FontWeight(600.0)));
-                body = body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py(px(8.0))
-                        .child(
-                            label("1  Introduction", text, 12.0)
-                                .font_weight(gpui::FontWeight(600.0)),
-                        )
-                        .child(label("2", muted, 10.0)),
-                );
-                for item in [("1.1 Background", "p.1"), ("1.2 Scope & Target", "p.1")] {
-                    body = body.child(
-                        div()
-                            .pl(px(24.0))
-                            .py(px(5.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_color(muted)
-                            .hover(|s| s.bg(hover).text_color(text))
-                            .child(label(item.0, muted, 12.0))
-                            .child(label(item.1, self.ui_faint(), 10.0).font_family(MONO_FONT)),
-                    );
+                // Real headings parsed from editor content; no more hardcoded demo items.
+                let content = self.editor.read(cx).content.clone();
+                let mut headings: Vec<(u8, String)> = Vec::new();
+                for line in content.lines() {
+                    let t = line.trim_start();
+                    let n = t.chars().take_while(|c| *c == '#').count();
+                    if (1..=6).contains(&n) && t[n..].starts_with(' ') {
+                        headings.push((n as u8, t[n + 1..].trim().to_string()));
+                    }
                 }
-                body = body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py(px(8.0))
-                        .child(
-                            label("2  Performance Analysis", text, 12.0)
-                                .font_weight(gpui::FontWeight(600.0)),
-                        )
-                        .child(label("2", muted, 10.0)),
-                );
-                body = body.child(
-                    div()
-                        .relative()
-                        .pl(px(24.0))
-                        .py(px(7.0))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .bg(self.ui_panel_high())
-                        .text_color(primary)
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(3.0))
-                                .bg(primary),
-                        )
-                        .child(
-                            label("2.1 Revenue Trajectory", primary, 12.0)
-                                .font_weight(gpui::FontWeight(600.0)),
-                        )
-                        .child(label("p.1", primary, 10.0).font_family(MONO_FONT)),
-                );
-                body = body.child(
-                    div()
-                        .pl(px(24.0))
-                        .py(px(7.0))
-                        .text_color(muted)
-                        .hover(|s| s.bg(hover).text_color(text))
-                        .child(label("2.2 Operational Costs", muted, 12.0)),
-                );
-                for title in ["3  Conclusion & Roadmap", "4  Regulatory Addenda"] {
+                // Also include structured heading blocks from the rich document.
+                for b in &self.document.blocks {
+                    if let sylph_core::document::Block::Heading { level, runs } = b {
+                        let s: String =
+                            runs.iter().map(|r| r.text.as_str()).collect();
+                        if !s.trim().is_empty() {
+                            headings.push((*level, s));
+                        }
+                    }
+                }
+                if headings.is_empty() {
                     body = body.child(
-                        div()
-                            .py(px(8.0))
-                            .text_color(text)
-                            .hover(|s| s.bg(hover))
-                            .child(label(title, text, 12.0).font_weight(gpui::FontWeight(600.0))),
+                        div().py(px(8.0)).child(label(
+                            "Under dev — no headings yet. Use # to add some.",
+                            muted,
+                            12.0,
+                        )),
                     );
+                } else {
+                    for (level, title) in headings.iter().take(30) {
+                        let indent = px((*level as f32 - 1.0).clamp(0.0, 4.0) * 12.0);
+                        body = body.child(
+                            div()
+                                .pl(indent)
+                                .py(px(5.0))
+                                .text_color(muted)
+                                .hover(|s| s.bg(hover).text_color(text))
+                                .child(label(title.clone(), muted, 12.0)),
+                        );
+                    }
                 }
             }
             NavigatorTab::Pages => {
+                // Real page count = explicit PageBreak blocks + 1. Thumbnails not built.
+                let breaks = self
+                    .document
+                    .blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, sylph_core::document::Block::PageBreak)
+                    })
+                    .count();
+                let count = breaks + 1;
                 body = body
-                    .child(label("THUMBNAILS", muted, 11.0).font_weight(gpui::FontWeight(600.0)))
+                    .child(label(
+                        format!("PAGES ({})", count),
+                        muted,
+                        11.0,
+                    ).font_weight(gpui::FontWeight(600.0)))
+                    .child(div().py(px(6.0)).child(label(
+                        "Under dev — live thumbnails not built yet.",
+                        muted,
+                        11.0,
+                    )))
                     .child(
                         div()
                             .mt(px(10.0))
@@ -1117,17 +1097,46 @@ impl SylphApp {
             }
             NavigatorTab::Assets => {
                 body = body
-                    .child(label("ASSETS", muted, 11.0).font_weight(gpui::FontWeight(600.0)))
-                    .child(
-                        div()
-                            .mt(px(8.0))
-                            .p(px(10.0))
-                            .bg(self.surface_color())
-                            .border_1()
-                            .border_color(border)
-                            .child(label("▧  Telemetry Chart", text, 12.0))
-                            .child(label("Figure 1 · linked", muted, 10.0)),
-                    );
+                    .child(label("ASSETS", muted, 11.0).font_weight(gpui::FontWeight(600.0)));
+                let mut images: Vec<String> = Vec::new();
+                let mut tables = 0usize;
+                for b in &self.document.blocks {
+                    match b {
+                        sylph_core::document::Block::Image { data } => {
+                            images.push(data.path.clone())
+                        }
+                        sylph_core::document::Block::Table { .. } => tables += 1,
+                        _ => {}
+                    }
+                }
+                if images.is_empty() && tables == 0 {
+                    body = body.child(div().py(px(8.0)).child(label(
+                        "Under dev — no assets yet. Insert an image or table.",
+                        muted,
+                        12.0,
+                    )));
+                } else {
+                    for path in images.iter().take(20) {
+                        let name = path.rsplit('/').next().unwrap_or(path.as_str());
+                        body = body.child(
+                            div()
+                                .mt(px(8.0))
+                                .p(px(10.0))
+                                .bg(self.surface_color())
+                                .border_1()
+                                .border_color(border)
+                                .child(label(format!("▧  {}", name), text, 12.0))
+                                .child(label(path.clone(), muted, 10.0)),
+                        );
+                    }
+                    if tables > 0 {
+                        body = body.child(div().py(px(6.0)).child(label(
+                            format!("{} table(s) in document", tables),
+                            muted,
+                            11.0,
+                        )));
+                    }
+                }
             }
         }
 
@@ -1136,21 +1145,12 @@ impl SylphApp {
             .bg(self.ui_panel_low())
             .border_t_1()
             .border_color(border)
-            .child(label("RECENT GALLEY FILES", muted, 11.0).font_weight(gpui::FontWeight(600.0)))
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .p(px(8.0))
-                    .bg(self.surface_color())
-                    .child(label("▣  Q3 Financial Review.sylph", text, 12.0))
-                    .child(label("Modified 2h ago · 4.2 MB", muted, 10.0)),
-            )
-            .child(
-                div()
-                    .p(px(8.0))
-                    .child(label("▤  Architecture RFC-04.md", text, 12.0))
-                    .child(label("Modified yesterday · 312 KB", muted, 10.0)),
-            );
+            .child(label("RECENT FILES", muted, 11.0).font_weight(gpui::FontWeight(600.0)))
+            .child(div().py(px(6.0)).child(label(
+                "Under dev — recent-file tracking not built yet.",
+                muted,
+                11.0,
+            )));
 
         div()
             .w(px(260.0))
