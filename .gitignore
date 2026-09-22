@@ -18,8 +18,9 @@ venv/
 *.swo
 *~
 
-# Research
-/research/
+# Research (scratch notes stay local; template specs are versioned)
+research/*
+!research/templates/
 
 
 # OS
