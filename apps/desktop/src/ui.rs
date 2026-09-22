@@ -198,20 +198,14 @@ impl SylphApp {
         }
     }
 
-    /// Returns width in pixels for the current page size.
+    /// Returns width in pixels for the current page size + orientation.
     fn page_width(&self) -> Pixels {
-        match self.document.page_size {
-            sylph_core::document::PageSize::A4 => px(793.0),
-            sylph_core::document::PageSize::Letter => px(816.0),
-        }
+        px(self.document.page_width() * 96.0 / 72.0)
     }
 
-    /// Returns height in pixels for the current page size.
+    /// Returns height in pixels for the current page size + orientation.
     fn page_height(&self) -> Pixels {
-        match self.document.page_size {
-            sylph_core::document::PageSize::A4 => px(1122.0),
-            sylph_core::document::PageSize::Letter => px(1056.0),
-        }
+        px(self.document.page_height() * 96.0 / 72.0)
     }
 
     /// Returns (top, right, bottom, left) margins in pixels, converting from points.

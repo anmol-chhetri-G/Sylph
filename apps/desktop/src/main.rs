@@ -1765,6 +1765,7 @@ actions!(
         ToggleRuler,
         CycleHeading,
         CycleBodyFont,
+        SetOrientation,
     ]
 );
 

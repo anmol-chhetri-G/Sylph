@@ -422,6 +422,7 @@ pub struct Document {
     pub line_spacing: f32,
     pub body_font: String,
     pub body_font_size: f32,
+    pub landscape: bool,
 }
 
 impl Document {
@@ -434,6 +435,7 @@ impl Document {
             line_spacing: 1.15,
             body_font: "Noto Serif".to_string(),
             body_font_size: 11.0,
+            landscape: false,
         }
     }
 
@@ -446,6 +448,7 @@ impl Document {
             line_spacing: 1.15,
             body_font: "Noto Serif".to_string(),
             body_font_size: 11.0,
+            landscape: false,
         }
     }
 
@@ -469,12 +472,18 @@ impl Document {
         self.body_font_size = size.clamp(8.0, 72.0);
     }
 
+    pub fn set_landscape(&mut self, landscape: bool) {
+        self.landscape = landscape;
+    }
+
     pub fn page_width(&self) -> f32 {
-        self.page_size.dimensions().0
+        let (w, h) = self.page_size.dimensions();
+        if self.landscape { h } else { w }
     }
 
     pub fn page_height(&self) -> f32 {
-        self.page_size.dimensions().1
+        let (w, h) = self.page_size.dimensions();
+        if self.landscape { w } else { h }
     }
 
     pub fn content_width(&self) -> f32 {
@@ -540,6 +549,7 @@ impl Document {
             line_spacing: 1.15,
             body_font: "Noto Serif".to_string(),
             body_font_size: 11.0,
+            landscape: false,
         }
     }
 
