@@ -419,69 +419,14 @@ impl TextInput {
         let color_link = hsla(210.0 / 360.0, 0.8, 0.45, 1.0);
         let color_list = hsla(30.0 / 360.0, 0.7, 0.45, 1.0);
         let color_quote = hsla(0.0, 0.0, 0.5, 1.0);
+        let color_strike = hsla(0.0, 0.6, 0.45, 1.0);
 
-        if trimmed.starts_with("# ") {
-            runs.push(TextRun {
-                len: 2,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            runs.push(TextRun {
-                len: trimmed.len() - 2,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
-        if trimmed.starts_with("## ") {
-            runs.push(TextRun {
-                len: 3,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            runs.push(TextRun {
-                len: trimmed.len() - 3,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
-        if trimmed.starts_with("### ") {
-            runs.push(TextRun {
-                len: 4,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            runs.push(TextRun {
-                len: trimmed.len() - 4,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
-        if trimmed.starts_with("#### ")
-            || trimmed.starts_with("##### ")
-            || trimmed.starts_with("###### ")
+        // Headings # .. ###### (single consolidated check, longest first).
+        let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hash_count)
+            && trimmed[hash_count..].starts_with(' ')
         {
-            let prefix_len = trimmed.find(' ').unwrap_or(0) + 1;
+            let prefix_len = hash_count + 1;
             runs.push(TextRun {
                 len: prefix_len,
                 font: font.clone(),
@@ -521,7 +466,10 @@ impl TextInput {
             return runs;
         }
 
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ")
+        {
             runs.push(TextRun {
                 len: 2,
                 font: font.clone(),
@@ -532,6 +480,73 @@ impl TextInput {
             });
             runs.push(TextRun {
                 len: trimmed.len() - 2,
+                font: font.clone(),
+                color: base_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            return runs;
+        }
+
+        // Ordered list: `1. `, `12. `, etc.
+        {
+            let mut digits = 0usize;
+            for c in trimmed.chars() {
+                if c.is_ascii_digit() {
+                    digits += 1;
+                } else {
+                    break;
+                }
+            }
+            if digits > 0
+                && trimmed[digits..].starts_with(". ")
+            {
+                let prefix_len = digits + 2;
+                runs.push(TextRun {
+                    len: prefix_len,
+                    font: font.clone(),
+                    color: color_list,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+                runs.push(TextRun {
+                    len: trimmed.len() - prefix_len,
+                    font: font.clone(),
+                    color: base_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+                return runs;
+            }
+        }
+
+        // Horizontal rule: ---, ***, ___ (3+ of same marker).
+        {
+            let s = trimmed.trim();
+            if s.len() >= 3
+                && (s.chars().all(|c| c == '-')
+                    || s.chars().all(|c| c == '*')
+                    || s.chars().all(|c| c == '_'))
+            {
+                runs.push(TextRun {
+                    len: trimmed.len(),
+                    font: font.clone(),
+                    color: color_list,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+                return runs;
+            }
+        }
+
+        // Table row: | a | b |
+        if trimmed.starts_with('|') {
+            runs.push(TextRun {
+                len: trimmed.len(),
                 font: font.clone(),
                 color: base_color,
                 background_color: None,
@@ -558,13 +573,16 @@ impl TextInput {
         let mut in_bold = false;
         let mut in_italic = false;
         let mut in_code = false;
+        let mut in_strike = false;
 
-        while let Some((i, ch)) = chars.next() {
-            if ch == '`' {
-                let seg_end = i;
-                if seg_end > seg_start {
+        // Flush plain segment up to byte index `end` with current style color.
+        macro_rules! flush {
+            ($end:expr) => {
+                if $end > seg_start {
                     let color = if in_code {
                         color_code
+                    } else if in_strike {
+                        color_strike
                     } else if in_bold {
                         color_bold
                     } else if in_italic {
@@ -573,7 +591,7 @@ impl TextInput {
                         base_color
                     };
                     runs.push(TextRun {
-                        len: seg_end - seg_start,
+                        len: $end - seg_start,
                         font: font.clone(),
                         color,
                         background_color: None,
@@ -581,6 +599,12 @@ impl TextInput {
                         strikethrough: None,
                     });
                 }
+            };
+        }
+
+        while let Some((i, ch)) = chars.next() {
+            if ch == '`' {
+                flush!(i);
                 in_code = !in_code;
                 seg_start = i;
                 if !in_code {
@@ -594,70 +618,50 @@ impl TextInput {
                     });
                     seg_start = i + 1;
                 }
-            } else if !in_code && ch == '*' && chars.peek() == Some(&(i + 1, '*')) {
-                let seg_end = i;
-                if seg_end > seg_start {
-                    let color = if in_bold {
-                        color_bold
-                    } else if in_italic {
-                        color_italic
-                    } else {
-                        base_color
-                    };
-                    runs.push(TextRun {
-                        len: seg_end - seg_start,
-                        font: font.clone(),
-                        color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    });
-                }
-                in_bold = !in_bold;
+            } else if !in_code && ch == '~' && chars.peek().map(|(_, c)| *c) == Some('~') {
+                // Peek second ~ without consuming unless confirmed pair.
+                // `chars.peek()` gives next (byte_idx, char); consume it.
+                flush!(i);
+                in_strike = !in_strike;
                 chars.next();
                 seg_start = i + 2;
-            } else if !in_code && !in_bold && ch == '*' {
-                let seg_end = i;
-                if seg_end > seg_start {
-                    let color = if in_italic { color_italic } else { base_color };
-                    runs.push(TextRun {
-                        len: seg_end - seg_start,
-                        font: font.clone(),
-                        color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    });
+            } else if !in_code && (ch == '*' || ch == '_') {
+                let next_is_same =
+                    chars.peek().map(|(_, c)| *c) == Some(ch);
+                if next_is_same {
+                    flush!(i);
+                    in_bold = !in_bold;
+                    chars.next();
+                    seg_start = i + 2;
+                } else {
+                    // Single * or _ toggles italic (but not inside bold run
+                    // for * — keep old guard so ** pairs stay stable).
+                    if ch == '*' && in_bold {
+                        continue;
+                    }
+                    flush!(i);
+                    in_italic = !in_italic;
+                    seg_start = i + 1;
                 }
-                in_italic = !in_italic;
-                seg_start = i + 1;
-            } else if !in_code && (ch == '[' || ch == ']') {
-                let seg_end = i;
-                if seg_end > seg_start {
-                    runs.push(TextRun {
-                        len: seg_end - seg_start,
-                        font: font.clone(),
-                        color: base_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    });
-                }
+            } else if !in_code && (ch == '[' || ch == ']' || ch == '(' || ch == ')' || ch == '|') {
+                flush!(i);
                 runs.push(TextRun {
-                    len: 1,
+                    len: ch.len_utf8(),
                     font: font.clone(),
-                    color: color_link,
+                    color: if ch == '|' { base_color } else { color_link },
                     background_color: None,
                     underline: None,
                     strikethrough: None,
                 });
-                seg_start = i + 1;
+                seg_start = i + ch.len_utf8();
             }
         }
 
         if seg_start < trimmed.len() {
             let color = if in_code {
                 color_code
+            } else if in_strike {
+                color_strike
             } else if in_bold {
                 color_bold
             } else if in_italic {

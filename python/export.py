@@ -13,15 +13,25 @@ from typing import List, Tuple
 def _parse_inline(text: str) -> List[Tuple[str, dict]]:
     """Parse inline markdown formatting into segments with styles.
 
-    Returns list of (text, {'bold': bool, 'italic': bool, 'code': bool})
+    Returns list of (text, {'bold': bool, 'italic': bool, 'code': bool,
+    'strike': bool, 'link': str|None})
     """
     segments = []
     i = 0
     n = len(text)
 
     while i < n:
+        # Strikethrough: ~~text~~
+        m = re.match(r'~~(.+?)~~', text[i:])
+        if m:
+            segments.append((m.group(1), {'bold': False, 'italic': False, 'code': False, 'strike': True}))
+            i += m.end()
+            continue
+
         # Bold + Italic: ***text*** or ___text___
         m = re.match(r'\*\*\*(.+?)\*\*\*', text[i:])
+        if not m:
+            m = re.match(r'___(.+?)___', text[i:])
         if m:
             segments.append((m.group(1), {'bold': True, 'italic': True, 'code': False}))
             i += m.end()
@@ -61,7 +71,7 @@ def _parse_inline(text: str) -> List[Tuple[str, dict]]:
 
         # Plain text: consume until next special character
         j = i + 1
-        while j < n and text[j] not in ('*', '_', '`', '['):
+        while j < n and text[j] not in ('*', '_', '`', '[', '~'):
             j += 1
         segments.append((text[i:j], {'bold': False, 'italic': False, 'code': False}))
         i = j
@@ -69,11 +79,23 @@ def _parse_inline(text: str) -> List[Tuple[str, dict]]:
     return segments if segments else [('', {'bold': False, 'italic': False, 'code': False})]
 
 
+def _is_table_delimiter(line: str) -> bool:
+    """True for `| --- | --- |` style delimiter rows."""
+    cells = [c.strip() for c in line.strip().strip('|').split('|')]
+    if not cells:
+        return False
+    return all(re.match(r'^:?-{1,}:?$', c) for c in cells if c != '')
+
+
+def _split_table_row(line: str) -> List[str]:
+    return [c.strip() for c in line.strip().strip('|').split('|')]
+
+
 def _parse_markdown_lines(text: str) -> List[dict]:
     """Parse markdown text into structured blocks.
 
     Returns list of dicts with 'type' and content fields.
-    Types: heading, paragraph, code_block, blockquote, hr, ul, ol, blank
+    Types: heading, paragraph, code_block, blockquote, hr, ul, ol, table, blank
     """
     blocks = []
     lines = text.split('\n')
@@ -151,23 +173,47 @@ def _parse_markdown_lines(text: str) -> List[dict]:
             blocks.append({'type': 'ol', 'items': items})
             continue
 
+        # Table: header row + delimiter row + body rows
+        if '|' in line and i + 1 < len(lines) and _is_table_delimiter(lines[i + 1]):
+            header = _split_table_row(line)
+            i += 2  # skip header + delimiter
+            rows = [header]
+            while i < len(lines) and '|' in lines[i] and lines[i].strip() != '':
+                rows.append(_split_table_row(lines[i]))
+                i += 1
+            blocks.append({'type': 'table', 'rows': rows})
+            continue
+
         # Paragraph (collect consecutive non-special lines)
         para_lines = []
         while i < len(lines) and lines[i].strip() != '':
-            # Stop if we hit a special block
-            if (lines[i].strip().startswith('```') or
-                lines[i].strip().startswith('#') or
-                lines[i].strip().startswith('>') or
-                re.match(r'^(\s*)[-*+]\s+', lines[i]) or
-                re.match(r'^(\s*)\d+\.\s+', lines[i]) or
-                re.match(r'^(\*\*\*+|---+|___+)\s*$', lines[i].strip())):
+            nxt = lines[i]
+            if (nxt.strip().startswith('```') or
+                nxt.strip().startswith('#') or
+                nxt.strip().startswith('>') or
+                re.match(r'^(\s*)[-*+]\s+', nxt) or
+                re.match(r'^(\s*)\d+\.\s+', nxt) or
+                re.match(r'^(\*\*\*+|---+|___+)\s*$', nxt.strip()) or
+                ('|' in nxt and i + 1 < len(lines) and _is_table_delimiter(lines[i + 1]))):
                 break
-            para_lines.append(lines[i])
+            para_lines.append(nxt)
             i += 1
         if para_lines:
             blocks.append({'type': 'paragraph', 'text': ' '.join(para_lines)})
 
     return blocks
+
+
+def _apply_inline_docx(run, styles):
+    """Apply parsed inline styles to a python-docx run."""
+    from docx.shared import Pt
+    run.bold = styles.get('bold', False)
+    run.italic = styles.get('italic', False)
+    if styles.get('strike', False):
+        run.font.strike = True
+    if styles.get('code', False):
+        run.font.name = 'Courier New'
+        run.font.size = Pt(10)
 
 
 def markdown_to_html(text: str) -> str:
@@ -210,11 +256,7 @@ def markdown_to_docx(text: str, output_path: str) -> bool:
             segments = _parse_inline(block['text'])
             for seg_text, styles in segments:
                 run = para.add_run(seg_text)
-                run.bold = styles.get('bold', False)
-                run.italic = styles.get('italic', False)
-                if styles.get('code', False):
-                    run.font.name = 'Courier New'
-                    run.font.size = Pt(10)
+                _apply_inline_docx(run, styles)
 
         elif btype == 'code_block':
             code_para = doc.add_paragraph()
@@ -249,8 +291,7 @@ def markdown_to_docx(text: str, output_path: str) -> bool:
                 segments = _parse_inline(item)
                 for seg_text, styles in segments:
                     run = para.add_run(seg_text)
-                    run.bold = styles.get('bold', False)
-                    run.italic = styles.get('italic', False)
+                    _apply_inline_docx(run, styles)
 
         elif btype == 'ol':
             for item in block['items']:
@@ -258,8 +299,23 @@ def markdown_to_docx(text: str, output_path: str) -> bool:
                 segments = _parse_inline(item)
                 for seg_text, styles in segments:
                     run = para.add_run(seg_text)
-                    run.bold = styles.get('bold', False)
-                    run.italic = styles.get('italic', False)
+                    _apply_inline_docx(run, styles)
+
+        elif btype == 'table':
+            rows = block.get('rows', [])
+            if rows:
+                num_cols = max(len(r) for r in rows)
+                table = doc.add_table(rows=len(rows), cols=num_cols)
+                table.style = 'Table Grid'
+                for ri, row in enumerate(rows):
+                    for ci in range(num_cols):
+                        cell_text = row[ci] if ci < len(row) else ''
+                        cell_para = table.cell(ri, ci).paragraphs[0]
+                        for seg_text, styles in _parse_inline(cell_text):
+                            run = cell_para.add_run(seg_text)
+                            _apply_inline_docx(run, styles)
+                            if ri == 0:
+                                run.bold = True
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     doc.save(output_path)
@@ -350,6 +406,25 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
                 _render_inline_pdf(pdf, item, indent=13)
                 pdf.ln(1)
             pdf.ln(2)
+
+        elif btype == 'table':
+            rows = block.get('rows', [])
+            if rows:
+                num_cols = max(len(r) for r in rows)
+                col_w = (pdf.w - pdf.l_margin - pdf.r_margin) / max(num_cols, 1)
+                for ri, row in enumerate(rows):
+                    pdf.set_x(pdf.l_margin)
+                    is_header = ri == 0
+                    pdf.set_font('Helvetica', 'B' if is_header else '', 10)
+                    if is_header:
+                        pdf.set_fill_color(230, 230, 230)
+                    else:
+                        pdf.set_fill_color(255, 255, 255)
+                    for ci in range(num_cols):
+                        txt = row[ci] if ci < len(row) else ''
+                        pdf.cell(col_w, 8, txt[:60], border=1, fill=is_header)
+                    pdf.ln()
+                pdf.ln(2)
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     pdf.output(output_path)
