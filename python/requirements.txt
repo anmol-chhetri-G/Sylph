@@ -1,0 +1,7 @@
+# Sylph Python export/AI dependencies.
+# System Python on Arch is PEP-668 managed — use a venv:
+#   python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt
+# Then run with the venv active so the embedded (PyO3) interpreter finds them.
+fpdf2
+python-docx
+markdown

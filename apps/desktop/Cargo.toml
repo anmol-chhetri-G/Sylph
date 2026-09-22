@@ -8,4 +8,5 @@ description = "Sylph - A native document editor built with GPUI"
 sylph-core = { path = "../../crates/core" }
 sylph-storage = { path = "../../crates/storage" }
 sylph-py-bridge = { path = "../../crates/py_bridge" }
+serde_json = "1"
 gpui = { version = "0.2.2", features = ["wayland", "x11"] }

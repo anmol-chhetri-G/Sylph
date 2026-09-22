@@ -390,9 +390,10 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
         elif btype == 'ul':
             for item in block['items']:
                 pdf.set_font('Helvetica', '', 11)
-                x = pdf.get_x()
-                pdf.set_x(x + 5)
-                pdf.cell(5, 6, chr(8226))  # bullet char
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_x(pdf.l_margin)
+                # Core PDF fonts are latin-1 only: use '-' instead of '•'.
+                pdf.cell(5, 6, '-')
                 _render_inline_pdf(pdf, item, indent=10)
                 pdf.ln(1)
             pdf.ln(2)
@@ -400,8 +401,8 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
         elif btype == 'ol':
             for idx, item in enumerate(block['items'], 1):
                 pdf.set_font('Helvetica', '', 11)
-                x = pdf.get_x()
-                pdf.set_x(x + 5)
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_x(pdf.l_margin)
                 pdf.cell(8, 6, f'{idx}.')
                 _render_inline_pdf(pdf, item, indent=13)
                 pdf.ln(1)
@@ -431,12 +432,31 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
     return True
 
 
+def _pdf_safe(text: str) -> str:
+    """Core PDF fonts are latin-1: map common unicode to ASCII fallbacks."""
+    return (
+        text.replace('—', '--')
+        .replace('–', '-')
+        .replace('•', '-')
+        .replace('─', '-')
+        .replace('“', '"')
+        .replace('”', '"')
+        .replace('‘', "'")
+        .replace('’', "'")
+        .replace('…', '...')
+        .encode('latin-1', errors='replace')
+        .decode('latin-1')
+    )
+
+
 def _render_inline_pdf(pdf, text: str, indent: int = 0):
     """Render inline markdown text to PDF with formatting."""
     from fpdf import FPDF
     segments = _parse_inline(text)
 
     for seg_text, styles in segments:
+        if not seg_text:
+            continue
         if styles.get('code', False):
             pdf.set_font('Courier', '', 10)
             pdf.set_text_color(200, 50, 50)
@@ -454,10 +474,15 @@ def _render_inline_pdf(pdf, text: str, indent: int = 0):
             pdf.set_text_color(0, 0, 0)
 
         if indent > 0:
-            x = pdf.get_x()
-            pdf.set_x(x + indent)
-
-        pdf.multi_cell(0, 6, seg_text)
+            # Reserve explicit width: multi_cell(w=0) after set_x() would
+            # leave no room and raise "Not enough horizontal space".
+            x = pdf.l_margin + indent
+            w = pdf.w - pdf.r_margin - x
+            pdf.set_x(x)
+            pdf.multi_cell(w, 6, _pdf_safe(seg_text))
+        else:
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(0, 6, _pdf_safe(seg_text))
 
 
 def markdown_to_markdown(text: str, output_path: str) -> bool:

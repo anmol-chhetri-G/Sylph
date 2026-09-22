@@ -5301,6 +5301,7 @@ name = "sylph-desktop"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "serde_json",
  "sylph-core",
  "sylph-py-bridge",
  "sylph-storage",

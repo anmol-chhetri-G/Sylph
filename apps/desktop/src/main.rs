@@ -2233,13 +2233,18 @@ impl SylphApp {
     }
 
     fn export_document(&mut self, to_pdf: bool, cx: &mut Context<Self>) {
-        let text = self.editor.read(cx).content.clone();
         let ext = if to_pdf { "pdf" } else { "docx" };
         let path = format!("output/{}.{}", self.doc_title.replace(' ', "_"), ext);
         let _ = std::fs::create_dir_all("output");
         let result = if to_pdf {
-            sylph_py_bridge::export_to_pdf(&text, &path)
+            // Rich export: cover, headings, images, tables, margins.
+            // Falls back to markdown text if serialization fails.
+            match serde_json::to_string(&self.document) {
+                Ok(json) => sylph_py_bridge::export_rich_pdf(&json, &path),
+                Err(e) => format!("Export failed to serialize document: {}", e),
+            }
         } else {
+            let text = self.editor.read(cx).content.clone();
             sylph_py_bridge::export_to_docx(&text, &path)
         };
         self.status_message = Some(result);

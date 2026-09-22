@@ -13,6 +13,21 @@ fn with_python_module<T>(
         let sys = py.import("sys")?;
         let path = sys.getattr("path")?;
         path.call_method1("append", ("./python",))?;
+        // Honor an active venv (PEP-668 systems like Arch forbid system
+        // pip installs, so export deps live in .venv). The embedded
+        // interpreter does not pick up $VIRTUAL_ENV automatically.
+        if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+            let pattern = format!("{}/lib/python*/site-packages", venv);
+            if let Ok(glob) = py.import("glob") {
+                if let Ok(paths) =
+                    glob.call_method1("glob", (pattern,))?.extract::<Vec<String>>()
+                {
+                    for p in paths {
+                        let _ = path.call_method1("append", (p,));
+                    }
+                }
+            }
+        }
         let module = py.import(module_name)?;
         f(&module)
     })
@@ -26,7 +41,17 @@ fn with_python_module<T>(
 fn bridge_call(f: impl FnOnce() -> Result<String, PyErr>) -> String {
     match f() {
         Ok(result) => result,
-        Err(e) => format!("Python error: {}", e),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No module named") {
+                format!(
+                    "Python error: {}. Hint: python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt, then run with the venv active",
+                    msg
+                )
+            } else {
+                format!("Python error: {}", msg)
+            }
+        }
     }
 }
 
