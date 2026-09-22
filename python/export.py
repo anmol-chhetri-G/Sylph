@@ -355,7 +355,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
             size = max(24 - (level - 1) * 3, 12)
             pdf.set_font('Helvetica', 'B', size)
             pdf.set_text_color(0, 0, 0)
-            pdf.multi_cell(0, size * 0.5, block['text'])
+            pdf.multi_cell(0, size * 0.5, _pdf_safe(block['text']))
             pdf.ln(2)
 
         elif btype == 'paragraph':
@@ -366,7 +366,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
             pdf.set_fill_color(245, 245, 245)
             pdf.set_font('Courier', '', 9)
             pdf.set_text_color(50, 50, 50)
-            code_text = block['text']
+            code_text = _pdf_safe(block['text'])
             # Escape special PDF characters
             code_text = code_text.replace('\\', '\\\\')
             pdf.multi_cell(0, 5, code_text, fill=True)
@@ -375,9 +375,9 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
         elif btype == 'blockquote':
             pdf.set_font('Helvetica', 'I', 11)
             pdf.set_text_color(100, 100, 100)
-            x = pdf.get_x()
-            pdf.set_x(x + 10)
-            pdf.multi_cell(0, 6, block['text'])
+            bx = pdf.l_margin + 10
+            pdf.set_x(bx)
+            pdf.multi_cell(pdf.w - pdf.r_margin - bx, 6, _pdf_safe(block['text']))
             pdf.set_text_color(0, 0, 0)
             pdf.ln(3)
 
@@ -423,7 +423,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
                         pdf.set_fill_color(255, 255, 255)
                     for ci in range(num_cols):
                         txt = row[ci] if ci < len(row) else ''
-                        pdf.cell(col_w, 8, txt[:60], border=1, fill=is_header)
+                        pdf.cell(col_w, 8, _pdf_safe(txt[:60]), border=1, fill=is_header)
                     pdf.ln()
                 pdf.ln(2)
 
@@ -606,8 +606,8 @@ def _render_block_docx(doc, block: dict):
                         for run_data in cell.get('runs', []):
                             run = cell_para.add_run(run_data['text'])
                             styles = run_data.get('styles', [])
-                            run.bold = 'Bold' in styles
-                            run.italic = 'Italic' in styles
+                            run.bold = 'Bold' in styles or 'BoldItalic' in styles
+                            run.italic = 'Italic' in styles or 'BoldItalic' in styles
             caption = table_data.get('caption')
             if caption:
                 cap_para = doc.add_paragraph()
@@ -622,6 +622,8 @@ def _render_block_docx(doc, block: dict):
         run.font.color.rgb = RGBColor(100, 100, 100)
     elif 'HorizontalRule' in block:
         doc.add_paragraph('─' * 50)
+    elif 'PageBreak' in block:
+        doc.add_page_break()
 
 
 def _render_cover_page_docx(doc, data: dict):
@@ -740,19 +742,22 @@ def _render_block_pdf(pdf, block: dict):
         pdf.set_font('Helvetica', 'B', size)
         pdf.set_text_color(0, 0, 0)
         text = ''.join(r['text'] for r in h.get('runs', []))
-        pdf.multi_cell(pdf.epw, size * 0.5, text)
+        pdf.multi_cell(pdf.epw, size * 0.5, _pdf_safe(text))
         pdf.ln(2)
     elif 'Paragraph' in block:
         p = block['Paragraph']
         style_data = p.get('style', {})
         space_after = style_data.get('space_after', 3)
+        pdf.set_x(pdf.l_margin)
         for run_data in p.get('runs', []):
             text = run_data['text']
+            if not text:
+                continue
             styles = run_data.get('styles', [])
             if 'Code' in styles:
                 pdf.set_font('Courier', '', 10)
                 pdf.set_text_color(200, 50, 50)
-            elif 'Bold' in styles and 'Italic' in styles:
+            elif 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
                 pdf.set_font('Helvetica', 'BI', 11)
                 pdf.set_text_color(0, 0, 0)
             elif 'Bold' in styles:
@@ -764,9 +769,10 @@ def _render_block_pdf(pdf, block: dict):
             else:
                 pdf.set_font('Helvetica', '', 11)
                 pdf.set_text_color(0, 0, 0)
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(pdf.epw, 6, text)
-        pdf.ln(space_after)
+            # write() keeps runs on the same flowing line; multi_cell()
+            # per run would stack each run on its own line.
+            pdf.write(6, _pdf_safe(text))
+        pdf.ln(max(space_after, 2))
     elif 'Image' in block:
         img_data = block['Image']['data']
         path = img_data.get('path', '')
@@ -780,18 +786,18 @@ def _render_block_pdf(pdf, block: dict):
                     pdf.set_x(pdf.l_margin)
                     pdf.set_font('Helvetica', 'I', 9)
                     pdf.set_text_color(100, 100, 100)
-                    pdf.cell(pdf.epw, 5, caption, align='C')
+                    pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
                     pdf.ln(3)
                 pdf.ln(3)
             except Exception:
                 pdf.set_x(pdf.l_margin)
                 pdf.set_font('Helvetica', '', 10)
-                pdf.cell(pdf.epw, 6, f'[Image: {path}]')
+                pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
                 pdf.ln(3)
         else:
             pdf.set_x(pdf.l_margin)
             pdf.set_font('Helvetica', '', 10)
-            pdf.cell(pdf.epw, 6, f'[Image: {path}]')
+            pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
             pdf.ln(3)
     elif 'Table' in block:
         _render_table_pdf(pdf, block['Table']['data'])
@@ -799,7 +805,7 @@ def _render_block_pdf(pdf, block: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font('Helvetica', 'I', 9)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(pdf.epw, 5, block['Caption']['text'])
+        pdf.cell(pdf.epw, 5, _pdf_safe(block['Caption']['text']))
         pdf.ln(3)
     elif 'HorizontalRule' in block:
         pdf.set_x(pdf.l_margin)
@@ -807,6 +813,10 @@ def _render_block_pdf(pdf, block: dict):
         y = pdf.get_y()
         pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
         pdf.ln(5)
+    elif 'PageBreak' in block:
+        # Rust serializes the unit variant as the string "PageBreak";
+        # `in` matches both the string and {"PageBreak": ...} shapes.
+        pdf.add_page()
 
 
 def _render_cover_page_pdf(pdf, data: dict):
@@ -888,7 +898,7 @@ def _render_table_pdf(pdf, table_data: dict):
                     pdf.set_font('Helvetica', '', 10)
                     pdf.set_fill_color(255, 255, 255)
                 # Use explicit width and ensure x position
-                pdf.cell(col_width, 8, text[:50], border=1, fill=is_header)
+                pdf.cell(col_width, 8, _pdf_safe(text[:50]), border=1, fill=is_header)
         pdf.ln()
 
     caption = table_data.get('caption')
@@ -896,7 +906,7 @@ def _render_table_pdf(pdf, table_data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font('Helvetica', 'I', 9)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, 5, caption, align='C')
+        pdf.cell(0, 5, _pdf_safe(caption), align='C')
         pdf.ln(3)
 
     pdf.ln(3)
@@ -944,7 +954,7 @@ def _render_block_markdown(block: dict) -> list:
         for run_data in p.get('runs', []):
             text = run_data['text']
             styles = run_data.get('styles', [])
-            if 'Bold' in styles and 'Italic' in styles:
+            if 'Bold' in styles and 'Italic' in styles or 'BoldItalic' in styles:
                 parts.append(f'***{text}***')
             elif 'Bold' in styles:
                 parts.append(f'**{text}**')
