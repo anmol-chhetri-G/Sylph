@@ -8,3 +8,6 @@ description = "Core document model and logic for Sylph"
 yrs = "0.25"
 serde = { version = "1", features = ["derive"] }
 unicode-segmentation = "1.12"
+
+[dev-dependencies]
+serde_json = "1"  # JSON-shape assertions for the export contract (tests only)

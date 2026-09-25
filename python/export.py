@@ -216,6 +216,88 @@ def _apply_inline_docx(run, styles):
         run.font.size = Pt(10)
 
 
+def _link_url(styles):
+    """Extract the URL from run styles, or None when the run is not a link.
+
+    Styles are a list of either bare strings ("Bold") or one-element dicts
+    ({"Link": "https://..."}).
+    """
+    for s in styles:
+        if isinstance(s, dict) and 'Link' in s:
+            return s['Link']
+    return None
+
+
+def _add_hyperlink_docx(paragraph, text, url, *, bold=False, italic=False,
+                        code=False, strike=False):
+    """Append a real OOXML hyperlink run to a paragraph."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+
+    run_el = OxmlElement('w:r')
+    r_pr = OxmlElement('w:rPr')
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), '0563C1')
+    r_pr.append(color)
+    underline = OxmlElement('w:u')
+    underline.set(qn('w:val'), 'single')
+    r_pr.append(underline)
+    if bold:
+        r_pr.append(OxmlElement('w:b'))
+    if italic:
+        r_pr.append(OxmlElement('w:i'))
+    if strike:
+        r_pr.append(OxmlElement('w:strike'))
+    if code:
+        fonts = OxmlElement('w:rFonts')
+        fonts.set(qn('w:ascii'), 'Courier New')
+        fonts.set(qn('w:hAnsi'), 'Courier New')
+        r_pr.append(fonts)
+        size = OxmlElement('w:sz')
+        size.set(qn('w:val'), '20')
+        r_pr.append(size)
+    run_el.append(r_pr)
+    text_el = OxmlElement('w:t')
+    text_el.set(qn('xml:space'), 'preserve')
+    text_el.text = text
+    run_el.append(text_el)
+    hyperlink.append(run_el)
+    paragraph._p.append(hyperlink)
+
+
+def _add_styled_run_docx(paragraph, run_data):
+    """Add one run (text + styles, including links) to a DOCX paragraph."""
+    from docx.shared import Pt
+
+    styles = run_data.get('styles', [])
+    text = run_data.get('text', '')
+    url = _link_url(styles)
+    if url is not None:
+        _add_hyperlink_docx(
+            paragraph, text, url,
+            bold='Bold' in styles or 'BoldItalic' in styles,
+            italic='Italic' in styles or 'BoldItalic' in styles,
+            code='Code' in styles,
+            strike='Strikethrough' in styles,
+        )
+        return
+    run = paragraph.add_run(text)
+    run.bold = 'Bold' in styles or 'BoldItalic' in styles
+    run.italic = 'Italic' in styles or 'BoldItalic' in styles
+    if 'Code' in styles:
+        run.font.name = 'Courier New'
+        run.font.size = Pt(10)
+    if 'Strikethrough' in styles:
+        run.font.strike = True
+    if 'Underline' in styles:
+        run.font.underline = True
+
+
 def markdown_to_html(text: str) -> str:
     """Convert markdown text to HTML."""
     import markdown
@@ -546,10 +628,7 @@ def _render_block_docx(doc, block: dict):
         level = min(h['level'], 9)
         heading = doc.add_heading('', level=level)
         for run_data in h.get('runs', []):
-            run = heading.add_run(run_data['text'])
-            styles = run_data.get('styles', [])
-            run.bold = 'Bold' in styles or 'BoldItalic' in styles
-            run.italic = 'Italic' in styles or 'BoldItalic' in styles
+            _add_styled_run_docx(heading, run_data)
     elif 'Paragraph' in block:
         p = block['Paragraph']
         para = doc.add_paragraph()
@@ -561,17 +640,7 @@ def _render_block_docx(doc, block: dict):
         if style_data.get('line_spacing', 1.5) != 1.0:
             para.paragraph_format.line_spacing = style_data.get('line_spacing', 1.5)
         for run_data in p.get('runs', []):
-            run = para.add_run(run_data['text'])
-            styles = run_data.get('styles', [])
-            run.bold = 'Bold' in styles or 'BoldItalic' in styles
-            run.italic = 'Italic' in styles or 'BoldItalic' in styles
-            if 'Code' in styles:
-                run.font.name = 'Courier New'
-                run.font.size = Pt(10)
-            if 'Strikethrough' in styles:
-                run.font.strike = True
-            if 'Underline' in styles:
-                run.font.underline = True
+            _add_styled_run_docx(para, run_data)
     elif 'Image' in block:
         img_data = block['Image']['data']
         path = img_data.get('path', '')
@@ -611,10 +680,7 @@ def _render_block_docx(doc, block: dict):
                     if j < num_cols:
                         cell_para = table.cell(i, j).paragraphs[0]
                         for run_data in cell.get('runs', []):
-                            run = cell_para.add_run(run_data['text'])
-                            styles = run_data.get('styles', [])
-                            run.bold = 'Bold' in styles or 'BoldItalic' in styles
-                            run.italic = 'Italic' in styles or 'BoldItalic' in styles
+                            _add_styled_run_docx(cell_para, run_data)
             caption = table_data.get('caption')
             if caption:
                 cap_para = doc.add_paragraph()
@@ -631,6 +697,95 @@ def _render_block_docx(doc, block: dict):
         doc.add_paragraph('─' * 50)
     elif 'PageBreak' in block:
         doc.add_page_break()
+    elif 'List' in block:
+        _render_list_docx(doc, block['List'])
+    elif 'Quote' in block:
+        _render_quote_docx(doc, block['Quote'])
+    elif 'CodeBlock' in block:
+        _render_code_block_docx(doc, block['CodeBlock'])
+    else:
+        # No-silent-drop law: an unrecognized block is a bug, not content
+        # to quietly discard.
+        raise ValueError(f'_render_block_docx: unknown block {block!r}')
+
+
+def _render_list_docx(doc, list_data: dict):
+    """Render list items with manual markers and hanging indentation.
+
+    Numbering is derived per level (not Word numbering.xml) so DOCX, PDF
+    and MD all agree on the exact same sequence.
+    """
+    from docx.shared import Inches, Pt
+
+    items = list_data.get('items', [])
+    counters = {}
+    for item in items:
+        level = min(int(item.get('level', 0)), 4)
+        ordered = bool(item.get('ordered'))
+        checked = item.get('checked')
+        for deeper in [lv for lv in counters if lv > level]:
+            del counters[deeper]
+        if checked is not None:
+            marker = '☑ ' if checked else '☐ '
+        elif ordered:
+            counters[level] = counters.get(level, 0) + 1
+            marker = f'{counters[level]}. '
+        else:
+            counters.pop(level, None)
+            marker = '• '
+        para = doc.add_paragraph()
+        para.paragraph_format.left_indent = Inches(0.3 * (level + 1))
+        para.paragraph_format.space_after = Pt(3)
+        para.add_run(marker)
+        for run_data in item.get('runs', []):
+            _add_styled_run_docx(para, run_data)
+
+
+def _render_quote_docx(doc, quote_data: dict):
+    """Render a blockquote as an indented paragraph with a left bar."""
+    from docx.shared import Inches, Pt
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    level = min(int(quote_data.get('level', 1)), 4)
+    para = doc.add_paragraph()
+    para.paragraph_format.left_indent = Inches(0.25 * level + 0.15)
+    para.paragraph_format.space_after = Pt(8)
+    p_pr = para._p.get_or_add_pPr()
+    p_bdr = OxmlElement('w:pBdr')
+    left = OxmlElement('w:left')
+    left.set(qn('w:val'), 'single')
+    left.set(qn('w:sz'), '18')
+    left.set(qn('w:space'), '8')
+    left.set(qn('w:color'), 'AAAAAA')
+    p_bdr.append(left)
+    p_pr.append(p_bdr)
+    for run_data in quote_data.get('runs', []):
+        _add_styled_run_docx(para, run_data)
+
+
+def _render_code_block_docx(doc, code_data: dict):
+    """Render a fenced code block as shaded monospace with real line breaks."""
+    from docx.shared import Pt
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    text = code_data.get('text', '')
+    para = doc.add_paragraph()
+    p_pr = para._p.get_or_add_pPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), 'F2F2F2')
+    p_pr.append(shd)
+    para.paragraph_format.space_after = Pt(8)
+    lines = text.split('\n')
+    for idx, line in enumerate(lines):
+        run = para.add_run(line)
+        run.font.name = 'Courier New'
+        run.font.size = Pt(9.5)
+        if idx < len(lines) - 1:
+            run.add_break()
 
 
 def _render_cover_page_docx(doc, data: dict):
@@ -737,6 +892,45 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
     return True
 
 
+def _write_pdf_runs(pdf, runs, size: int = 11,
+                    default_font=('Helvetica', ''), default_color=(0, 0, 0)):
+    """Write flowing inline runs to the current PDF line position.
+
+    Plain runs reset to `default_font`/`default_color` (set by the caller
+    for context, e.g. gray italic inside quotes); styled runs override.
+    Links are written as clickable PDF links (blue).
+    """
+    for run_data in runs:
+        text = run_data.get('text', '')
+        if not text:
+            continue
+        styles = run_data.get('styles', [])
+        url = _link_url(styles)
+        if 'Code' in styles:
+            pdf.set_font('Courier', '', size - 1)
+            pdf.set_text_color(200, 50, 50)
+        elif 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
+            pdf.set_font('Helvetica', 'BI', size)
+            pdf.set_text_color(0, 0, 0)
+        elif 'Bold' in styles:
+            pdf.set_font('Helvetica', 'B', size)
+            pdf.set_text_color(0, 0, 0)
+        elif 'Italic' in styles:
+            pdf.set_font('Helvetica', 'I', size)
+            pdf.set_text_color(0, 0, 0)
+        else:
+            pdf.set_font(default_font[0], default_font[1], size)
+            pdf.set_text_color(*default_color)
+        if url is not None:
+            pdf.set_text_color(0, 90, 180)
+            # write() keeps runs on the same flowing line; multi_cell()
+            # per run would stack each run on its own line.
+            pdf.write(6, _pdf_safe(text), link=url)
+            pdf.set_text_color(*default_color)
+        else:
+            pdf.write(6, _pdf_safe(text))
+
+
 def _render_block_pdf(pdf, block: dict):
     """Render a single block to PDF."""
     if 'CoverPage' in block:
@@ -756,29 +950,9 @@ def _render_block_pdf(pdf, block: dict):
         style_data = p.get('style', {})
         space_after = style_data.get('space_after', 3)
         pdf.set_x(pdf.l_margin)
-        for run_data in p.get('runs', []):
-            text = run_data['text']
-            if not text:
-                continue
-            styles = run_data.get('styles', [])
-            if 'Code' in styles:
-                pdf.set_font('Courier', '', 10)
-                pdf.set_text_color(200, 50, 50)
-            elif 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
-                pdf.set_font('Helvetica', 'BI', 11)
-                pdf.set_text_color(0, 0, 0)
-            elif 'Bold' in styles:
-                pdf.set_font('Helvetica', 'B', 11)
-                pdf.set_text_color(0, 0, 0)
-            elif 'Italic' in styles:
-                pdf.set_font('Helvetica', 'I', 11)
-                pdf.set_text_color(0, 0, 0)
-            else:
-                pdf.set_font('Helvetica', '', 11)
-                pdf.set_text_color(0, 0, 0)
-            # write() keeps runs on the same flowing line; multi_cell()
-            # per run would stack each run on its own line.
-            pdf.write(6, _pdf_safe(text))
+        pdf.set_font('Helvetica', '', 11)
+        pdf.set_text_color(0, 0, 0)
+        _write_pdf_runs(pdf, p.get('runs', []))
         pdf.ln(max(space_after, 2))
     elif 'Image' in block:
         img_data = block['Image']['data']
@@ -838,6 +1012,68 @@ def _render_block_pdf(pdf, block: dict):
         # Rust serializes the unit variant as the string "PageBreak";
         # `in` matches both the string and {"PageBreak": ...} shapes.
         pdf.add_page()
+    elif 'List' in block:
+        _render_list_pdf(pdf, block['List'])
+    elif 'Quote' in block:
+        _render_quote_pdf(pdf, block['Quote'])
+    elif 'CodeBlock' in block:
+        _render_code_block_pdf(pdf, block['CodeBlock'])
+    else:
+        # No-silent-drop law: unknown block shapes are bugs, not content.
+        raise ValueError(f'_render_block_pdf: unknown block {block!r}')
+
+
+def _render_list_pdf(pdf, list_data: dict):
+    """Render list items with manual markers and per-level indentation."""
+    items = list_data.get('items', [])
+    counters = {}
+    for item in items:
+        level = min(int(item.get('level', 0)), 4)
+        ordered = bool(item.get('ordered'))
+        checked = item.get('checked')
+        for deeper in [lv for lv in counters if lv > level]:
+            del counters[deeper]
+        if checked is not None:
+            # Core PDF fonts are latin-1 only: ASCII task markers stay portable.
+            marker = '[x] ' if checked else '[ ] '
+        elif ordered:
+            counters[level] = counters.get(level, 0) + 1
+            marker = f'{counters[level]}. '
+        else:
+            counters.pop(level, None)
+            # '•' (U+2022) is rejected by latin-1 core fonts; '·' is the
+            # closest latin-1 bullet and renders with Helvetica.
+            marker = '· '
+        pdf.set_x(pdf.l_margin + 6.0 * (level + 1))
+        pdf.set_font('Helvetica', '', 11)
+        pdf.set_text_color(0, 0, 0)
+        pdf.write(6, _pdf_safe(marker))
+        _write_pdf_runs(pdf, item.get('runs', []))
+        pdf.ln(4)
+
+
+def _render_quote_pdf(pdf, quote_data: dict):
+    """Render a blockquote as an indented, gray-italic paragraph."""
+    level = min(int(quote_data.get('level', 1)), 4)
+    pdf.set_x(pdf.l_margin + 6.0 * level)
+    pdf.set_font('Helvetica', 'I', 11)
+    pdf.set_text_color(80, 80, 80)
+    _write_pdf_runs(
+        pdf, quote_data.get('runs', []),
+        default_font=('Helvetica', 'I'), default_color=(80, 80, 80),
+    )
+    pdf.ln(6)
+
+
+def _render_code_block_pdf(pdf, code_data: dict):
+    """Render a fenced code block as indented monospace lines."""
+    text = code_data.get('text', '')
+    for line in text.split('\n'):
+        pdf.set_x(pdf.l_margin + 6.0)
+        pdf.set_font('Courier', '', 9.5)
+        pdf.set_text_color(40, 40, 40)
+        pdf.multi_cell(pdf.epw - 6.0, 5, _pdf_safe(line) or ' ')
+    pdf.ln(4)
 
 
 def _render_cover_page_pdf(pdf, data: dict):
@@ -951,51 +1187,97 @@ def rich_markdown(doc_json: str, output_path: str) -> bool:
     return True
 
 
+def _md_escape_plain(text: str) -> str:
+    """Backslash-escape parser-active markers so plain text round-trips.
+
+    A literal `*` in a plain run came from an escaped input (`\\*`) or an
+    unmatched marker; emitting it raw could pair with another run's marker
+    and silently change emphasis on re-parse.
+    """
+    for ch in ('\\', '*', '`', '~'):
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
+def _md_emphasis(run_data) -> str:
+    """Wrap one run's text in its emphasis markers (no link handling)."""
+    text = run_data.get('text', '')
+    styles = run_data.get('styles', [])
+    if ('Bold' in styles and 'Italic' in styles) or 'BoldItalic' in styles:
+        return f'***{text}***'
+    if 'Bold' in styles:
+        return f'**{text}**'
+    if 'Italic' in styles:
+        return f'*{text}*'
+    if 'Code' in styles:
+        return f'`{text}`'
+    if 'Strikethrough' in styles:
+        return f'~~{text}~~'
+    return _md_escape_plain(text)
+
+
+def _md_runs(runs) -> str:
+    """Render inline runs back to markdown (emphasis, code, links).
+
+    Consecutive runs sharing one link target are emitted as a single
+    `[...](url)` so `[nested **bold** inside](url)` doesn't split into
+    three adjacent links.
+    """
+    parts = []
+    i = 0
+    while i < len(runs):
+        url = _link_url(runs[i].get('styles', []))
+        if url is not None:
+            group = []
+            while i < len(runs):
+                if _link_url(runs[i].get('styles', [])) != url:
+                    break
+                group.append(_md_emphasis(runs[i]))
+                i += 1
+            parts.append('[' + ''.join(group) + f']({url})')
+            continue
+        parts.append(_md_emphasis(runs[i]))
+        i += 1
+    return ''.join(parts)
+
+
 def _render_block_markdown(block: dict) -> list:
     """Render a single block to markdown lines."""
     if 'CoverPage' in block:
         data = block['CoverPage']['data']
-        lines = []
+        # Blank line after every field: consecutive cover lines would
+        # re-parse as one paragraph and collapse on the next export, so
+        # the output would not be a fixed point.
+        fields = []
         if data.get('title'):
-            lines.append(f'# {data["title"]}')
+            fields.append(f'# {data["title"]}')
         if data.get('subtitle'):
-            lines.append(f'*{data["subtitle"]}*')
+            fields.append(f'*{data["subtitle"]}*')
         if data.get('author'):
-            lines.append(f'**{data["author"]}**')
+            fields.append(f'**{data["author"]}**')
         if data.get('date'):
-            lines.append(data['date'])
-        lines.append('')
+            fields.append(data['date'])
+        lines = []
+        for field in fields:
+            lines.append(field)
+            lines.append('')
         return lines
     elif 'Heading' in block:
         h = block['Heading']
         level = h['level']
-        text = ''.join(r['text'] for r in h.get('runs', []))
-        return [f'{"#" * level} {text}', '']
+        return [f'{"#" * level} {_md_runs(h.get("runs", []))}', '']
     elif 'Paragraph' in block:
-        p = block['Paragraph']
-        parts = []
-        for run_data in p.get('runs', []):
-            text = run_data['text']
-            styles = run_data.get('styles', [])
-            if 'Bold' in styles and 'Italic' in styles or 'BoldItalic' in styles:
-                parts.append(f'***{text}***')
-            elif 'Bold' in styles:
-                parts.append(f'**{text}**')
-            elif 'Italic' in styles:
-                parts.append(f'*{text}*')
-            elif 'Code' in styles:
-                parts.append(f'`{text}`')
-            elif 'Strikethrough' in styles:
-                parts.append(f'~~{text}~~')
-            else:
-                parts.append(text)
-        return [''.join(parts), '']
+        return [_md_runs(block['Paragraph'].get('runs', [])), '']
     elif 'Image' in block:
         img = block['Image']['data']
         alt = img.get('alt_text', 'image')
         path = img.get('path', '')
         lines = [f'![{alt}]({path})']
         if img.get('caption'):
+            # The parser keeps captions as their own (italic) paragraph, so
+            # a blank line must precede the caption — otherwise the next
+            # export adds one and the output stops being a fixed point.
+            lines.append('')
             lines.append(f'*{img["caption"]}*')
         lines.append('')
         return lines
@@ -1009,14 +1291,22 @@ def _render_block_markdown(block: dict) -> list:
                 cells = []
                 for j in range(num_cols):
                     if j < len(row):
-                        text = ''.join(r.get('text', '') for r in row[j].get('runs', []))
-                        cells.append(text)
+                        # Cell styles must survive re-export exactly like
+                        # List/Quote/Paragraph runs do — flattening to plain
+                        # text would silently drop bold/links in tables.
+                        cell = _md_runs(row[j].get('runs', []))
+                        # An unescaped pipe would split this cell into extra
+                        # columns when the output is parsed again.
+                        cells.append(cell.replace('|', r'\|'))
                     else:
                         cells.append('')
                 lines.append('| ' + ' | '.join(cells) + ' |')
                 if i == 0:
                     lines.append('| ' + ' | '.join(['---'] * num_cols) + ' |')
         if table.get('caption'):
+            # Captions re-parse as their own paragraph (see Image above):
+            # emit a blank line before them so re-export is byte-identical.
+            lines.append('')
             lines.append(f'*{table["caption"]}*')
         lines.append('')
         return lines
@@ -1024,4 +1314,41 @@ def _render_block_markdown(block: dict) -> list:
         return [f'*{block["Caption"]["text"]}*', '']
     elif 'HorizontalRule' in block:
         return ['---', '']
-    return []
+    elif 'PageBreak' in block:
+        # Layout instruction, not content: emit a pandoc-readable break.
+        return ['\\newpage', '']
+    elif 'List' in block:
+        items = block['List'].get('items', [])
+        lines = []
+        counters = {}
+        for item in items:
+            level = min(int(item.get('level', 0)), 4)
+            indent = '  ' * level
+            checked = item.get('checked')
+            ordered = bool(item.get('ordered'))
+            for deeper in [lv for lv in counters if lv > level]:
+                del counters[deeper]
+            if checked is not None:
+                prefix = f'{indent}- {"[x]" if checked else "[ ]"} '
+            elif ordered:
+                counters[level] = counters.get(level, 0) + 1
+                prefix = f'{indent}{counters[level]}. '
+            else:
+                counters.pop(level, None)
+                prefix = f'{indent}- '
+            lines.append(prefix + _md_runs(item.get('runs', [])))
+        lines.append('')
+        return lines
+    elif 'Quote' in block:
+        q = block['Quote']
+        level = min(int(q.get('level', 1)), 4)
+        return [f'{">" * level} {_md_runs(q.get("runs", []))}', '']
+    elif 'CodeBlock' in block:
+        c = block['CodeBlock']
+        body = c.get('text', '')
+        # Widen the fence when the body itself contains backticks.
+        fence = '````' if '```' in body else '```'
+        lang = c.get('language', '')
+        return [fence + lang, *body.split('\n'), fence, '']
+    # No-silent-drop law: unknown block shapes are bugs, not content.
+    raise ValueError(f'_render_block_markdown: unknown block {block!r}')

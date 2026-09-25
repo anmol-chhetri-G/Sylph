@@ -407,3 +407,53 @@ This order directly addresses the current arrow-key and line-editing failures wh
 Sylph v0.1 is complete when a user can create and reopen a local A4 report, type and navigate reliably, apply core rich formatting, insert page breaks/images/tables, generate a TOC and page numbers, configure margins, recover from a crash, inspect/restore revisions, and export a visually faithful PDF/HTML plus a documented Markdown representation. DOCX/ODT compatibility may remain limited if unsupported features are clearly reported.
 
 The non-goals for v0.1 are collaboration, cloud sync, real-time multi-user CRDT behavior, full Word compatibility, arbitrary desktop publishing/freeform canvas layout, and a plugin marketplace.
+
+## 12. Markdown support in export — v1 scope and known limitations
+
+The export pipeline parses editor text with one shared parser (`parse_content_blocks`
+in `apps/desktop/src/main.rs`) into structured blocks (`Block::List/Quote/CodeBlock`,
+`SpanStyle::Link`), which the GUI, the headless CLI (`--export-* <file>.md`), and all
+three renderers (DOCX/PDF/Markdown in `python/export.py`) consume. Supported: ATX
+headings, paragraphs with emphasis/code/strikethrough, inline links, `<autolinks>`,
+backslash escapes, bullet/ordered/task lists with nesting (2- and 4-space styles),
+blockquotes with `>` depth, fenced code blocks (verbatim, language kept), pipe tables
+(with inline styles in cells), thematic breaks, standalone images, and a
+pandoc-style `\newpage` line that parses back into `Block::PageBreak` (the same
+directive the Markdown exporter emits for structured page breaks).
+
+Honest v1 limitations (not parsed as in CommonMark/GFM; content is kept as literal
+text rather than dropped):
+
+- **Setext headings**: `Title\n===` is not a heading; a `---` line is always a
+  thematic break, even directly under a paragraph line.
+- **Hard line breaks**: trailing double-space or trailing `\` do not break lines;
+  consecutive paragraph lines are joined with a single space.
+- **Reference-style links** (`[text][ref]`, `[ref]: url`) are not resolved; they
+  stay literal text.
+- **Bare/URL autolinks** (`www.example.com` without angle brackets) are not
+  linkified; only the `<https://...>` form is.
+- **Nested blockquotes inside list items**: a `>` line interrupts a list (quotes
+  and lists are scanned at block level, not nested inside each other).
+- **Table column alignment** (`:---:`) is parsed but not stored; exports use equal
+  column widths. Ragged rows are padded/truncated to the header width.
+- **Images inside sentences** degrade to their alt text; only standalone
+  `![alt](path)` lines become real image blocks.
+- **Indented (4-space) code blocks** are not code; only fenced blocks are.
+- **Inline HTML** is literal text in every format.
+- `_..._` is deliberately not emphasis (snake_case must stay plain).
+- PDF core fonts are latin-1: bullet markers render as `·` in PDF while DOCX uses
+  `•`; Markdown output uses the standard `- ` prefix.
+
+Round-trip guarantee: Markdown → parse → Markdown export is byte-identical for
+markdown already in exported (canonical) form — re-exporting export output is a
+fixed point (proven for both `fixtures/kitchen-sink.md` and the rich
+`fixtures/report.json` export: cover fields are emitted blank-line separated,
+table/figure captions as their own paragraph, and page breaks as `\newpage`, so
+every construct re-parses into the structure that produced it).
+Hand-written source markdown is *canonicalized* on first export, with semantics
+preserved: `<https://…>` becomes `[https://…](https://…)`, soft-wrapped
+paragraph/list/quote lines join, list indents normalize to 2 spaces per level,
+and `:---:` alignment markers drop to `---` (alignment is not stored — see
+limitations). Cell styles, links and escapes survive the normalization
+byte-for-byte after the first pass. Cover-page *structure* is not re-created on
+markdown import: cover fields come back as a heading plus separate paragraphs.

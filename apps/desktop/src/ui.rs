@@ -1,17 +1,125 @@
 use crate::{
-    BoldText, CloseOverlay, ContextMenuCopy, ContextMenuCut, ContextMenuPaste, CycleBodyFont,
-    CycleHeading, ExportPdf, InsertPageBreak, InsertTable, InspectorMode, ItalicText,
-    NavigatorTab, NewDocument, OpenCommandPalette, OpenFindBar, OpenModalShowcase, PasteImage,
-    Redo, SaveDoc, SetPageMargins, SetPageSize, ShowImageInspector, ShowParagraphInspector,
-    ShowVersionHistory, SylphApp, ToggleDarkMode, ToggleInspector, ToggleMarkdownMode,
-    ToggleRuler, ToggleSidebar, Undo, WorkspaceOverlay,
+    heading_level_and_text, heading_metrics_pt, BoldText, CloseOverlay, ContextMenuCopy,
+    ContextMenuCut, ContextMenuPaste, CycleBodyFont, CycleHeading, ExportPdf, InsertPageBreak,
+    InsertTable, InspectorMode, ItalicText, NavigatorTab, NewDocument, OpenCommandPalette,
+    OpenFindBar, OpenModalShowcase, PasteImage, Redo, SaveDoc, SetPageMargins, SetPageSize,
+    ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, StrikethroughText, SylphApp,
+    ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo,
+    WorkspaceOverlay,
 };
 use gpui::prelude::*;
-use gpui::{div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels, Rgba, Stateful, Window};
+use gpui::{
+    div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels, Rgba, Stateful, Window,
+};
 
 const UI_FONT: &str = "Hanken Grotesk";
 const PROSE_FONT: &str = "EB Garamond";
-const MONO_FONT: &str = "JetBrains Mono";
+pub(crate) const MONO_FONT: &str = "JetBrains Mono";
+
+/// Hover tooltip for toolbar buttons: a small dark chip with the action's
+/// name (and honest notes on controls that are present but not wired yet).
+struct ToolbarTip(&'static str);
+
+impl Render for ToolbarTip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgb(0x1c2333))
+            .text_color(rgb(0xe6e9f0))
+            .font_family(UI_FONT)
+            .text_size(px(11.0))
+            .child(self.0)
+    }
+}
+
+/// Attach a hover tooltip to a toolbar button. GPUI tooltips need a
+/// stateful (id'd) element, so the caller supplies a stable id.
+fn with_tip(button: Div, id: &'static str, tip: &'static str) -> Stateful<Div> {
+    button
+        .id(id)
+        .tooltip(move |_, cx| cx.new(move |_| ToolbarTip(tip)).into())
+}
+
+/// Which view-mode chip is lit. Exactly one: Web wins over Focus, and
+/// Focus (both side panels hidden) beats Print, the default layout.
+pub(crate) fn view_mode_active(web: bool, sidebar: bool, inspector: bool) -> (bool, bool, bool) {
+    if web {
+        (false, true, false)
+    } else if !sidebar && !inspector {
+        (false, false, true)
+    } else {
+        (true, false, false)
+    }
+}
+
+/// Spacing (points) shown for the block at the cursor: headings carry the
+/// spec's space-before/after; everything else is the paragraph default the
+/// export renderer applies (0 before / 8 after).
+pub(crate) fn spacing_pt_for(heading_level: u8) -> (f32, f32) {
+    if heading_level == 0 {
+        let d = sylph_core::document::ParagraphStyle::default();
+        (d.space_before, d.space_after)
+    } else {
+        let (_, before, after) = heading_metrics_pt(heading_level);
+        (before, after)
+    }
+}
+
+/// Ruler marks for a page, in centimeters: even-centimeter ticks across
+/// the real width, a tick at the page edge itself, and a marker at each
+/// margin edge (they replace any tick they would collide with). Returns
+/// sorted `(position_cm, is_margin_edge)` pairs.
+fn ruler_marks(width_cm: f32, left_cm: f32, right_cm: f32) -> Vec<(f32, bool)> {
+    let mut marks: Vec<(f32, bool)> = Vec::new();
+    if width_cm <= 0.0 {
+        return marks;
+    }
+    let near_edge = |cm: f32| (cm - left_cm).abs() < 0.45 || (cm - right_cm).abs() < 0.45;
+    let mut cm = 0.0;
+    while cm < width_cm - 0.01 {
+        if !near_edge(cm) {
+            marks.push((cm, false));
+        }
+        cm += 2.0;
+    }
+    if !near_edge(width_cm) {
+        marks.push((width_cm, false));
+    }
+    for edge in [left_cm, right_cm] {
+        if (0.0..=width_cm).contains(&edge) {
+            marks.push((edge, true));
+        }
+    }
+    marks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    marks
+}
+
+/// Words = whitespace-separated tokens containing at least one
+/// alphanumeric character. Markdown tokens (`#`, `##`, `**`, `-`) are
+/// never counted as words, in either mode.
+pub(crate) fn count_words(content: &str) -> usize {
+    content
+        .split_whitespace()
+        .filter(|token| token.chars().any(|c| c.is_alphanumeric()))
+        .count()
+}
+
+/// Status-bar position at `cursor`: 1-based logical line and character
+/// column — logical blocks, never visual wraps, and never raw byte
+/// offsets (multi-byte characters count as one column).
+pub(crate) fn cursor_status(content: &str, cursor: usize) -> (usize, usize, usize) {
+    let mut cursor = cursor.min(content.len());
+    while cursor < content.len() && !content.is_char_boundary(cursor) {
+        cursor += 1;
+    }
+    let before = &content[..cursor];
+    let line = before.matches('\n').count() + 1;
+    let col_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let column = before[col_start..].chars().count() + 1;
+    (line, column, count_words(content))
+}
 
 fn icon(glyph: &str, color: Rgba, size: f32) -> Div {
     div()
@@ -110,6 +218,13 @@ impl SylphApp {
         cx: &mut Context<Self>,
     ) {
         self.markdown_mode = !self.markdown_mode;
+        // The toggle is the single source of truth: the canvas follows it
+        // (ON = WYSIWYG with hidden syntax, OFF = literal source).
+        let on = self.markdown_mode;
+        self.editor.update(cx, |editor, cx| {
+            editor.markdown_mode = on;
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -457,27 +572,61 @@ impl SylphApp {
             .border_b_1()
             .border_color(border);
 
-        bar = bar.child(self.tool_button("☰", self.sidebar_visible).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)),
-        ));
-        bar = bar.child(self.tool_button("◧", self.inspector_visible).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.toggle_inspector(&ToggleInspector, window, cx)),
-        ));
+        bar = bar.child(
+            with_tip(
+                self.tool_button("☰", self.sidebar_visible),
+                "toggle-sidebar",
+                "Toggle sidebar",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)),
+            ),
+        );
+        bar = bar.child(
+            with_tip(
+                self.tool_button("◧", self.inspector_visible),
+                "toggle-inspector",
+                "Toggle inspector",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.toggle_inspector(&ToggleInspector, window, cx)
+                }),
+            ),
+        );
         bar = bar.child(divider(border));
-        bar = bar.child(self.tool_button("＋", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.new_document(&NewDocument, window, cx)),
+        bar = bar.child(
+            with_tip(
+                self.tool_button("＋", false),
+                "new-document",
+                "New document",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.new_document(&NewDocument, window, cx)),
+            ),
+        );
+        bar = bar.child(with_tip(
+            self.tool_button("□", false),
+            "utility-open",
+            "Not wired in v1",
         ));
-        bar = bar.child(self.tool_button("□", false));
-        bar = bar.child(self.tool_button("▣", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.save_doc(&SaveDoc, window, cx)),
-        ));
+        bar = bar.child(
+            with_tip(
+                self.tool_button("▣", false),
+                "save-document",
+                "Save document",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.save_doc(&SaveDoc, window, cx)),
+            ),
+        );
         bar = bar.child(divider(border));
-        for (glyph, action) in [("↶", 0), ("↷", 1)] {
-            let button = self.tool_button(glyph, false);
+        for (glyph, id, tip, action) in [("↶", "undo", "Undo", 0), ("↷", "redo", "Redo", 1)] {
+            let button = with_tip(self.tool_button(glyph, false), id, tip);
             bar = bar.child(match action {
                 0 => button.on_mouse_down(
                     MouseButton::Left,
@@ -490,25 +639,37 @@ impl SylphApp {
             });
         }
         bar = bar.child(divider(border));
-        bar = bar.child(self.tool_button("✂", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.context_menu_cut(&ContextMenuCut, window, cx)),
-        ));
-        bar = bar.child(self.tool_button("□", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.context_menu_copy(&ContextMenuCopy, window, cx)),
-        ));
-        bar = bar.child(self.tool_button("▣", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                this.context_menu_paste(&ContextMenuPaste, window, cx)
-            }),
-        ));
+        bar = bar.child(
+            with_tip(self.tool_button("✂", false), "edit-cut", "Cut").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_cut(&ContextMenuCut, window, cx)
+                }),
+            ),
+        );
+        bar = bar.child(
+            with_tip(self.tool_button("□", false), "edit-copy", "Copy").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_copy(&ContextMenuCopy, window, cx)
+                }),
+            ),
+        );
+        bar = bar.child(
+            with_tip(self.tool_button("▣", false), "edit-paste", "Paste").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_paste(&ContextMenuPaste, window, cx)
+                }),
+            ),
+        );
         bar = bar.child(divider(border));
-        bar = bar.child(self.tool_button("⌕", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.open_find_bar(&OpenFindBar, window, cx)),
-        ));
+        bar = bar.child(
+            with_tip(self.tool_button("⌕", false), "open-find", "Find").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.open_find_bar(&OpenFindBar, window, cx)),
+            ),
+        );
         bar = bar.child(divider(border));
         bar = bar.child(
             div()
@@ -538,15 +699,62 @@ impl SylphApp {
             .border_1()
             .border_color(border)
             .rounded(px(2.0));
-        for (name, active) in [("Print", true), ("Web", false), ("Focus", false)] {
-            modes = modes.child(self.compact_button(name, active));
+        let (print_active, web_active, focus_active) = view_mode_active(
+            self.web_layout,
+            self.sidebar_visible,
+            self.inspector_visible,
+        );
+        for (name, active) in [
+            ("Print", print_active),
+            ("Web", web_active),
+            ("Focus", focus_active),
+        ] {
+            let (id, tip) = match name {
+                "Print" => ("mode-print", "Print layout — fixed page canvas"),
+                "Web" => ("mode-web", "Web layout — continuous width, no pages"),
+                _ => ("mode-focus", "Focus — hide the side panels"),
+            };
+            modes = modes.child(
+                with_tip(self.compact_button(name, active), id, tip).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _window, cx| {
+                        match name {
+                            "Print" => {
+                                this.web_layout = false;
+                                this.sidebar_visible = true;
+                                this.inspector_visible = true;
+                            }
+                            "Web" => {
+                                this.web_layout = true;
+                            }
+                            _ => {
+                                this.web_layout = false;
+                                this.sidebar_visible = false;
+                                this.inspector_visible = false;
+                            }
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
         }
         bar = bar.child(modes).child(divider(border));
-        bar = bar.child(self.tool_button("▥", self.ruler_visible).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.toggle_ruler(&ToggleRuler, window, cx)),
+        bar = bar.child(
+            with_tip(
+                self.tool_button("▥", self.ruler_visible),
+                "toggle-ruler",
+                "Toggle ruler",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.toggle_ruler(&ToggleRuler, window, cx)),
+            ),
+        );
+        bar = bar.child(with_tip(
+            self.tool_button("＋", false),
+            "utility-add",
+            "Not wired in v1",
         ));
-        bar = bar.child(self.tool_button("＋", false));
         bar
     }
 
@@ -723,6 +931,9 @@ impl SylphApp {
             1 => "Heading 1",
             2 => "Heading 2",
             3 => "Heading 3",
+            4 => "Heading 4",
+            5 => "Heading 5",
+            6 => "Heading 6",
             _ => "Normal",
         };
         let font_size_display = self.document.body_font_size.round() as i32;
@@ -751,7 +962,12 @@ impl SylphApp {
                         }),
                     )
                     .child(label(heading_label, text, 12.0))
-                    .child(icon("⌄", muted, 12.0)),
+                    .child(icon("⌄", muted, 12.0))
+                    .id("heading-style")
+                    .tooltip(|_, cx| {
+                        cx.new(|_| ToolbarTip("Block style — click to cycle Normal → H1 … H6"))
+                            .into()
+                    }),
             )
             .child(
                 div()
@@ -774,7 +990,9 @@ impl SylphApp {
                         }),
                     )
                     .child(label(self.document.body_font.clone(), text, 12.0))
-                    .child(icon("⌄", muted, 12.0)),
+                    .child(icon("⌄", muted, 12.0))
+                    .id("body-font")
+                    .tooltip(|_, cx| cx.new(|_| ToolbarTip("Body font — click to cycle")).into()),
             )
             .child(
                 div()
@@ -799,6 +1017,8 @@ impl SylphApp {
                                     this.adjust_body_font_size(-1, window, cx);
                                 }),
                             )
+                            .id("font-size-down")
+                            .tooltip(|_, cx| cx.new(|_| ToolbarTip("Decrease body size")).into())
                             .child(icon("−", muted, 12.0)),
                     )
                     .child(label(font_size_display.to_string(), text, 12.0))
@@ -813,19 +1033,27 @@ impl SylphApp {
                                     this.adjust_body_font_size(1, window, cx);
                                 }),
                             )
+                            .id("font-size-up")
+                            .tooltip(|_, cx| cx.new(|_| ToolbarTip("Increase body size")).into())
                             .child(icon("＋", muted, 12.0)),
                     ),
             )
             .child(divider(border));
 
         let mut emphasis = div().flex().items_center().gap(px(2.0));
-        for (glyph, action, active) in [
-            ("B", 0, true),
-            ("I", 1, false),
-            ("U", 2, false),
-            ("S", 3, false),
+        for (glyph, id, action, active, tip) in [
+            ("B", "emph-bold", 0, true, "Bold"),
+            ("I", "emph-italic", 1, false, "Italic"),
+            (
+                "U",
+                "emph-underline",
+                2,
+                false,
+                "Underline — not supported in Markdown v1",
+            ),
+            ("S", "emph-strike", 3, false, "Strikethrough"),
         ] {
-            let button = self.compact_button(glyph, active);
+            let button = with_tip(self.compact_button(glyph, active), id, tip);
             emphasis = emphasis.child(match action {
                 0 => button.on_mouse_down(
                     MouseButton::Left,
@@ -835,13 +1063,29 @@ impl SylphApp {
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.italic_text(&ItalicText, window, cx)),
                 ),
+                3 => button.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.strikethrough_text(&StrikethroughText, window, cx)
+                    }),
+                ),
                 _ => button,
             });
         }
 
         let mut align = div().flex().items_center().gap(px(2.0));
-        for glyph in ["A", "☷", "≣", "⇥", "↔"] {
-            align = align.child(self.tool_button(glyph, glyph == "A"));
+        for (glyph, id) in [
+            ("A", "tool-color"),
+            ("☷", "tool-columns"),
+            ("≣", "tool-list"),
+            ("⇥", "tool-indent"),
+            ("↔", "tool-distribute"),
+        ] {
+            align = align.child(with_tip(
+                self.tool_button(glyph, glyph == "A"),
+                id,
+                "Not wired in v1",
+            ));
         }
         align = align.child(
             div()
@@ -861,29 +1105,60 @@ impl SylphApp {
                         this.cycle_line_spacing(window, cx);
                     }),
                 )
-                .child(label(format!("{:.2}", self.document.line_spacing), text, 12.0))
-                .child(icon("↕", muted, 12.0)),
+                .child(label(
+                    format!("{:.2}", self.document.line_spacing),
+                    text,
+                    12.0,
+                ))
+                .child(icon("↕", muted, 12.0))
+                .id("line-spacing")
+                .tooltip(|_, cx| {
+                    cx.new(|_| ToolbarTip("Line spacing — click to cycle"))
+                        .into()
+                }),
         );
 
         let mut inserts = div().flex().items_center().gap(px(2.0));
-        inserts = inserts.child(self.tool_button("↗", false));
-        inserts = inserts.child(self.tool_button("▧", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                this.show_image_inspector(&ShowImageInspector, window, cx);
-                this.paste_image(&PasteImage, window, cx);
-            }),
+        inserts = inserts.child(with_tip(
+            self.tool_button("↗", false),
+            "insert-link",
+            "Not wired in v1",
         ));
-        inserts = inserts.child(self.tool_button("▦", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                this.open_modal_showcase(&OpenModalShowcase, window, cx);
-            }),
-        ));
-        inserts = inserts.child(self.tool_button("↵", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| this.insert_page_break(&InsertPageBreak, window, cx)),
-        ));
+        inserts = inserts.child(
+            with_tip(self.tool_button("▧", false), "insert-image", "Paste image").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.show_image_inspector(&ShowImageInspector, window, cx);
+                    this.paste_image(&PasteImage, window, cx);
+                }),
+            ),
+        );
+        inserts = inserts.child(
+            with_tip(
+                self.tool_button("▦", false),
+                "insert-showcase",
+                "Examples gallery",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.open_modal_showcase(&OpenModalShowcase, window, cx);
+                }),
+            ),
+        );
+        inserts = inserts.child(
+            with_tip(
+                self.tool_button("↵", false),
+                "insert-page-break",
+                "Page break",
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.insert_page_break(&InsertPageBreak, window, cx)
+                }),
+            ),
+        );
 
         let mut left = controls
             .child(emphasis)
@@ -891,15 +1166,20 @@ impl SylphApp {
             .child(align)
             .child(divider(border))
             .child(inserts);
-        left = left
-            .child(divider(border))
-            .child(self.tool_button("＋", false).on_mouse_down(
+        left = left.child(divider(border)).child(
+            with_tip(
+                self.tool_button("＋", false),
+                "command-palette",
+                "Command palette",
+            )
+            .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
                     this.overlay = WorkspaceOverlay::CommandPalette;
                     this.open_command_palette(&OpenCommandPalette, window, cx);
                 }),
-            ));
+            ),
+        );
 
         bar = bar.child(left).child(
             div()
@@ -1006,34 +1286,51 @@ impl SylphApp {
             NavigatorTab::Outline => {
                 body = body
                     .child(label("DOCUMENT MAP", muted, 11.0).font_weight(gpui::FontWeight(600.0)));
-                // Real headings parsed from editor content; no more hardcoded demo items.
+                // The Markdown toggle is the single source of truth: the
+                // outline only parses headings when it is ON, so OFF never
+                // claims structure the canvas does not show.
                 let content = self.editor.read(cx).content.clone();
                 let mut headings: Vec<(u8, String)> = Vec::new();
-                for line in content.lines() {
-                    let t = line.trim_start();
-                    let n = t.chars().take_while(|c| *c == '#').count();
-                    if (1..=6).contains(&n) && t[n..].starts_with(' ') {
-                        headings.push((n as u8, t[n + 1..].trim().to_string()));
+                if self.markdown_mode {
+                    // Real headings parsed from editor content with the
+                    // same rules as the export parser: nothing inside ```
+                    // fences is a heading, and `# ` with no text is not
+                    // one either.
+                    let mut in_fence = false;
+                    for line in content.lines() {
+                        if line.trim_start().starts_with("```") {
+                            in_fence = !in_fence;
+                            continue;
+                        }
+                        if in_fence {
+                            continue;
+                        }
+                        if let Some((level, text)) = heading_level_and_text(line.trim_start()) {
+                            headings.push((level, text.to_string()));
+                        }
                     }
-                }
-                // Also include structured heading blocks from the rich document.
-                for b in &self.document.blocks {
-                    if let sylph_core::document::Block::Heading { level, runs } = b {
-                        let s: String =
-                            runs.iter().map(|r| r.text.as_str()).collect();
-                        if !s.trim().is_empty() {
-                            headings.push((*level, s));
+                    // Also include structured heading blocks from the rich document.
+                    for b in &self.document.blocks {
+                        if let sylph_core::document::Block::Heading { level, runs } = b {
+                            let s: String = runs.iter().map(|r| r.text.as_str()).collect();
+                            if !s.trim().is_empty() {
+                                headings.push((*level, s));
+                            }
                         }
                     }
                 }
-                if headings.is_empty() {
-                    body = body.child(
-                        div().py(px(8.0)).child(label(
-                            "Under dev — no headings yet. Use # to add some.",
-                            muted,
-                            12.0,
-                        )),
-                    );
+                if !self.markdown_mode {
+                    body = body.child(div().py(px(8.0)).child(label(
+                        "Markdown mode is off — turn it on to see headings.",
+                        muted,
+                        12.0,
+                    )));
+                } else if headings.is_empty() {
+                    body = body.child(div().py(px(8.0)).child(label(
+                        "No headings yet — start a line with # to add one.",
+                        muted,
+                        12.0,
+                    )));
                 } else {
                     for (level, title) in headings.iter().take(30) {
                         let indent = px((*level as f32 - 1.0).clamp(0.0, 4.0) * 12.0);
@@ -1054,19 +1351,16 @@ impl SylphApp {
                     .document
                     .blocks
                     .iter()
-                    .filter(|b| {
-                        matches!(b, sylph_core::document::Block::PageBreak)
-                    })
+                    .filter(|b| matches!(b, sylph_core::document::Block::PageBreak))
                     .count();
                 let count = breaks + 1;
                 body = body
-                    .child(label(
-                        format!("PAGES ({})", count),
-                        muted,
-                        11.0,
-                    ).font_weight(gpui::FontWeight(600.0)))
+                    .child(
+                        label(format!("PAGES ({})", count), muted, 11.0)
+                            .font_weight(gpui::FontWeight(600.0)),
+                    )
                     .child(div().py(px(6.0)).child(label(
-                        "Under dev — live thumbnails not built yet.",
+                        "Page thumbnails aren’t available yet.",
                         muted,
                         11.0,
                     )))
@@ -1096,8 +1390,8 @@ impl SylphApp {
                     .child(label("1", primary, 11.0).text_center());
             }
             NavigatorTab::Assets => {
-                body = body
-                    .child(label("ASSETS", muted, 11.0).font_weight(gpui::FontWeight(600.0)));
+                body =
+                    body.child(label("ASSETS", muted, 11.0).font_weight(gpui::FontWeight(600.0)));
                 let mut images: Vec<String> = Vec::new();
                 let mut tables = 0usize;
                 for b in &self.document.blocks {
@@ -1111,7 +1405,7 @@ impl SylphApp {
                 }
                 if images.is_empty() && tables == 0 {
                     body = body.child(div().py(px(8.0)).child(label(
-                        "Under dev — no assets yet. Insert an image or table.",
+                        "No images or tables yet — insert one to see it here.",
                         muted,
                         12.0,
                     )));
@@ -1146,11 +1440,11 @@ impl SylphApp {
             .border_t_1()
             .border_color(border)
             .child(label("RECENT FILES", muted, 11.0).font_weight(gpui::FontWeight(600.0)))
-            .child(div().py(px(6.0)).child(label(
-                "Under dev — recent-file tracking not built yet.",
-                muted,
-                11.0,
-            )));
+            .child(
+                div()
+                    .py(px(6.0))
+                    .child(label("No recent files yet.", muted, 11.0)),
+            );
 
         div()
             .w(px(260.0))
@@ -1170,44 +1464,49 @@ impl SylphApp {
         let muted = self.ui_muted();
         let primary = self.ui_primary();
         let page_w = self.page_width();
+        // Real page geometry (pt → cm at 2.54 cm/in): ticks and margin
+        // markers track the current page size and margins, so the ruler
+        // matches the page below it — A4, Letter, landscape, or edited.
+        let pt_to_cm = |pt: f32| pt * 2.54 / 72.0;
+        let width_cm = pt_to_cm(self.document.page_width());
+        let left_cm = pt_to_cm(self.document.page_margins.left);
+        let right_cm = width_cm - pt_to_cm(self.document.page_margins.right);
+        let fmt = |cm: f32| {
+            let r = (cm * 10.0).round() / 10.0;
+            if (r - r.round()).abs() < 1e-3 {
+                format!("{:.0}", r)
+            } else {
+                format!("{:.1}", r)
+            }
+        };
+        let width_px: f32 = page_w.into();
         let mut ticks = div()
+            .relative()
             .w(page_w)
             .h(px(20.0))
-            .flex()
-            .items_end()
-            .justify_between()
-            .px(px(8.0))
             .font_family(MONO_FONT)
             .text_size(px(8.0))
             .text_color(muted);
-        for (index, value) in [
-            "0", "1", "2.5", "4", "6", "8", "10", "12", "14", "16", "18.5", "20", "21",
-        ]
-        .iter()
-        .enumerate()
-        {
+        for (cm, is_margin) in ruler_marks(width_cm, left_cm, right_cm) {
+            // Each mark is absolutely placed at its proportional x, with a
+            // fixed-width centered label so the tick lands on the number.
             ticks = ticks.child(
                 div()
-                    .relative()
-                    .pb(px(3.0))
-                    .when(index == 2 || index == 10, |s| s.text_color(primary))
-                    .child((*value).to_string())
+                    .absolute()
+                    .left(px(width_px * (cm / width_cm) - 12.0))
+                    .w(px(24.0))
+                    .h(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_end()
+                    .when(is_margin, |s| s.text_color(primary))
+                    .child(fmt(cm))
                     .child(
                         div()
-                            .absolute()
-                            .left(px(4.0))
-                            .bottom_0()
                             .w(px(1.0))
-                            .h(if index == 2 || index == 10 {
-                                px(10.0)
-                            } else {
-                                px(6.0)
-                            })
-                            .bg(if index == 2 || index == 10 {
-                                primary
-                            } else {
-                                self.ui_border()
-                            }),
+                            .h(if is_margin { px(10.0) } else { px(6.0) })
+                            .bg(if is_margin { primary } else { self.ui_border() }),
                     ),
             );
         }
@@ -1372,6 +1671,9 @@ impl SylphApp {
     }
 
     #[allow(dead_code)]
+    /// DEAD: the live canvas is `render_blank_editor_page` (see
+    /// `center_canvas`). Kept only as the legacy showcase layout — do not
+    /// rewire it without porting the page-setup sync first.
     fn render_page(&mut self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let text = self.ui_text();
@@ -1414,15 +1716,22 @@ impl SylphApp {
                     .bg(self.ui_panel_high()),
             );
 
+        // The editor grows with its content (no fixed clip: the caret can
+        // never float in an empty page), and the canvas body size follows
+        // the toolbar's font-size control — 11pt default = 14.67px at
+        // 96dpi, so what the toolbar says is what the page shows.
+        let body_px = self.document.body_font_size * (4.0 / 3.0);
+        let content_height = self.editor.read(cx).content_height;
+        let editor_height = px(430.0).max(content_height + px(24.0));
         let editor = div()
             .w_full()
-            .h(px(430.0))
+            .h(editor_height)
             .flex_shrink_0()
             .mb(px(10.0))
             .overflow_hidden()
             .font_family(PROSE_FONT)
-            .text_size(px(14.0))
-            .line_height(px(24.0))
+            .text_size(px(body_px))
+            .line_height(px((body_px * 1.6).max(24.0)))
             .text_color(text)
             .child(self.editor.clone())
             .on_mouse_down(
@@ -1569,6 +1878,57 @@ impl SylphApp {
             )
     }
 
+    /// Structured rich blocks (images, tables) rendered under the editor —
+    /// shared by the Print page and the Web flow so both show exactly the
+    /// same document content.
+    fn rich_block_divs(&self) -> Vec<Div> {
+        let border = self.ui_border();
+        let text = self.ui_text();
+        let muted = self.ui_muted();
+        let mut out = Vec::new();
+        for block in &self.document.blocks {
+            match block {
+                sylph_core::document::Block::PageBreak => {}
+                sylph_core::document::Block::Image { data } => {
+                    out.push(
+                        div()
+                            .mt(px(16.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(img(data.path.clone()).max_w(px(480.0)).max_h(px(300.0)))
+                            .child(
+                                label(
+                                    data.caption.clone().unwrap_or_else(|| "Figure 1".into()),
+                                    muted,
+                                    11.0,
+                                )
+                                .italic(),
+                            ),
+                    );
+                }
+                sylph_core::document::Block::Table { data } => {
+                    let mut table = div().w_full().mt(px(16.0)).border_1().border_color(border);
+                    for row in &data.rows {
+                        let mut row_div = div().flex().border_b_1().border_color(border);
+                        for cell in row {
+                            row_div = row_div.child(
+                                label(cell.text(), text, 12.0)
+                                    .flex_1()
+                                    .px(px(8.0))
+                                    .py(px(6.0)),
+                            );
+                        }
+                        table = table.child(row_div);
+                    }
+                    out.push(table);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     fn render_blank_editor_page(&mut self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let text = self.ui_text();
@@ -1577,8 +1937,14 @@ impl SylphApp {
         let page_w = self.page_width();
         let page_h = self.page_height();
         let (margin_top, margin_right, margin_bottom, margin_left) = self.page_margins_px();
-        let editor_h = page_h - margin_top - margin_bottom;
-        let text_size = px(self.document.body_font_size);
+        // The body size is set in points; the canvas paints pixels
+        // (pt × 4/3 at 96dpi) — what the toolbar says is what the page
+        // shows. The editor fills the page's layout box but never clips
+        // the caret: content taller than one page grows the galley
+        // (explicit page breaks split off further pages).
+        let content_height = self.editor.read(cx).content_height;
+        let editor_h = (page_h - margin_top - margin_bottom).max(content_height + px(24.0));
+        let text_size = px(self.document.body_font_size * (4.0 / 3.0));
         let line_height = text_size * self.document.line_spacing;
         let editor = div()
             .w_full()
@@ -1624,46 +1990,7 @@ impl SylphApp {
             )
             .child(editor);
 
-        for block in &self.document.blocks {
-            match block {
-                sylph_core::document::Block::PageBreak => {}
-                sylph_core::document::Block::Image { data } => {
-                    page_content = page_content.child(
-                        div()
-                            .mt(px(16.0))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .child(img(data.path.clone()).max_w(px(480.0)).max_h(px(300.0)))
-                            .child(
-                                label(
-                                    data.caption.clone().unwrap_or_else(|| "Figure 1".into()),
-                                    muted,
-                                    11.0,
-                                )
-                                .italic(),
-                            ),
-                    );
-                }
-                sylph_core::document::Block::Table { data } => {
-                    let mut table = div().w_full().mt(px(16.0)).border_1().border_color(border);
-                    for row in &data.rows {
-                        let mut row_div = div().flex().border_b_1().border_color(border);
-                        for cell in row {
-                            row_div = row_div.child(
-                                label(cell.text(), text, 12.0)
-                                    .flex_1()
-                                    .px(px(8.0))
-                                    .py(px(6.0)),
-                            );
-                        }
-                        table = table.child(row_div);
-                    }
-                    page_content = page_content.child(table);
-                }
-                _ => {}
-            }
-        }
+        page_content = page_content.children(self.rich_block_divs());
 
         // Page number footer — page 1
         page_content = page_content.child(
@@ -1681,6 +2008,49 @@ impl SylphApp {
         );
 
         page_content
+    }
+
+    /// Web layout: the document flows at the canvas width — no fixed page
+    /// box, no margins, no page breaks (Word's Web Layout view). Shares the
+    /// editor and the rich blocks with the Print page, so content and font
+    /// size stay identical across views.
+    fn render_web_editor(&mut self, cx: &mut Context<Self>) -> Div {
+        let text = self.ui_text();
+        let page = self.ui_page();
+        let text_size = px(self.document.body_font_size * (4.0 / 3.0));
+        let line_height = text_size * self.document.line_spacing;
+        let content_height = self.editor.read(cx).content_height;
+        let editor_h = px(430.0).max(content_height + px(24.0));
+        let editor = div()
+            .w_full()
+            .h(editor_h)
+            .flex_shrink_0()
+            .overflow_hidden()
+            .font_family(self.document.body_font.clone())
+            .text_size(text_size)
+            .line_height(line_height)
+            .text_color(text)
+            .child(self.editor.clone())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.commit_field_edit(cx);
+                }),
+            );
+        div()
+            .w_full()
+            .min_h(px(560.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .relative()
+            .p(px(40.0))
+            .bg(page)
+            .text_color(text)
+            .font_family(PROSE_FONT)
+            .shadow_md()
+            .child(editor)
+            .children(self.rich_block_divs())
     }
 
     fn render_blank_page(&self, page_number: usize) -> Div {
@@ -1746,6 +2116,9 @@ impl SylphApp {
                 )
                 .child(div().flex_1().h(px(1.0)).bg(page_gap_border))
         };
+        // Web layout drops the page metaphor: one continuous flow, no
+        // page gaps, no extra pages, no ruler (page geometry is off).
+        let web = self.web_layout;
         let mut pages = div()
             .w_full()
             .flex_shrink_0()
@@ -1754,11 +2127,17 @@ impl SylphApp {
             .flex()
             .flex_col()
             .items_center()
-            .child(self.render_blank_editor_page(cx));
-        for page_number in 2..=page_count {
-            pages = pages
-                .child(page_gap())
-                .child(self.render_blank_page(page_number));
+            .child(if web {
+                self.render_web_editor(cx)
+            } else {
+                self.render_blank_editor_page(cx)
+            });
+        if !web {
+            for page_number in 2..=page_count {
+                pages = pages
+                    .child(page_gap())
+                    .child(self.render_blank_page(page_number));
+            }
         }
         let canvas = div()
             .id("document-canvas")
@@ -1770,7 +2149,7 @@ impl SylphApp {
             .overflow_y_scroll()
             .scrollbar_width(px(8.0))
             .bg(self.ui_workspace())
-            .child(if self.ruler_visible {
+            .child(if self.ruler_visible && !web {
                 self.ruler()
             } else {
                 div().h(px(0.0))
@@ -1878,6 +2257,9 @@ impl SylphApp {
                 )
         };
         let current_ls = self.document.line_spacing;
+        // Real spacing for the block at the cursor (heading metrics or the
+        // paragraph default the export applies) — not placeholder numbers.
+        let (before_pt, after_pt) = spacing_pt_for(self.current_heading_level(cx));
         let line_spacing = div()
             .flex()
             .items_center()
@@ -1971,8 +2353,8 @@ impl SylphApp {
                             .mt(px(8.0))
                             .flex()
                             .gap(px(4.0))
-                            .child(stepper("Before", "6 pt"))
-                            .child(stepper("After", "6 pt")),
+                            .child(stepper("Before", &format!("{before_pt:.0} pt")))
+                            .child(stepper("After", &format!("{after_pt:.0} pt"))),
                     )
                     .child(label("Line Spacing", muted, 11.0).mt(px(14.0)))
                     .child(line_spacing)
@@ -1997,7 +2379,7 @@ impl SylphApp {
                             .items_center()
                             .justify_between()
                             .child(
-                                label("PHYSICAL GALLEY & PAPER", muted, 11.0)
+                                label("Page Setup", muted, 11.0)
                                     .font_weight(gpui::FontWeight(600.0)),
                             )
                             .child(label("Defaults", primary, 10.0)),
@@ -2047,20 +2429,25 @@ impl SylphApp {
                         let ml = format!("Left    {:.2} cm", m.left * cm);
                         let mr = format!("Right   {:.2} cm", m.right * cm);
                         div().grid().grid_cols(2).gap(px(4.0)).children(
-                            [mt, mb, ml, mr]
-                                .iter()
-                                .map(|v| {
-                                    div()
-                                        .p(px(10.0))
-                                        .bg(panel)
-                                        .font_family(MONO_FONT)
-                                        .text_size(px(10.0))
-                                        .text_color(text)
-                                        .child(v.clone())
-                                }),
+                            [mt, mb, ml, mr].iter().map(|v| {
+                                div()
+                                    .p(px(10.0))
+                                    .bg(panel)
+                                    .font_family(MONO_FONT)
+                                    .text_size(px(10.0))
+                                    .text_color(text)
+                                    .child(v.clone())
+                            }),
                         )
                     })
-                    .child(label("Presets (click to cycle: Narrow → Normal → Wide)", muted, 10.0).mt(px(4.0)))
+                    .child(
+                        label(
+                            "Presets (click to cycle: Narrow → Normal → Wide)",
+                            muted,
+                            10.0,
+                        )
+                        .mt(px(4.0)),
+                    )
                     .child(
                         div()
                             .h(px(44.0))
@@ -2080,7 +2467,7 @@ impl SylphApp {
                                     this.set_page_margins(&SetPageMargins, window, cx);
                                 }),
                             )
-                            .child(label("Cycle Margins", text, 11.0))
+                            .child(label("Margins", text, 11.0))
                             .child(icon("⌄", muted, 12.0)),
                     )
                     .child(label("Pagination Style", muted, 11.0).mt(px(12.0)))
@@ -2337,9 +2724,7 @@ impl SylphApp {
         let text = self.ui_text();
         let (line, column, word_count) = {
             let editor = self.editor.read(cx);
-            let (line, column) = editor.cursor_line_and_column(editor.cursor_offset());
-            let words = editor.content.split_whitespace().count();
-            (line + 1, column + 1, words)
+            cursor_status(&editor.content, editor.cursor_offset())
         };
         let page_count = 1 + self
             .document
@@ -2347,7 +2732,12 @@ impl SylphApp {
             .iter()
             .filter(|block| matches!(block, sylph_core::document::Block::PageBreak))
             .count();
-        let save_state = self.status_message.as_deref().unwrap_or("Saved 2s ago");
+        // Never leak build paths here — the save indicator reads like
+        // Word/Docs ("All changes saved") with transient action feedback.
+        let save_state = self
+            .status_message
+            .as_deref()
+            .unwrap_or("All changes saved");
         div()
             .h(px(28.0))
             .w_full()
@@ -2572,9 +2962,20 @@ impl SylphApp {
                     .justify_between()
                     .bg(self.ui_panel_low())
                     .child(label(
-                        format!("{} · {} × {} mm", self.document.page_size.name(),
-                            if self.document.page_size == sylph_core::document::PageSize::A4 { 210 } else { 216 },
-                            if self.document.page_size == sylph_core::document::PageSize::A4 { 297 } else { 279 }),
+                        format!(
+                            "{} · {} × {} mm",
+                            self.document.page_size.name(),
+                            if self.document.page_size == sylph_core::document::PageSize::A4 {
+                                210
+                            } else {
+                                216
+                            },
+                            if self.document.page_size == sylph_core::document::PageSize::A4 {
+                                297
+                            } else {
+                                279
+                            }
+                        ),
                         text,
                         13.0,
                     ))
@@ -2596,18 +2997,18 @@ impl SylphApp {
                 let mb = format!("Bottom  {:.2} cm", m.bottom * cm);
                 let ml = format!("Left    {:.2} cm", m.left * cm);
                 let mr = format!("Right   {:.2} cm", m.right * cm);
-                div().grid().grid_cols(2).gap(px(4.0)).children(
-                    [mt, mb, ml, mr]
-                        .iter()
-                        .map(|v| {
-                            div()
-                                .p(px(12.0))
-                                .bg(self.ui_panel_low())
-                                .font_family(MONO_FONT)
-                                .text_size(px(11.0))
-                                .child(v.clone())
-                        }),
-                )
+                div()
+                    .grid()
+                    .grid_cols(2)
+                    .gap(px(4.0))
+                    .children([mt, mb, ml, mr].iter().map(|v| {
+                        div()
+                            .p(px(12.0))
+                            .bg(self.ui_panel_low())
+                            .font_family(MONO_FONT)
+                            .text_size(px(11.0))
+                            .child(v.clone())
+                    }))
             })
             .child(
                 div()
@@ -2899,5 +3300,63 @@ impl Render for SylphApp {
             this.child(self.modal_showcase(cx))
         });
         root
+    }
+}
+
+#[cfg(test)]
+mod chrome_tests {
+    use super::*;
+
+    #[test]
+    fn ruler_marks_follow_page_geometry() {
+        // A4: 21 cm wide with 2.54 cm margins → edges at 2.54 / 18.46.
+        let marks = ruler_marks(21.0, 2.54, 18.46);
+        assert!(marks.iter().any(|(cm, m)| *m && (cm - 2.54).abs() < 1e-3));
+        assert!(marks.iter().any(|(cm, m)| *m && (cm - 18.46).abs() < 1e-3));
+        assert!(
+            marks.iter().any(|(cm, m)| !*m && (cm - 21.0).abs() < 1e-3),
+            "page width tick"
+        );
+        // No plain tick collides with a margin marker, and positions ascend.
+        assert!(!marks
+            .iter()
+            .any(|(cm, m)| !*m && ((cm - 2.54).abs() < 0.45 || (cm - 18.46).abs() < 0.45)));
+        assert!(marks.windows(2).all(|w| w[0].0 <= w[1].0));
+
+        // Letter (21.59 cm): different geometry, same rules — the ruler
+        // is derived from the page setup, not hardcoded to A4.
+        let letter = ruler_marks(21.59, 2.54, 19.05);
+        assert!(letter.iter().any(|(cm, m)| *m && (cm - 19.05).abs() < 1e-3));
+        assert!(letter
+            .iter()
+            .any(|(cm, m)| !*m && (cm - 21.59).abs() < 1e-3));
+    }
+
+    #[test]
+    fn view_mode_chips_are_exclusive_and_total() {
+        assert_eq!(view_mode_active(false, true, true), (true, false, false));
+        assert_eq!(view_mode_active(true, true, true), (false, true, false));
+        assert_eq!(view_mode_active(false, false, false), (false, false, true));
+        // Half-hidden chrome is still Print; Web wins over Focus.
+        assert_eq!(view_mode_active(false, true, false), (true, false, false));
+        assert_eq!(view_mode_active(true, false, false), (false, true, false));
+    }
+
+    #[test]
+    fn inspector_spacing_reflects_the_block_at_the_cursor() {
+        // Headings show the spec's points; Normal shows the paragraph
+        // default the export renderer applies (0 before / 8 after) —
+        // never hardcoded placeholder numbers.
+        assert_eq!(spacing_pt_for(0), (0.0, 8.0));
+        assert_eq!(spacing_pt_for(1), (12.0, 6.0));
+        assert_eq!(spacing_pt_for(3), (8.0, 4.0));
+        assert_eq!(spacing_pt_for(6), (4.0, 4.0));
+    }
+
+    #[test]
+    fn word_count_never_counts_markdown_tokens() {
+        assert_eq!(count_words("# Title\n\nSome **bold** text."), 4);
+        assert_eq!(count_words("## Intro"), 1);
+        assert_eq!(count_words("- item"), 1);
     }
 }

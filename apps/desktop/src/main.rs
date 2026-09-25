@@ -67,6 +67,19 @@ struct TextInput {
     last_bounds: Option<Bounds<gpui::Pixels>>,
     all_lines: Vec<ShapedLine>,
     line_char_offsets: Vec<usize>,
+    /// Markdown mode ON: the canvas shows the WYSIWYG transform of
+    /// `content` (block syntax hidden, heading type scale applied); OFF
+    /// renders source literally. Mirrors `SylphApp::markdown_mode`.
+    markdown_mode: bool,
+    /// Per-row layout metrics from the last prepaint — rows have variable
+    /// heights (headings are taller and carry space before/after).
+    row_metas: Vec<RowMeta>,
+    /// Total laid-out content height from the last prepaint.
+    content_height: gpui::Pixels,
+    /// Source→display maps from the last prepaint (identity when OFF).
+    display_lines: Vec<DisplayLine>,
+    /// Row the caret was laid out in, for scroll-into-view.
+    cursor_row: usize,
     line_height: gpui::Pixels,
     scroll_offset_y: gpui::Pixels,
     is_selecting: bool,
@@ -114,33 +127,27 @@ impl TextInput {
     }
 
     fn ensure_cursor_visible(&mut self) {
-        let (Some(bounds), Some(line_height)) = (self.last_bounds, Some(self.line_height)) else {
+        let Some(bounds) = self.last_bounds else {
             return;
         };
-        if line_height <= px(0.0) || self.all_lines.is_empty() {
+        // Rows carry their own box metrics (headings are taller), so use
+        // the stored layout instead of assuming a uniform line height.
+        let Some(row) = self.row_metas.get(self.cursor_row) else {
+            return;
+        };
+        let (row_top, text_height) = (row.text_top, row.text_height);
+        if text_height <= px(0.0) || self.row_metas.is_empty() {
             return;
         }
 
-        let cursor = self.cursor_offset().min(self.content.len());
-        let mut line_index = 0;
-        for (index, offset) in self.line_char_offsets.iter().enumerate() {
-            if *offset > cursor {
-                break;
-            }
-            line_index = index;
-        }
-
-        let line_top = line_height * line_index as f32;
-        let line_bottom = line_top + line_height;
         let visible_height = bounds.size.height;
-        let content_height = line_height * self.all_lines.len() as f32;
-        let max_scroll = (content_height - visible_height).max(px(0.0));
+        let max_scroll = (self.content_height - visible_height).max(px(0.0));
         let mut scroll = self.scroll_offset_y;
 
-        if line_top < scroll {
-            scroll = line_top;
-        } else if line_bottom > scroll + visible_height {
-            scroll = line_bottom - visible_height;
+        if row_top < scroll {
+            scroll = row_top;
+        } else if row_top + text_height > scroll + visible_height {
+            scroll = row_top + text_height - visible_height;
         }
 
         self.scroll_offset_y = scroll.max(px(0.0)).min(max_scroll);
@@ -153,27 +160,32 @@ impl TextInput {
         let Some(bounds) = self.last_bounds.as_ref() else {
             return 0;
         };
-        let line_height = if self.line_height > px(0.0) {
-            self.line_height
-        } else {
-            px(20.0)
-        };
+        if self.row_metas.is_empty() || self.all_lines.is_empty() {
+            return 0;
+        }
         let local_y = position.y - bounds.top() + self.scroll_offset_y;
         if local_y < px(0.0) {
             return 0;
         }
-        let line_idx = (local_y / line_height).floor().max(0.0) as usize;
-        if line_idx >= self.all_lines.len() {
-            return self.content.len();
+        // Row containing the click — rows have variable heights, so walk
+        // the box ranges instead of dividing by a uniform line height.
+        let mut row_idx = self.row_metas.len() - 1;
+        for (i, m) in self.row_metas.iter().enumerate() {
+            if local_y < m.box_top + m.box_height {
+                row_idx = i;
+                break;
+            }
         }
-        let line = &self.all_lines[line_idx];
-        let char_offset = self.line_char_offsets.get(line_idx).copied().unwrap_or(0);
+        let meta = self.row_metas[row_idx];
         let local_x = (position.x - bounds.left()).max(px(0.0));
-        let local_idx = line.closest_index_for_x(local_x);
-        snap_to_char_boundary(
-            &self.content,
-            (char_offset + local_idx).min(self.content.len()),
-        )
+        // The shaped line is display text; map back through the source→
+        // display transform so clicks land on real source offsets.
+        let disp = meta.disp_start + self.all_lines[row_idx].closest_index_for_x(local_x);
+        let src = match self.display_lines.get(meta.line_idx) {
+            Some(dl) => dl.src_offset + dl.disp_to_src(disp),
+            None => meta.src_start,
+        };
+        snap_to_char_boundary(&self.content, src.min(self.content.len()))
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -274,7 +286,7 @@ impl TextInput {
         let lines_per_page = ((visible_height / line_height) as usize).max(1);
         let scroll_delta = px(line_height * lines_per_page as f32);
 
-        let total_content_height = px(line_height * self.all_lines.len() as f32);
+        let total_content_height = self.content_height;
         let max_scroll = (total_content_height - px(visible_height)).max(px(0.));
         self.scroll_offset_y = (self.scroll_offset_y + scroll_delta).min(max_scroll);
 
@@ -396,8 +408,183 @@ impl TextInput {
             .unwrap_or(self.content.len())
     }
 
-    fn markdown_runs(line: &str, font: gpui::Font, base_color: gpui::Hsla) -> Vec<TextRun> {
+    /// Inline markdown styling for one run of text: emphasis, code spans,
+    /// strikethrough, links/autolinks (whole span colored, matching
+    /// export's Link style), inline images (plain, matching export's alt
+    /// text), and backslash escapes. Marker tokens become explicit runs,
+    /// so the runs always cover `text` exactly and paint boundaries stay
+    /// aligned with what the export renders.
+    fn inline_runs(text: &str, font: gpui::Font, base_color: gpui::Hsla) -> Vec<TextRun> {
+        let color_bold = hsla(0.0, 0.0, 0.15, 1.0);
+        let color_italic = hsla(0.0, 0.0, 0.35, 1.0);
+        let color_code = hsla(120.0 / 360.0, 0.5, 0.35, 1.0);
+        let color_link = hsla(210.0 / 360.0, 0.8, 0.45, 1.0);
+        let color_strike = hsla(0.0, 0.6, 0.45, 1.0);
+
+        let state_color = |in_code: bool, in_strike: bool, in_bold: bool, in_italic: bool| {
+            if in_code {
+                color_code
+            } else if in_strike {
+                color_strike
+            } else if in_bold {
+                color_bold
+            } else if in_italic {
+                color_italic
+            } else {
+                base_color
+            }
+        };
+        let mut runs: Vec<TextRun> = Vec::new();
+        // Struck runs get a real strike line (plus the strike color), so
+        // the canvas shows what the export renders for `~~…~~`.
+        let mut push = |len: usize, color: gpui::Hsla, struck: bool| {
+            runs.push(TextRun {
+                len,
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: struck.then(|| gpui::StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: None,
+                }),
+            });
+        };
+
+        let mut chars = text.char_indices().peekable();
+        let mut seg_start = 0;
+        let mut in_bold = false;
+        let mut in_italic = false;
+        let mut in_code = false;
+        let mut in_strike = false;
+
+        // Flush [seg_start, end) with the current emphasis-state color.
+        macro_rules! flush {
+            ($end:expr) => {
+                if $end > seg_start {
+                    let color = state_color(in_code, in_strike, in_bold, in_italic);
+                    push($end - seg_start, color, in_strike);
+                }
+            };
+        }
+
+        while let Some((i, ch)) = chars.next() {
+            // 1. Backslash escape: ASCII punctuation after `\` is literal
+            //    (export drops the backslash and styles nothing extra).
+            if !in_code
+                && ch == '\\'
+                && chars
+                    .peek()
+                    .is_some_and(|(_, next)| next.is_ascii_punctuation())
+            {
+                chars.next();
+                continue;
+            }
+
+            // 2. Link/image/autolink spans: color exactly what export
+            //    treats as a link; image alt text stays plain, like export.
+            let span_end = if in_code {
+                None
+            } else if ch == '!' {
+                image_span_end(text, i)
+            } else if ch == '[' {
+                link_span_end(text, i)
+            } else if ch == '<' {
+                autolink_span_end(text, i)
+            } else {
+                None
+            };
+            if let Some(end) = span_end {
+                flush!(i);
+                push(
+                    end - i,
+                    if ch == '!' { base_color } else { color_link },
+                    in_strike,
+                );
+                seg_start = end;
+                while chars.peek().is_some_and(|(b, _)| *b < end) {
+                    chars.next();
+                }
+                continue;
+            }
+
+            if ch == '`' {
+                flush!(i);
+                in_code = !in_code;
+                seg_start = i;
+                if !in_code {
+                    push(1, color_code, in_strike);
+                    seg_start = i + 1;
+                }
+            } else if !in_code && ch == '~' && chars.peek().map(|(_, c)| *c) == Some('~') {
+                // `~~` pair: markers stay plain, content gets strike color
+                // and a strike line.
+                flush!(i);
+                push(2, base_color, false);
+                in_strike = !in_strike;
+                chars.next();
+                seg_start = i + 2;
+            } else if !in_code && ch == '*' {
+                // `*` only — `_..._` is not a marker (snake_case stays
+                // plain), exactly like the export parser.
+                if chars.peek().map(|(_, c)| *c) == Some(ch) {
+                    flush!(i);
+                    push(2, base_color, in_strike);
+                    in_bold = !in_bold;
+                    chars.next();
+                    seg_start = i + 2;
+                } else if !in_bold {
+                    flush!(i);
+                    push(1, base_color, in_strike);
+                    in_italic = !in_italic;
+                    seg_start = i + 1;
+                }
+                // Lone `*` inside bold stays literal (as before).
+            } else if !in_code && (ch == '[' || ch == ']' || ch == '(' || ch == ')' || ch == '|') {
+                flush!(i);
+                push(
+                    ch.len_utf8(),
+                    if ch == '|' { base_color } else { color_link },
+                    in_strike,
+                );
+                seg_start = i + ch.len_utf8();
+            }
+        }
+
+        if seg_start < text.len() {
+            let color = state_color(in_code, in_strike, in_bold, in_italic);
+            push(text.len() - seg_start, color, in_strike);
+        }
+
+        runs
+    }
+
+    /// Style one editor line for display. Mirrors the export parser's
+    /// decisions — same block order as `parse_content_blocks`, same inline
+    /// rules as `parse_inline_runs` — so the editor never claims styling
+    /// the export will not render. `in_fence` marks a line inside ``` where
+    /// export keeps text verbatim.
+    fn markdown_runs(
+        line: &str,
+        font: gpui::Font,
+        base_color: gpui::Hsla,
+        in_fence: bool,
+    ) -> Vec<TextRun> {
         let mut runs = Vec::new();
+
+        // Fenced-code body: export stores it verbatim — flat code color.
+        if in_fence {
+            runs.push(TextRun {
+                len: line.len(),
+                font,
+                color: hsla(120.0 / 360.0, 0.5, 0.35, 1.0),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            return runs;
+        }
+
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
 
@@ -413,149 +600,14 @@ impl TextInput {
         }
 
         let color_header = hsla(210.0 / 360.0, 0.8, 0.4, 1.0);
-        let color_bold = hsla(0.0, 0.0, 0.15, 1.0);
-        let color_italic = hsla(0.0, 0.0, 0.35, 1.0);
         let color_code = hsla(120.0 / 360.0, 0.5, 0.35, 1.0);
-        let color_link = hsla(210.0 / 360.0, 0.8, 0.45, 1.0);
         let color_list = hsla(30.0 / 360.0, 0.7, 0.45, 1.0);
         let color_quote = hsla(0.0, 0.0, 0.5, 1.0);
-        let color_strike = hsla(0.0, 0.6, 0.45, 1.0);
 
-        // Headings # .. ###### (single consolidated check, longest first).
-        let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
-        if (1..=6).contains(&hash_count)
-            && trimmed[hash_count..].starts_with(' ')
-        {
-            let prefix_len = hash_count + 1;
-            runs.push(TextRun {
-                len: prefix_len,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            runs.push(TextRun {
-                len: trimmed.len() - prefix_len,
-                font: font.clone(),
-                color: color_header,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
+        // Block order mirrors parse_content_blocks: fence → quote →
+        // heading → rule → list → paragraph.
 
-        if trimmed.starts_with("> ") {
-            runs.push(TextRun {
-                len: 2,
-                font: font.clone(),
-                color: color_quote,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            runs.push(TextRun {
-                len: trimmed.len() - 2,
-                font: font.clone(),
-                color: color_quote,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
-
-        if trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("+ ")
-        {
-            runs.push(TextRun {
-                len: 2,
-                font: font.clone(),
-                color: color_list,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            runs.push(TextRun {
-                len: trimmed.len() - 2,
-                font: font.clone(),
-                color: base_color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
-
-        // Ordered list: `1. `, `12. `, etc.
-        {
-            let mut digits = 0usize;
-            for c in trimmed.chars() {
-                if c.is_ascii_digit() {
-                    digits += 1;
-                } else {
-                    break;
-                }
-            }
-            if digits > 0
-                && trimmed[digits..].starts_with(". ")
-            {
-                let prefix_len = digits + 2;
-                runs.push(TextRun {
-                    len: prefix_len,
-                    font: font.clone(),
-                    color: color_list,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-                runs.push(TextRun {
-                    len: trimmed.len() - prefix_len,
-                    font: font.clone(),
-                    color: base_color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-                return runs;
-            }
-        }
-
-        // Horizontal rule: ---, ***, ___ (3+ of same marker).
-        {
-            let s = trimmed.trim();
-            if s.len() >= 3
-                && (s.chars().all(|c| c == '-')
-                    || s.chars().all(|c| c == '*')
-                    || s.chars().all(|c| c == '_'))
-            {
-                runs.push(TextRun {
-                    len: trimmed.len(),
-                    font: font.clone(),
-                    color: color_list,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-                return runs;
-            }
-        }
-
-        // Table row: | a | b |
-        if trimmed.starts_with('|') {
-            runs.push(TextRun {
-                len: trimmed.len(),
-                font: font.clone(),
-                color: base_color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            return runs;
-        }
-
+        // ── Fence marker (```lang): flat code color.
         if trimmed.starts_with("```") {
             runs.push(TextRun {
                 len: trimmed.len(),
@@ -568,121 +620,102 @@ impl TextInput {
             return runs;
         }
 
-        let mut chars = trimmed.char_indices().peekable();
-        let mut seg_start = 0;
-        let mut in_bold = false;
-        let mut in_italic = false;
-        let mut in_code = false;
-        let mut in_strike = false;
-
-        // Flush plain segment up to byte index `end` with current style color.
-        macro_rules! flush {
-            ($end:expr) => {
-                if $end > seg_start {
-                    let color = if in_code {
-                        color_code
-                    } else if in_strike {
-                        color_strike
-                    } else if in_bold {
-                        color_bold
-                    } else if in_italic {
-                        color_italic
-                    } else {
-                        base_color
-                    };
-                    runs.push(TextRun {
-                        len: $end - seg_start,
-                        font: font.clone(),
-                        color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    });
-                }
-            };
-        }
-
-        while let Some((i, ch)) = chars.next() {
-            if ch == '`' {
-                flush!(i);
-                in_code = !in_code;
-                seg_start = i;
-                if !in_code {
-                    runs.push(TextRun {
-                        len: 1,
-                        font: font.clone(),
-                        color: color_code,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    });
-                    seg_start = i + 1;
-                }
-            } else if !in_code && ch == '~' && chars.peek().map(|(_, c)| *c) == Some('~') {
-                // Peek second ~ without consuming unless confirmed pair.
-                // `chars.peek()` gives next (byte_idx, char); consume it.
-                flush!(i);
-                in_strike = !in_strike;
-                chars.next();
-                seg_start = i + 2;
-            } else if !in_code && (ch == '*' || ch == '_') {
-                let next_is_same =
-                    chars.peek().map(|(_, c)| *c) == Some(ch);
-                if next_is_same {
-                    flush!(i);
-                    in_bold = !in_bold;
-                    chars.next();
-                    seg_start = i + 2;
-                } else {
-                    // Single * or _ toggles italic (but not inside bold run
-                    // for * — keep old guard so ** pairs stay stable).
-                    if ch == '*' && in_bold {
-                        continue;
-                    }
-                    flush!(i);
-                    in_italic = !in_italic;
-                    seg_start = i + 1;
-                }
-            } else if !in_code && (ch == '[' || ch == ']' || ch == '(' || ch == ')' || ch == '|') {
-                flush!(i);
-                runs.push(TextRun {
-                    len: ch.len_utf8(),
-                    font: font.clone(),
-                    color: if ch == '|' { base_color } else { color_link },
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-                seg_start = i + ch.len_utf8();
+        // ── Blockquote: same >-stripping as export (any depth, space optional).
+        if trimmed.starts_with('>') {
+            let mut rest = trimmed;
+            while let Some(r) = rest.strip_prefix('>') {
+                rest = r.strip_prefix(' ').unwrap_or(r);
             }
-        }
-
-        if seg_start < trimmed.len() {
-            let color = if in_code {
-                color_code
-            } else if in_strike {
-                color_strike
-            } else if in_bold {
-                color_bold
-            } else if in_italic {
-                color_italic
-            } else {
-                base_color
-            };
+            let marker_len = trimmed.len() - rest.len();
             runs.push(TextRun {
-                len: trimmed.len() - seg_start,
+                len: marker_len,
                 font: font.clone(),
-                color,
+                color: color_quote,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             });
+            runs.extend(Self::inline_runs(rest, font, color_quote));
+            return runs;
         }
+
+        // ── Heading: hashes + space, like export's heading_level_and_text.
+        let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hash_count) && trimmed[hash_count..].starts_with(' ') {
+            let prefix_len = hash_count + 1;
+            runs.push(TextRun {
+                len: prefix_len,
+                font: font.clone(),
+                color: color_header,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            runs.extend(Self::inline_runs(
+                &trimmed[prefix_len..],
+                font,
+                color_header,
+            ));
+            return runs;
+        }
+
+        // ── Thematic break, checked before list (like export: `* * *` is
+        //    a rule, not a bullet whose content is `* *`).
+        if is_horizontal_rule(trimmed) {
+            runs.push(TextRun {
+                len: trimmed.len(),
+                font: font.clone(),
+                color: color_list,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            return runs;
+        }
+
+        // ── List item: marker colored like the bullet color, plus export's
+        //    task box as metadata; item text gets inline styling.
+        if let Some((marker_len, content)) = list_marker_and_content(trimmed) {
+            runs.push(TextRun {
+                len: marker_len,
+                font: font.clone(),
+                color: color_list,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            let box_len = if content.starts_with("[ ] ")
+                || content.starts_with("[x] ")
+                || content.starts_with("[X] ")
+            {
+                4
+            } else if matches!(content, "[ ]" | "[x]" | "[X]") {
+                3
+            } else {
+                0
+            };
+            if box_len > 0 {
+                runs.push(TextRun {
+                    len: box_len,
+                    font: font.clone(),
+                    color: color_list,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            runs.extend(Self::inline_runs(&content[box_len..], font, base_color));
+            return runs;
+        }
+
+        // ── Everything else (paragraphs and table rows): export parses
+        //    those runs inline, so style them the same way.
+        runs.extend(Self::inline_runs(trimmed, font.clone(), base_color));
 
         if runs.is_empty() {
             runs.push(TextRun {
                 len: line.len(),
-                font: font.clone(),
+                font,
                 color: base_color,
                 background_color: None,
                 underline: None,
@@ -826,9 +859,7 @@ impl TextInput {
             .map(|b| b.size.height)
             .unwrap_or(px(0.))
             .into();
-        let line_count = self.all_lines.len() as f32;
-        let line_height_f: f32 = self.line_height.into();
-        let total_content_height = line_height_f * line_count;
+        let total_content_height: f32 = self.content_height.into();
         let max_scroll = (total_content_height - visible_height).max(0.);
         let current: f32 = self.scroll_offset_y.into();
         let delta_f: f32 = delta.y.into();
@@ -1152,12 +1183,48 @@ struct TextElement {
     input: Entity<TextInput>,
 }
 
+/// One laid-out visual row (a wrapped segment of a logical line). Rows
+/// have their own box/text metrics so headings can be taller than body
+/// text and carry space before/after.
+struct PrepRow {
+    shaped: ShapedLine,
+    /// Top of the row's full box, relative to the element (space-before
+    /// included); rows are stacked contiguously.
+    box_top: gpui::Pixels,
+    /// Top of the text within the box.
+    text_top: gpui::Pixels,
+    text_height: gpui::Pixels,
+    box_height: gpui::Pixels,
+    /// Absolute source byte offset of the row start.
+    src_start: usize,
+    /// Display byte offset of the row start within its logical line.
+    disp_start: usize,
+    /// Logical line this row belongs to.
+    line_idx: usize,
+    /// Draw the row as a horizontal rule (Markdown mode ON).
+    rule_color: Option<gpui::Hsla>,
+}
+
+/// Persisted half of `PrepRow` — layout metrics the input needs for
+/// hit-testing, scroll clamping and caret visibility between frames.
+#[derive(Clone, Copy)]
+struct RowMeta {
+    box_top: gpui::Pixels,
+    text_top: gpui::Pixels,
+    text_height: gpui::Pixels,
+    box_height: gpui::Pixels,
+    src_start: usize,
+    disp_start: usize,
+    line_idx: usize,
+}
+
 struct PrepaintState {
-    lines: Vec<ShapedLine>,
-    line_numbers: Vec<ShapedLine>,
+    rows: Vec<PrepRow>,
+    /// (y, height, shaped number) per logical line, for the optional gutter.
+    line_numbers: Vec<(gpui::Pixels, gpui::Pixels, ShapedLine)>,
     gutter_width: gpui::Pixels,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
+    selection: Vec<PaintQuad>,
 }
 
 impl IntoElement for TextElement {
@@ -1204,7 +1271,7 @@ impl Element for TextElement {
         _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Self::PrepaintState {
+    ) -> PrepaintState {
         let input = self.input.read(cx);
         let content = &input.content;
         let selected_range = input.selected_range.clone();
@@ -1212,9 +1279,11 @@ impl Element for TextElement {
         let scroll_offset_y = input.scroll_offset_y;
         let show_line_numbers = input.show_line_numbers;
         let word_wrap = input.word_wrap;
+        let markdown_on = input.markdown_mode;
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
+        let base_font = style.font();
 
         let line_count = if content.is_empty() {
             1
@@ -1251,266 +1320,296 @@ impl Element for TextElement {
             style.color
         };
 
-        let mut shaped_lines = Vec::new();
-        let mut visual_char_offsets = Vec::new();
-        let mut char_offset = 0;
-        let mut cursor_line = 0;
-        let mut cursor_x_in_line = px(0.0);
-        let mut sel_start_line = 0;
-        let mut sel_start_x = px(0.0);
-        let mut sel_end_line = 0;
-        let mut sel_end_x = px(0.0);
+        // Source→display transform: identity when Markdown mode is OFF.
+        let display_lines = build_display_lines(&lines, markdown_on);
 
         let available_width = bounds.size.width - gutter_width;
+        let mut rows: Vec<PrepRow> = Vec::new();
+        let mut y = px(0.0);
 
-        for (i, line_text) in lines.iter().enumerate() {
-            let line_start = char_offset;
-            let line_end = char_offset + line_text.len();
+        for (i, dl) in display_lines.iter().enumerate() {
+            let row_font_size = dl.font_size.map(px).unwrap_or(font_size);
+            // Body rows keep the layout's line height; rows with an
+            // explicit size (headings) get a box that fits their glyphs.
+            let text_height = match dl.font_size {
+                Some(size) => line_height.max(px(size * 1.4)),
+                None => line_height,
+            };
+            let mut font = if dl.mono {
+                gpui::font(ui::MONO_FONT)
+            } else {
+                base_font.clone()
+            };
+            if dl.bold {
+                font = font.bold();
+            }
+            if dl.italic {
+                font = font.italic();
+            }
 
-            if word_wrap && available_width > px(0.0) && !line_text.is_empty() {
-                let mut remaining = line_text.as_str();
-                let mut local_offset = 0usize;
-
-                while !remaining.is_empty() {
+            // Wrap the *display* text (Markdown ON wraps rendered text,
+            // not source), recording each row's display range.
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            if word_wrap && available_width > px(0.0) && !dl.text.is_empty() {
+                let mut d0 = 0usize;
+                while d0 < dl.text.len() {
+                    let remaining = &dl.text[d0..];
                     let check_run = TextRun {
                         len: remaining.len(),
-                        font: style.font(),
+                        font: font.clone(),
                         color: text_color,
                         background_color: None,
                         underline: None,
                         strikethrough: None,
                     };
-                    let shaped = window.text_system().shape_line(
+                    let measured = window.text_system().shape_line(
                         remaining.to_string().into(),
-                        font_size,
+                        row_font_size,
                         &[check_run],
                         None,
                     );
-
-                    visual_char_offsets.push(line_start + local_offset);
-
-                    if shaped.width > available_width && remaining.len() > 1 {
-                        let break_idx = shaped.closest_index_for_x(available_width);
-                        let actual_break = if break_idx > 0 {
-                            let slice = &remaining[..break_idx];
-                            slice.rfind(' ').map(|p| p + 1).unwrap_or(break_idx)
+                    if measured.width > available_width && remaining.len() > 1 {
+                        let break_idx = measured.closest_index_for_x(available_width);
+                        let mut actual_break = if break_idx > 0 {
+                            remaining[..break_idx]
+                                .rfind(' ')
+                                .map(|p| p + 1)
+                                .unwrap_or(break_idx)
                         } else {
-                            1
+                            // First char boundary — never split UTF-8.
+                            remaining
+                                .char_indices()
+                                .nth(1)
+                                .map(|(p, _)| p)
+                                .unwrap_or(remaining.len())
                         };
-
-                        let segment = &remaining[..actual_break];
-                        let seg_runs = TextInput::markdown_runs(segment, style.font(), text_color);
-                        let seg_shaped = window.text_system().shape_line(
-                            segment.to_string().into(),
-                            font_size,
-                            &seg_runs,
-                            None,
-                        );
-
-                        let vis_idx = shaped_lines.len();
-                        let seg_start = line_start + local_offset;
-                        let seg_end = seg_start + segment.len();
-
-                        if cursor >= seg_start && cursor <= seg_end {
-                            cursor_line = vis_idx;
-                            cursor_x_in_line = seg_shaped.x_for_index(cursor - seg_start);
+                        while actual_break > 0
+                            && actual_break < remaining.len()
+                            && !remaining.is_char_boundary(actual_break)
+                        {
+                            actual_break -= 1;
                         }
-                        if !selected_range.is_empty() {
-                            let sel_start = selected_range.start;
-                            let sel_end = selected_range.end;
-                            if sel_start >= seg_start && sel_start < seg_end {
-                                sel_start_line = vis_idx;
-                                sel_start_x = seg_shaped.x_for_index(sel_start - seg_start);
-                            } else if sel_start >= seg_end
-                                && i == lines.len() - 1
-                                && actual_break >= remaining.len()
-                            {
-                                sel_start_line = vis_idx;
-                                sel_start_x = seg_shaped.x_for_index(segment.len());
-                            }
-                            if sel_end > seg_start && sel_end <= seg_end {
-                                sel_end_line = vis_idx;
-                                sel_end_x = seg_shaped.x_for_index(sel_end - seg_start);
-                            } else if sel_end > seg_end
-                                && i == lines.len() - 1
-                                && actual_break >= remaining.len()
-                            {
-                                sel_end_line = vis_idx;
-                                sel_end_x = seg_shaped.x_for_index(segment.len());
-                            }
-                        }
-
-                        shaped_lines.push(seg_shaped);
-                        remaining = &remaining[actual_break..];
-                        local_offset += actual_break;
+                        actual_break = actual_break.max(1);
+                        ranges.push((d0, d0 + actual_break));
+                        d0 += actual_break;
                     } else {
-                        let vis_idx = shaped_lines.len();
-                        if cursor >= line_start && cursor <= line_end {
-                            cursor_line = vis_idx;
-                            cursor_x_in_line = shaped.x_for_index(cursor - line_start);
-                        }
-                        if !selected_range.is_empty() {
-                            let sel_start = selected_range.start;
-                            let sel_end = selected_range.end;
-                            if sel_start >= line_start && sel_start < line_end {
-                                sel_start_line = vis_idx;
-                                sel_start_x = shaped.x_for_index(sel_start - line_start);
-                            } else if sel_start >= line_end && i == lines.len() - 1 {
-                                sel_start_line = vis_idx;
-                                sel_start_x = shaped.x_for_index(line_text.len());
-                            }
-                            if sel_end > line_start && sel_end <= line_end {
-                                sel_end_line = vis_idx;
-                                sel_end_x = shaped.x_for_index(sel_end - line_start);
-                            } else if sel_end > line_end && i == lines.len() - 1 {
-                                sel_end_line = vis_idx;
-                                sel_end_x = shaped.x_for_index(line_text.len());
-                            }
-                        }
-                        shaped_lines.push(shaped);
-                        remaining = "";
+                        ranges.push((d0, dl.text.len()));
+                        d0 = dl.text.len();
                     }
                 }
             } else {
-                let runs = TextInput::markdown_runs(line_text, style.font(), text_color);
+                ranges.push((0, dl.text.len()));
+            }
+            if ranges.is_empty() {
+                ranges.push((0, 0));
+            }
+
+            let row_count = ranges.len();
+            for (r, &(d0, d1)) in ranges.iter().enumerate() {
+                let space_before = if r == 0 { dl.space_before } else { 0.0 };
+                let space_after = if r + 1 == row_count {
+                    dl.space_after
+                } else {
+                    0.0
+                };
+                let box_top = y;
+                let text_top = y + px(space_before);
+                let box_height = px(space_before) + text_height + px(space_after);
+                y = box_top + box_height;
+
+                let slice = &dl.text[d0..d1];
+                let runs = if markdown_on {
+                    display_runs(dl.kind, slice, font.clone(), text_color)
+                } else {
+                    TextInput::markdown_runs(slice, font.clone(), text_color, dl.fenced)
+                };
                 let shaped = window.text_system().shape_line(
-                    line_text.clone().into(),
-                    font_size,
+                    slice.to_string().into(),
+                    row_font_size,
                     &runs,
                     None,
                 );
-
-                visual_char_offsets.push(line_start);
-
-                if cursor >= line_start && cursor <= line_end {
-                    cursor_line = i;
-                    cursor_x_in_line = shaped.x_for_index(cursor - line_start);
-                }
-                if !selected_range.is_empty() {
-                    let sel_start = selected_range.start;
-                    let sel_end = selected_range.end;
-                    if sel_start >= line_start && sel_start < line_end {
-                        sel_start_line = i;
-                        sel_start_x = shaped.x_for_index(sel_start - line_start);
-                    } else if sel_start >= line_end && i == lines.len() - 1 {
-                        sel_start_line = i;
-                        sel_start_x = shaped.x_for_index(line_text.len());
-                    }
-                    if sel_end > line_start && sel_end <= line_end {
-                        sel_end_line = i;
-                        sel_end_x = shaped.x_for_index(sel_end - line_start);
-                    } else if sel_end > line_end && i == lines.len() - 1 {
-                        sel_end_line = i;
-                        sel_end_x = shaped.x_for_index(line_text.len());
-                    }
-                }
-                shaped_lines.push(shaped);
+                let rule_color = if dl.kind == DisplayKind::Rule {
+                    let mut color = text_color;
+                    color.a = 0.35;
+                    Some(color)
+                } else {
+                    None
+                };
+                rows.push(PrepRow {
+                    shaped,
+                    box_top,
+                    text_top,
+                    text_height,
+                    box_height,
+                    src_start: dl.src_offset + dl.disp_to_src(d0),
+                    disp_start: d0,
+                    line_idx: i,
+                    rule_color,
+                });
             }
-
-            char_offset += line_text.len() + 1;
         }
+        let content_height = y;
 
-        let char_offsets: Vec<usize> = visual_char_offsets;
+        // Caret and selection live in source space; map them through the
+        // display transform onto the row that shows them.
+        let line_of = |offset: usize| -> usize {
+            let mut idx = 0;
+            for (i, dl) in display_lines.iter().enumerate() {
+                if dl.src_offset <= offset {
+                    idx = i;
+                } else {
+                    break;
+                }
+            }
+            idx
+        };
+        let disp_of = |offset: usize| -> usize {
+            let li = line_of(offset);
+            let dl = &display_lines[li];
+            dl.src_to_disp(offset.saturating_sub(dl.src_offset))
+        };
+        let row_of = |line_idx: usize, disp: usize| -> usize {
+            let mut found = rows
+                .iter()
+                .position(|r| r.line_idx == line_idx)
+                .unwrap_or(0);
+            for (ri, r) in rows.iter().enumerate() {
+                if r.line_idx == line_idx && disp >= r.disp_start {
+                    found = ri;
+                }
+            }
+            found
+        };
+        let x_of = |ri: usize, disp: usize| -> gpui::Pixels {
+            let r = &rows[ri];
+            r.shaped.x_for_index(disp.saturating_sub(r.disp_start))
+        };
+
+        let cursor_disp = disp_of(cursor);
+        let cursor_row = row_of(line_of(cursor), cursor_disp);
+        let cursor_x = x_of(cursor_row, cursor_disp);
 
         let (selection, cursor_quad) = if selected_range.is_empty() {
             (
-                None,
+                Vec::new(),
                 Some(fill(
                     Bounds::new(
                         point(
-                            bounds.left() + gutter_width + cursor_x_in_line,
-                            bounds.top() + line_height * cursor_line as f32 - scroll_offset_y,
+                            bounds.left() + gutter_width + cursor_x,
+                            bounds.top() + rows[cursor_row].text_top - scroll_offset_y,
                         ),
-                        size(px(1.), line_height),
+                        size(px(1.), rows[cursor_row].text_height),
                     ),
                     gpui::blue(),
                 )),
             )
         } else {
-            let top_line = sel_start_line.min(sel_end_line);
-            let bot_line = sel_start_line.max(sel_end_line);
-            let left_x = if sel_start_line <= sel_end_line {
-                sel_start_x
-            } else {
-                sel_end_x
-            };
-            let right_x = if sel_start_line <= sel_end_line {
-                sel_end_x
-            } else {
-                sel_start_x
-            };
+            let start_disp = disp_of(selected_range.start);
+            let end_disp = disp_of(selected_range.end);
+            let start_row = row_of(line_of(selected_range.start), start_disp);
+            let end_row = row_of(line_of(selected_range.end), end_disp);
+            let start_x = x_of(start_row, start_disp);
+            let end_x = x_of(end_row, end_disp);
 
-            if top_line == bot_line {
-                (
-                    Some(fill(
-                        Bounds::from_corners(
-                            point(
-                                bounds.left() + gutter_width + left_x,
-                                bounds.top() + line_height * top_line as f32 - scroll_offset_y,
-                            ),
-                            point(
-                                bounds.left() + gutter_width + right_x,
-                                bounds.top() + line_height * (top_line as f32 + 1.0)
-                                    - scroll_offset_y,
-                            ),
-                        ),
-                        rgba(0x3311ff30),
-                    )),
-                    None,
-                )
+            let top_ri = start_row.min(end_row);
+            let bot_ri = start_row.max(end_row);
+            let (left_x, right_x) = if start_row <= end_row {
+                (start_x, end_x)
             } else {
-                (
-                    Some(fill(
-                        Bounds::from_corners(
-                            point(
-                                bounds.left() + gutter_width + left_x,
-                                bounds.top() + line_height * top_line as f32 - scroll_offset_y,
-                            ),
-                            point(
-                                bounds.right(),
-                                bounds.top() + line_height * (bot_line as f32 + 1.0)
-                                    - scroll_offset_y,
-                            ),
-                        ),
-                        rgba(0x3311ff30),
-                    )),
-                    None,
-                )
+                (end_x, start_x)
+            };
+            let row_left = bounds.left() + gutter_width;
+            let mut quads = Vec::new();
+            let single = top_ri == bot_ri;
+            for (ri, r) in rows.iter().enumerate().take(bot_ri + 1).skip(top_ri) {
+                // Selection covers each row's text box; multi-row spans
+                // stitch together through the space between boxes.
+                let y0 = if single || ri == top_ri {
+                    r.text_top
+                } else {
+                    r.box_top
+                };
+                let y1 = if single || ri == bot_ri {
+                    r.text_top + r.text_height
+                } else {
+                    r.box_top + r.box_height
+                };
+                let x0 = if ri == top_ri { left_x } else { px(0.0) };
+                let x1 = if ri == bot_ri {
+                    right_x
+                } else {
+                    available_width
+                };
+                quads.push(fill(
+                    Bounds::from_corners(
+                        point(row_left + x0, bounds.top() + y0 - scroll_offset_y),
+                        point(row_left + x1, bounds.top() + y1 - scroll_offset_y),
+                    ),
+                    rgba(0x3311ff30),
+                ));
             }
+            (quads, None)
         };
 
-        let last_line = shaped_lines.last().cloned();
-        self.input.update(cx, |input, _cx| {
-            input.last_layout = last_line;
-            input.all_lines = shaped_lines.clone();
-            input.line_char_offsets = char_offsets;
-            input.line_height = line_height;
-        });
-
+        // Line numbers: one per logical line, at its first row.
         let line_numbers = if show_line_numbers {
             let number_color = hsla(0., 0., 0.4, 0.5);
-            (0..line_count)
-                .map(|i| {
-                    let num_str = format!("{}", i + 1);
-                    let run = TextRun {
-                        len: num_str.len(),
-                        font: style.font(),
-                        color: number_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
+            let mut seen_lines = std::collections::HashSet::new();
+            let mut nums = Vec::new();
+            for r in rows.iter() {
+                if !seen_lines.insert(r.line_idx) {
+                    continue;
+                }
+                let num_str = format!("{}", r.line_idx + 1);
+                let run = TextRun {
+                    len: num_str.len(),
+                    font: base_font.clone(),
+                    color: number_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped =
                     window
                         .text_system()
-                        .shape_line(num_str.into(), font_size, &[run], None)
-                })
-                .collect::<Vec<_>>()
+                        .shape_line(num_str.into(), font_size, &[run], None);
+                nums.push((r.text_top, r.text_height, shaped));
+            }
+            nums
         } else {
             Vec::new()
         };
 
+        let last_layout = rows.last().map(|r| r.shaped.clone());
+        let all_lines: Vec<ShapedLine> = rows.iter().map(|r| r.shaped.clone()).collect();
+        let line_char_offsets: Vec<usize> = rows.iter().map(|r| r.src_start).collect();
+        let row_metas: Vec<RowMeta> = rows
+            .iter()
+            .map(|r| RowMeta {
+                box_top: r.box_top,
+                text_top: r.text_top,
+                text_height: r.text_height,
+                box_height: r.box_height,
+                src_start: r.src_start,
+                disp_start: r.disp_start,
+                line_idx: r.line_idx,
+            })
+            .collect();
+        let cursor_row_idx = cursor_row;
+        self.input.update(cx, |input, _cx| {
+            input.last_layout = last_layout;
+            input.all_lines = all_lines;
+            input.line_char_offsets = line_char_offsets;
+            input.row_metas = row_metas;
+            input.display_lines = display_lines;
+            input.content_height = content_height;
+            input.cursor_row = cursor_row_idx;
+            input.line_height = line_height;
+        });
+
         PrepaintState {
-            lines: shaped_lines,
+            rows,
             line_numbers,
             gutter_width,
             cursor: cursor_quad,
@@ -1535,41 +1634,63 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection);
+        for quad in prepaint.selection.drain(..) {
+            window.paint_quad(quad);
         }
-        let line_height = window.line_height();
         let gutter_width = prepaint.gutter_width;
 
-        for (i, num) in prepaint.line_numbers.iter().enumerate() {
-            let y = bounds.top() + line_height * i as f32 - scroll_offset_y;
+        for (y, h, num) in prepaint.line_numbers.iter() {
             let num_w = num.width;
             let x = bounds.left() + gutter_width - num_w - px(8.0);
-            num.paint(point(x, y), line_height, window, cx).ok();
-        }
-
-        for (i, line) in prepaint.lines.iter().enumerate() {
-            let y = bounds.top() + line_height * i as f32 - scroll_offset_y;
-            line.paint(
-                point(bounds.left() + gutter_width, y),
-                line_height,
+            num.paint(
+                point(x, bounds.top() + *y - scroll_offset_y),
+                *h,
                 window,
                 cx,
             )
             .ok();
+        }
+
+        for row in prepaint.rows.iter() {
+            if let Some(color) = row.rule_color {
+                // Markdown mode ON hides `---` and draws the rule instead.
+                let mid_y = bounds.top() + row.text_top + px(f32::from(row.text_height) / 2.0)
+                    - scroll_offset_y;
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left() + gutter_width + px(4.0), mid_y - px(1.0)),
+                        size(
+                            (bounds.size.width - gutter_width - px(8.0)).max(px(0.0)),
+                            px(1.5),
+                        ),
+                    ),
+                    color,
+                ));
+            }
+            row.shaped
+                .paint(
+                    point(
+                        bounds.left() + gutter_width,
+                        bounds.top() + row.text_top - scroll_offset_y,
+                    ),
+                    row.text_height,
+                    window,
+                    cx,
+                )
+                .ok();
         }
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
             }
         }
-        let last_line = prepaint.lines.last().cloned();
+        let last_layout = prepaint.rows.last().map(|r| r.shaped.clone());
         let last_bounds = Bounds::new(
             point(bounds.left() + gutter_width, bounds.top()),
             size(bounds.size.width - gutter_width, bounds.size.height),
         );
         self.input.update(cx, |input, _cx| {
-            input.last_layout = last_line;
+            input.last_layout = last_layout;
             input.last_bounds = Some(last_bounds);
         });
     }
@@ -1681,11 +1802,33 @@ enum WorkspaceOverlay {
     ModalShowcase,
 }
 
+/// Where `export_document` writes: same merged model, three renderers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Pdf,
+    Docx,
+    Markdown,
+}
+
+impl ExportFormat {
+    fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Pdf => "pdf",
+            ExportFormat::Docx => "docx",
+            ExportFormat::Markdown => "md",
+        }
+    }
+}
+
 struct SylphApp {
     editor: Entity<TextInput>,
     document: sylph_core::document::Document,
     focus_handle: FocusHandle,
     sidebar_visible: bool,
+    /// Canvas layout: `false` = Print (fixed page canvas), `true` = Web
+    /// (continuous full-width flow, no page box or ruler). Focus is not a
+    /// field — it is derived from both side panels being hidden.
+    web_layout: bool,
     preview_visible: bool,
     find: FindReplaceState,
     context_menu: ContextMenuState,
@@ -1739,11 +1882,13 @@ actions!(
         ToggleDarkMode,
         ExportDocx,
         ExportPdf,
+        ExportMarkdown,
         TogglePreview,
         AddCoverPage,
         PasteImage,
         BoldText,
         ItalicText,
+        StrikethroughText,
         InsertTable,
         RewriteText,
         OpenAiPanel,
@@ -2232,8 +2377,8 @@ impl SylphApp {
         }
     }
 
-    fn export_document(&mut self, to_pdf: bool, cx: &mut Context<Self>) {
-        let ext = if to_pdf { "pdf" } else { "docx" };
+    fn export_document(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
+        let ext = format.ext();
         // Keep the file inside output/: doc_title is user-editable, so strip
         // path separators and other unsafe filename characters.
         let safe_title: String = self
@@ -2247,7 +2392,8 @@ impl SylphApp {
                 }
             })
             .collect();
-        let path = format!("output/{}.{}", safe_title.replace(' ', "_"), ext);
+        let file_name = format!("{}.{}", safe_title.replace(' ', "_"), ext);
+        let path = format!("output/{}", file_name);
         let _ = std::fs::create_dir_all("output");
         let content = self.editor.read(cx).content.clone();
         // Neither buffer alone is the document yet: typed text lives in the
@@ -2255,28 +2401,48 @@ impl SylphApp {
         // Merge both so export never silently drops content.
         let model = export_model(&self.document, &content);
         let result = match serde_json::to_string(&model) {
-            Ok(json) if to_pdf => sylph_py_bridge::export_rich_pdf(&json, &path),
-            Ok(json) => sylph_py_bridge::export_rich_docx(&json, &path),
-            Err(e) => {
-                if to_pdf {
+            Ok(json) => match format {
+                ExportFormat::Pdf => sylph_py_bridge::export_rich_pdf(&json, &path),
+                ExportFormat::Docx => sylph_py_bridge::export_rich_docx(&json, &path),
+                ExportFormat::Markdown => sylph_py_bridge::export_rich_markdown(&json, &path),
+            },
+            Err(e) => match format {
+                ExportFormat::Pdf => {
                     // Never write DOCX bytes into a .pdf path.
                     format!("Export failed to serialize document: {e}")
-                } else {
+                }
+                ExportFormat::Docx => {
                     let fallback = sylph_py_bridge::export_to_docx(&content, &path);
                     format!("Export failed to serialize document: {e}. Fallback: {fallback}")
                 }
-            }
+                ExportFormat::Markdown => format!("Export failed to serialize document: {e}"),
+            },
         };
-        self.status_message = Some(result);
+        // The status bar shows the file name, never the internal
+        // `output/` build path (Google Docs / Word say "Exported · x").
+        self.status_message = Some(if result.starts_with("Exported to ") {
+            format!("Exported · {}", file_name)
+        } else {
+            result.replace("output/", "")
+        });
         cx.notify();
     }
 
     fn export_docx(&mut self, _: &ExportDocx, _window: &mut Window, cx: &mut Context<Self>) {
-        self.export_document(false, cx);
+        self.export_document(ExportFormat::Docx, cx);
     }
 
     fn export_pdf(&mut self, _: &ExportPdf, _window: &mut Window, cx: &mut Context<Self>) {
-        self.export_document(true, cx);
+        self.export_document(ExportFormat::Pdf, cx);
+    }
+
+    fn export_markdown(
+        &mut self,
+        _: &ExportMarkdown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.export_document(ExportFormat::Markdown, cx);
     }
 
     fn toggle_preview(&mut self, _: &TogglePreview, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2403,29 +2569,37 @@ impl SylphApp {
         self.open_image_picker(cx);
     }
 
-    fn bold_text(&mut self, _: &BoldText, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Wrap the selection in `marker` markdown (the same source-level
+    /// syntax the export parser reads back).
+    fn wrap_selection(&mut self, marker: &str, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             let text = editor.content.clone();
             let sel = editor.selected_range.clone();
             if sel.start < sel.end && sel.end <= text.len() {
                 let selected = &text[sel.clone()];
-                let new_text = format!("**{}**", selected);
+                let new_text = format!("{marker}{}{marker}", selected);
                 editor.replace_text_in_range(Some(sel), &new_text, cx);
             }
         });
+    }
+
+    fn bold_text(&mut self, _: &BoldText, _window: &mut Window, cx: &mut Context<Self>) {
+        self.wrap_selection("**", cx);
         cx.notify();
     }
 
     fn italic_text(&mut self, _: &ItalicText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.update(cx, |editor, cx| {
-            let text = editor.content.clone();
-            let sel = editor.selected_range.clone();
-            if sel.start < sel.end && sel.end <= text.len() {
-                let selected = &text[sel.clone()];
-                let new_text = format!("*{}*", selected);
-                editor.replace_text_in_range(Some(sel), &new_text, cx);
-            }
-        });
+        self.wrap_selection("*", cx);
+        cx.notify();
+    }
+
+    fn strikethrough_text(
+        &mut self,
+        _: &StrikethroughText,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.wrap_selection("~~", cx);
         cx.notify();
     }
 
@@ -2585,10 +2759,7 @@ impl SylphApp {
             sylph_core::document::PageMargins::default()
         };
         self.document.set_margins(new_margins);
-        self.status_message = Some(format!(
-            "Margins: {:.1}pt",
-            self.document.page_margins.top
-        ));
+        self.status_message = Some(format!("Margins: {:.1}pt", self.document.page_margins.top));
         cx.notify();
     }
 
@@ -2608,12 +2779,7 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn set_line_spacing_value(
-        &mut self,
-        value: f32,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_line_spacing_value(&mut self, value: f32, _window: &mut Window, cx: &mut Context<Self>) {
         self.document.set_line_spacing(value);
         self.status_message = Some(format!("Line spacing: {:.2}", value));
         cx.notify();
@@ -2623,19 +2789,25 @@ impl SylphApp {
         let level = self.current_heading_level(cx);
         let new_level = match level {
             0 => 1,
-            1 => 2,
-            2 => 3,
-            _ => 0, // 3 or more -> Normal
+            6 => 0,
+            l => l + 1,
         };
+        // Picking a style from the dropdown is an explicit request for a
+        // heading; Markdown mode is the single source of truth for what
+        // the canvas shows, so turn it on to show the result.
+        if !self.markdown_mode {
+            self.markdown_mode = true;
+            self.editor.update(cx, |editor, cx| {
+                editor.markdown_mode = true;
+                cx.notify();
+            });
+        }
 
         // Modify the current line in the editor
         self.editor.update(cx, |editor, cx| {
             let cursor = editor.cursor_offset();
             let content = editor.content.clone();
-            let line_start = content[..cursor]
-                .rfind('\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
+            let line_start = content[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
             let line_end = content[cursor..]
                 .find('\n')
                 .map(|p| cursor + p)
@@ -2644,13 +2816,12 @@ impl SylphApp {
             let trimmed = line.trim_start();
             let indent = &line[..line.len() - trimmed.len()];
 
-            // Strip existing heading prefix
-            let stripped = if trimmed.starts_with("### ") {
-                &trimmed[4..]
-            } else if trimmed.starts_with("## ") {
-                &trimmed[3..]
-            } else if trimmed.starts_with("# ") {
-                &trimmed[2..]
+            // Strip the existing heading prefix: `#{1,6} ` — all six
+            // levels, including `# ` with no text (a marker that is not
+            // yet a heading). `#nospace` is not a marker, so it stays.
+            let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+            let stripped = if (1..=6).contains(&hashes) {
+                trimmed[hashes..].strip_prefix(' ').unwrap_or(trimmed)
             } else {
                 trimmed
             };
@@ -2671,6 +2842,9 @@ impl SylphApp {
             1 => "Heading 1",
             2 => "Heading 2",
             3 => "Heading 3",
+            4 => "Heading 4",
+            5 => "Heading 5",
+            6 => "Heading 6",
             _ => "Normal",
         };
         self.status_message = Some(format!("Style: {}", label));
@@ -2697,40 +2871,33 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn adjust_body_font_size(
-        &mut self,
-        delta: i8,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn adjust_body_font_size(&mut self, delta: i8, _window: &mut Window, cx: &mut Context<Self>) {
         let new_size = (self.document.body_font_size + delta as f32).clamp(8.0, 72.0);
         self.document.set_body_font_size(new_size);
         self.status_message = Some(format!("Font size: {}", new_size.round() as i32));
         cx.notify();
     }
 
+    /// Heading level at the caret — `0` (Normal) unless Markdown mode is
+    /// ON, which is the single source of truth for what counts as a
+    /// heading. Uses the export parser's own `heading_level_and_text`, so
+    /// `# ` with no text stays Normal, levels 4–6 work, and levels match
+    /// what the Document Map and export will parse.
     fn current_heading_level(&self, cx: &mut Context<Self>) -> u8 {
+        if !self.markdown_mode {
+            return 0;
+        }
         let content = self.editor.read(cx).content.clone();
         let cursor = self.editor.read(cx).cursor_offset();
-        let line_start = content[..cursor]
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let line_start = content[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let line_end = content[cursor..]
             .find('\n')
             .map(|p| cursor + p)
             .unwrap_or(content.len());
         let line = &content[line_start..line_end];
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("### ") {
-            3
-        } else if trimmed.starts_with("## ") {
-            2
-        } else if trimmed.starts_with("# ") {
-            1
-        } else {
-            0
-        }
+        heading_level_and_text(line.trim_start())
+            .map(|(level, _)| level)
+            .unwrap_or(0)
     }
 
     fn editing_cover_title(
@@ -2955,6 +3122,7 @@ impl SylphApp {
             .on_action(cx.listener(Self::paste_image))
             .on_action(cx.listener(Self::bold_text))
             .on_action(cx.listener(Self::italic_text))
+            .on_action(cx.listener(Self::strikethrough_text))
             .on_action(cx.listener(Self::insert_table))
             .on_action(cx.listener(Self::open_ai_panel))
             .on_action(cx.listener(Self::close_ai_panel))
@@ -3108,6 +3276,21 @@ impl SylphApp {
                                         }),
                                     )
                                     .child("PDF"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .hover(|s| s.bg(hover))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _window, cx| {
+                                            this.export_markdown(&ExportMarkdown, _window, cx);
+                                        }),
+                                    )
+                                    .child("MD"),
                             ),
                     )
                     // ── Divider ──
@@ -4148,9 +4331,21 @@ fn heading_level_and_text(line: &str) -> Option<(u8, &str)> {
     None
 }
 
+/// Inline link/autolink targets must look like a URL, not any `<...>`.
+fn looks_like_link_target(url: &str) -> bool {
+    !url.contains(char::is_whitespace)
+        && (url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("ftp://")
+            || url.starts_with("mailto:"))
+}
+
 /// Split inline markdown markers into styled runs. Markers are ASCII, so
 /// byte scanning never splits a UTF-8 char; `_..._` is deliberately not a
-/// marker (snake_case words must stay plain).
+/// marker (snake_case words must stay plain). Handles emphasis, code,
+/// strikethrough, links `[t](u)`, inline images `![a](p)` (alt as plain
+/// text — block-level images are detected by the line scanner), autolinks
+/// `<https://...>`, and backslash escapes `\*`.
 fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
     let markers: [(&str, Vec<doc::SpanStyle>); 5] = [
         ("***", vec![doc::SpanStyle::BoldItalic]),
@@ -4164,10 +4359,87 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
     let bytes = text.as_bytes();
     let mut i = 0;
     let n = text.len();
+    let flush_plain = |plain: &mut String, runs: &mut Vec<doc::TextRun>| {
+        if !plain.is_empty() {
+            runs.push(doc::TextRun::plain(std::mem::take(plain)));
+        }
+    };
     while i < n {
         let c = bytes[i];
+        let rest = &text[i..];
+
+        // 1. Backslash escape: ASCII punctuation after `\` is literal.
+        if c == b'\\' && i + 1 < n && bytes[i + 1].is_ascii_punctuation() {
+            plain.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+
+        // 2. Inline link `[text](url)` — inner text is parsed recursively
+        // so emphasis inside links survives; every run gets the Link style.
+        if c == b'[' {
+            if let Some(rel) = rest.find("](") {
+                let inner_start = i + 1;
+                let inner_end = i + rel; // index of ']'
+                let url_start = inner_end + 2;
+                if let Some(rp) = text[url_start..].find(')') {
+                    let url_end = url_start + rp;
+                    let inner = &text[inner_start..inner_end];
+                    let url = text[url_start..url_end].trim();
+                    if !inner.is_empty() && looks_like_link_target(url) {
+                        let mut inner_runs = parse_inline_runs(inner);
+                        if !inner_runs.is_empty() {
+                            flush_plain(&mut plain, &mut runs);
+                            for r in &mut inner_runs {
+                                r.styles.push(doc::SpanStyle::Link(url.to_string()));
+                            }
+                            runs.extend(inner_runs);
+                            i = url_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Inline image `![alt](path)` — alt becomes plain text (the
+        // block scanner turns standalone image lines into Image blocks).
+        if c == b'!' && rest.starts_with("![") {
+            if let Some(rel) = rest.find("](") {
+                let inner_start = i + 2;
+                let inner_end = i + rel;
+                let url_start = inner_end + 2;
+                if let Some(rp) = text[url_start..].find(')') {
+                    let url_end = url_start + rp;
+                    let alt = &text[inner_start..inner_end];
+                    if !alt.is_empty() {
+                        flush_plain(&mut plain, &mut runs);
+                        plain.push_str(alt);
+                        i = url_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 4. Autolink `<https://...>`.
+        if c == b'<' {
+            if let Some(rel) = rest[1..].find('>') {
+                let url = &rest[1..1 + rel];
+                if looks_like_link_target(url) {
+                    flush_plain(&mut plain, &mut runs);
+                    runs.push(doc::TextRun::styled(
+                        url,
+                        vec![doc::SpanStyle::Link(url.to_string())],
+                    ));
+                    i += rel + 2;
+                    continue;
+                }
+            }
+        }
+
+        // 5. Emphasis markers: longest match first.
         if c == b'*' || c == b'`' || c == b'~' {
-            let rest = &text[i..];
             let found = markers.iter().find_map(|(m, s)| {
                 // `m: &&str`; deref so `starts_with` gets a plain `&str`.
                 rest.starts_with(*m).then(|| (*m, s.clone()))
@@ -4177,9 +4449,7 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
                 if let Some(rel) = text[start..].find(marker) {
                     let inner = &text[start..start + rel];
                     if !inner.is_empty() {
-                        if !plain.is_empty() {
-                            runs.push(doc::TextRun::plain(std::mem::take(&mut plain)));
-                        }
+                        flush_plain(&mut plain, &mut runs);
                         runs.push(doc::TextRun::styled(inner, styles));
                         i = start + rel + marker.len();
                         continue;
@@ -4187,55 +4457,873 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
                 }
             }
         }
+
         let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
         plain.push_str(&text[i..i + ch_len]);
         i += ch_len;
     }
-    if !plain.is_empty() {
-        runs.push(doc::TextRun::plain(plain));
-    }
+    flush_plain(&mut plain, &mut runs);
     runs
 }
 
-/// Parse editor content into blocks: blank lines separate paragraphs,
-/// `# `-lines become headings, consecutive other lines join with a space
-/// (soft wrap), inline markers become styled runs.
-fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
-    let mut blocks: Vec<doc::Block> = Vec::new();
-    let mut para: Vec<&str> = Vec::new();
-    let flush = |para: &mut Vec<&str>, blocks: &mut Vec<doc::Block>| {
-        if para.is_empty() {
-            return;
+/// `---`, `***`, or `___` alone (≥3 markers, optional inner spaces).
+fn is_horizontal_rule(line: &str) -> bool {
+    let compact: String = line.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.chars().count() < 3 {
+        return false;
+    }
+    ['-', '*', '_']
+        .iter()
+        .any(|&m| compact.chars().all(|c| c == m))
+}
+
+/// End byte (exclusive) of a `[text](url)` link starting at `i` (the
+/// `[`). Mirrors the export parser's link rules: non-empty text and a
+/// target that looks like a URL.
+fn link_span_end(text: &str, i: usize) -> Option<usize> {
+    let rel = text[i..].find("](")?;
+    let inner_end = i + rel;
+    let url_start = inner_end + 2;
+    let rp = text[url_start..].find(')')?;
+    let url_end = url_start + rp;
+    let inner = &text[i + 1..inner_end];
+    let url = text[url_start..url_end].trim();
+    if !inner.is_empty() && looks_like_link_target(url) {
+        Some(url_end + 1)
+    } else {
+        None
+    }
+}
+
+/// End byte (exclusive) of an `![alt](path)` image span starting at `i`
+/// (the `!`). Export keeps alt text as plain text, so the editor must not
+/// color it as a link either.
+fn image_span_end(text: &str, i: usize) -> Option<usize> {
+    if !text[i..].starts_with("![") {
+        return None;
+    }
+    let rel = text[i..].find("](")?;
+    let inner_end = i + rel;
+    let url_start = inner_end + 2;
+    let rp = text[url_start..].find(')')?;
+    if inner_end == i + 2 {
+        return None; // empty alt — export leaves the span as plain text
+    }
+    Some(url_start + rp + 1)
+}
+
+/// End byte (exclusive) of an `<autolink>` span starting at `i` (the `<`).
+fn autolink_span_end(text: &str, i: usize) -> Option<usize> {
+    let rel = text[i + 1..].find('>')?;
+    let url = &text[i + 1..i + 1 + rel];
+    if looks_like_link_target(url) {
+        Some(i + rel + 2)
+    } else {
+        None
+    }
+}
+
+/// Marker byte length and item text of a bullet (`-`/`*`/`+`) or ordered
+/// (`1. `/`1)`) line — the same two separators the export parser accepts.
+fn list_marker_and_content(trimmed: &str) -> Option<(usize, &str)> {
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return Some((2, &trimmed[2..]));
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && (trimmed[digits..].starts_with(". ") || trimmed[digits..].starts_with(") ")) {
+        return Some((digits + 2, &trimmed[digits + 2..]));
+    }
+    None
+}
+
+/// Strip `>` quote markers: returns (depth, remaining text).
+fn strip_quote(line: &str) -> Option<(u8, &str)> {
+    let t = line.trim_start();
+    if !t.starts_with('>') {
+        return None;
+    }
+    let mut level = 0u8;
+    let mut rest = t;
+    while let Some(r) = rest.strip_prefix('>') {
+        level += 1;
+        rest = r.strip_prefix(' ').unwrap_or(r);
+    }
+    Some((level.min(4), rest.trim_end()))
+}
+
+/// Strip a leading task checkbox `[ ]`/`[x]`/`[X]` if present.
+/// Returns (checked flag, remaining content).
+fn take_checkbox_prefix(s: &str) -> (Option<bool>, &str) {
+    for box_lit in ["[ ]", "[x]", "[X]"] {
+        if let Some(after) = s.strip_prefix(box_lit) {
+            if after.is_empty() || after.starts_with(' ') {
+                let checked = box_lit != "[ ]";
+                let content = if after.is_empty() { "" } else { &after[1..] };
+                return (Some(checked), content);
+            }
         }
-        let joined = para.join(" ");
-        para.clear();
-        let runs = parse_inline_runs(&joined);
-        if !runs.is_empty() {
-            blocks.push(doc::Block::Paragraph {
-                runs,
-                style: doc::ParagraphStyle {
-                    line_spacing,
-                    space_before: 0.0,
-                    space_after: 8.0,
-                },
+    }
+    (None, s)
+}
+
+// ── Markdown presentation transform (Markdown mode ON) ─────────────────────
+//
+// The toggle is the single source of truth for what the canvas shows:
+// ON turns each logical source line into a WYSIWYG display line (block
+// syntax disappears — headings lose `# `, quotes lose `> `, bullets render
+// as `• `, fence delimiters hide) with the type scale the export renders;
+// OFF is the identity transform, so display == source and nothing is
+// parsed. `segments` keep a byte-exact source↔display map either way, so
+// the caret, selection and mouse keep addressing the real source text.
+
+/// What a line renders as when Markdown mode is ON.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DisplayKind {
+    Paragraph,
+    Heading,
+    List,
+    Quote,
+    Rule,
+    Code,
+    Fence,
+}
+
+/// One source→display mapping segment: source bytes `[src_start, src_end)`
+/// render as display bytes `[disp_start, disp_end)` of the line's display
+/// text. Identity segments copy bytes verbatim; non-identity segments are
+/// markers — hidden (`## ` → nothing) or replaced (`- ` → `• `).
+#[derive(Clone, Copy, Debug)]
+struct DisplaySegment {
+    src_start: usize,
+    src_end: usize,
+    disp_start: usize,
+    disp_end: usize,
+    identity: bool,
+}
+
+/// A logical source line, transformed for canvas display.
+#[derive(Clone, Debug)]
+struct DisplayLine {
+    /// Absolute source offset of this line's first byte.
+    src_offset: usize,
+    /// Display text (block syntax stripped when Markdown mode is ON).
+    text: String,
+    /// Monotonic source↔display mapping covering the whole line.
+    segments: Vec<DisplaySegment>,
+    kind: DisplayKind,
+    /// Explicit font size in px (headings); `None` inherits the editor's.
+    font_size: Option<f32>,
+    /// Space before/after the line box in px (headings).
+    space_before: f32,
+    space_after: f32,
+    /// Font overrides for the line.
+    bold: bool,
+    italic: bool,
+    mono: bool,
+    /// The line is inside an open ``` fence (used by the OFF-mode
+    /// highlighter path, matching the legacy `in_fence` flag).
+    fenced: bool,
+}
+
+impl DisplayLine {
+    /// The identity line: display == source, no parsing.
+    fn identity(src_offset: usize, text: &str, fenced: bool) -> Self {
+        let mut segments = Vec::new();
+        if !text.is_empty() {
+            segments.push(DisplaySegment {
+                src_start: 0,
+                src_end: text.len(),
+                disp_start: 0,
+                disp_end: text.len(),
+                identity: true,
             });
         }
+        DisplayLine {
+            src_offset,
+            text: text.to_string(),
+            segments,
+            kind: DisplayKind::Paragraph,
+            font_size: None,
+            space_before: 0.0,
+            space_after: 0.0,
+            bold: false,
+            italic: false,
+            mono: false,
+            fenced,
+        }
+    }
+
+    /// Source byte offset (line-local) → display byte offset. Bytes inside
+    /// a hidden marker clamp to the marker's display start, so a caret in
+    /// `# ` sits at the visible text start instead of a phantom position.
+    fn src_to_disp(&self, src: usize) -> usize {
+        for seg in &self.segments {
+            if src <= seg.src_end {
+                return if seg.identity {
+                    seg.disp_start + (src - seg.src_start).min(seg.disp_end - seg.disp_start)
+                } else {
+                    seg.disp_start
+                };
+            }
+        }
+        self.text.len()
+    }
+
+    /// Display byte offset (line-local) → source byte offset. Clicks on a
+    /// replaced marker (`• `) land on its source (`- `).
+    fn disp_to_src(&self, disp: usize) -> usize {
+        for seg in &self.segments {
+            if disp <= seg.disp_end {
+                return if seg.identity {
+                    seg.src_start + (disp - seg.disp_start).min(seg.src_end - seg.src_start)
+                } else {
+                    seg.src_start
+                };
+            }
+        }
+        self.segments.last().map(|s| s.src_end).unwrap_or(0)
+    }
+}
+
+/// Accumulates one line's display text and source↔display segments.
+#[derive(Default)]
+struct DisplayBuilder {
+    text: String,
+    segments: Vec<DisplaySegment>,
+    src: usize,
+}
+
+impl DisplayBuilder {
+    /// Consume `n` source bytes without rendering them (hidden marker).
+    fn hide(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let disp = self.text.len();
+        self.segments.push(DisplaySegment {
+            src_start: self.src,
+            src_end: self.src + n,
+            disp_start: disp,
+            disp_end: disp,
+            identity: false,
+        });
+        self.src += n;
+    }
+
+    /// Render the next `n` source bytes verbatim.
+    fn ident(&mut self, line: &str, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let disp = self.text.len();
+        self.text.push_str(&line[self.src..self.src + n]);
+        self.segments.push(DisplaySegment {
+            src_start: self.src,
+            src_end: self.src + n,
+            disp_start: disp,
+            disp_end: self.text.len(),
+            identity: true,
+        });
+        self.src += n;
+    }
+
+    /// Consume `n` source bytes and render `disp` in their place.
+    fn replace(&mut self, n: usize, disp: &str) {
+        if n == 0 {
+            return;
+        }
+        let disp_start = self.text.len();
+        self.text.push_str(disp);
+        self.segments.push(DisplaySegment {
+            src_start: self.src,
+            src_end: self.src + n,
+            disp_start,
+            disp_end: self.text.len(),
+            identity: false,
+        });
+        self.src += n;
+    }
+}
+
+/// Heading type scale in px: pt at 96dpi (1pt = 4/3px). The spec pins H1
+/// at 28pt bold with 12pt before / 6pt after; the rest follow Word/Docs
+/// proportions (each level ~10–20% smaller, tighter spacing as level ↑).
+fn heading_metrics_pt(level: u8) -> (f32, f32, f32) {
+    match level {
+        1 => (28.0, 12.0, 6.0),
+        2 => (22.0, 10.0, 6.0),
+        3 => (18.0, 8.0, 4.0),
+        4 => (16.0, 6.0, 4.0),
+        5 => (14.0, 4.0, 4.0),
+        _ => (12.0, 4.0, 4.0),
+    }
+}
+
+/// The spec's heading scale in canvas pixels (pt → px at 96dpi). The
+/// inspector shows the same numbers in points via `heading_metrics_pt`.
+fn heading_metrics(level: u8) -> (f32, f32, f32) {
+    let (size_pt, before_pt, after_pt) = heading_metrics_pt(level);
+    const PT: f32 = 4.0 / 3.0;
+    (size_pt * PT, before_pt * PT, after_pt * PT)
+}
+
+/// Transform one logical source line for the canvas, with the export
+/// parser's block order: fence → quote → heading → rule → list →
+/// paragraph. With `markdown_on == false` this is the identity
+/// transform (display == source) so nothing is parsed or hidden.
+fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
+    if !markdown_on {
+        return DisplayLine::identity(0, line, in_fence);
+    }
+
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    let mut b = DisplayBuilder::default();
+    let mut kind = DisplayKind::Paragraph;
+    let (mut font_size, mut space_before, mut space_after) = (None, 0.0, 0.0);
+    let (mut bold, mut italic, mut mono) = (false, false, false);
+
+    if trimmed.starts_with("```") {
+        // Fence delimiter (opening or closing): hidden entirely.
+        b.hide(line.len());
+        kind = DisplayKind::Fence;
+        mono = true;
+    } else if in_fence {
+        // Fenced-code body: verbatim, monospace — export keeps it literal.
+        b.ident(line, line.len());
+        kind = DisplayKind::Code;
+        mono = true;
+    } else if trimmed.starts_with('>') {
+        // Quote: strip `>` markers with the export's own loop.
+        b.ident(line, indent);
+        let mut rest = trimmed;
+        while let Some(r) = rest.strip_prefix('>') {
+            rest = r.strip_prefix(' ').unwrap_or(r);
+        }
+        b.hide(trimmed.len() - rest.len());
+        b.ident(line, rest.trim_end().len());
+        b.hide(rest.len() - rest.trim_end().len());
+        kind = DisplayKind::Quote;
+        italic = true;
+    } else if let Some((level, _)) = heading_level_and_text(trimmed) {
+        // Heading: `# `…`###### ` hidden; the spec's `line.slice(2).trim()`
+        // generalizes to "drop indent + hashes + spaces, trim the ends".
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        let after_hashes = &trimmed[hashes..];
+        let ws = after_hashes.len() - after_hashes.trim_start().len();
+        let content = &line[indent + hashes + ws..];
+        b.ident(line, indent);
+        b.hide(hashes + ws);
+        b.ident(line, content.trim_end().len());
+        b.hide(content.len() - content.trim_end().len());
+        kind = DisplayKind::Heading;
+        let (size, before, after) = heading_metrics(level);
+        font_size = Some(size);
+        space_before = before;
+        space_after = after;
+        bold = true;
+    } else if is_horizontal_rule(trimmed) {
+        // Rule: hidden source, drawn as a line by the painter.
+        b.hide(line.len());
+        kind = DisplayKind::Rule;
+    } else if let Some((marker_len, item)) = list_marker_and_content(trimmed) {
+        // List: keep indent (nesting), render the bullet as `• ` and keep
+        // ordered markers verbatim; task boxes become ☐/☑.
+        b.ident(line, indent);
+        if trimmed.as_bytes()[indent].is_ascii_digit() {
+            b.ident(line, marker_len);
+        } else {
+            b.replace(marker_len, "• ");
+        }
+        let mut item_rest = item;
+        if let (Some(checked), rest) = take_checkbox_prefix(item) {
+            b.replace(item.len() - rest.len(), if checked { "☑ " } else { "☐ " });
+            item_rest = rest;
+        }
+        b.ident(line, item_rest.len());
+        b.hide(line.len() - b.src);
+        kind = DisplayKind::List;
+    } else {
+        // Paragraph (and table rows): verbatim.
+        b.ident(line, line.len());
+    }
+
+    DisplayLine {
+        src_offset: 0,
+        text: b.text,
+        segments: b.segments,
+        kind,
+        font_size,
+        space_before,
+        space_after,
+        bold,
+        italic,
+        mono,
+        fenced: false,
+    }
+}
+
+/// Transform every logical line, tracking ``` fence state exactly like the
+/// highlighter and the export parser. Source offsets are absolute.
+fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    for line in lines {
+        let line_in_fence = in_fence;
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        let mut dl = display_line(line, line_in_fence, markdown_on);
+        dl.src_offset = offset;
+        offset += line.len() + 1;
+        out.push(dl);
+    }
+    out
+}
+
+/// Runs for one display row (a slice of a `DisplayLine`'s text) with
+/// Markdown mode ON: headings bold + heading-colored, quotes italic +
+/// muted, fenced code flat code color — the styles the export renderer
+/// applies, using GPUI's per-run font weight/style.
+fn display_runs(
+    kind: DisplayKind,
+    slice: &str,
+    font: gpui::Font,
+    base: gpui::Hsla,
+) -> Vec<TextRun> {
+    let flat = |font: gpui::Font, color: gpui::Hsla, bg: Option<gpui::Hsla>| {
+        vec![TextRun {
+            len: slice.len(),
+            font,
+            color,
+            background_color: bg,
+            underline: None,
+            strikethrough: None,
+        }]
     };
-    for line in text.split('\n') {
-        let line = line.trim_end();
-        if let Some((level, content)) = heading_level_and_text(line) {
-            flush(&mut para, &mut blocks);
+    match kind {
+        DisplayKind::Heading => {
+            let color = hsla(210.0 / 360.0, 0.8, 0.4, 1.0);
+            let bold_font = font.bold();
+            let mut runs = TextInput::inline_runs(slice, bold_font.clone(), color);
+            for r in &mut runs {
+                r.font = bold_font.clone();
+                r.color = color;
+            }
+            runs
+        }
+        DisplayKind::Quote => {
+            let color = hsla(0.0, 0.0, 0.5, 1.0);
+            TextInput::inline_runs(slice, font.italic(), color)
+        }
+        DisplayKind::Code => flat(font, hsla(120.0 / 360.0, 0.5, 0.35, 1.0), None),
+        DisplayKind::Rule | DisplayKind::Fence => Vec::new(),
+        DisplayKind::List | DisplayKind::Paragraph => TextInput::inline_runs(slice, font, base),
+    }
+}
+
+/// One bullet (`-`/`*`/`+`) or ordered (`1.`/`1)`) item, with task-box
+/// detection (`[ ]`/`[x]`). Returns (raw_indent, ordered, checked, runs);
+/// the scanner converts indent into a nesting level relative to the list
+/// base so both 2-space and 4-space nesting styles work.
+fn parse_list_item(line: &str) -> Option<(usize, bool, Option<bool>, Vec<doc::TextRun>)> {
+    let b = line.as_bytes();
+    let mut idx = 0usize;
+    let mut indent = 0usize;
+    while idx < b.len() {
+        if b[idx] == b' ' {
+            indent += 1;
+            idx += 1;
+        } else if b[idx] == b'\t' {
+            indent += 4;
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    let rest = &line[idx..];
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Bullet: marker followed by a space.
+    if rest.len() >= 2
+        && matches!(rest.as_bytes()[0], b'-' | b'*' | b'+')
+        && rest.as_bytes()[1] == b' '
+    {
+        let (checked, content) = take_checkbox_prefix(&rest[2..]);
+        if content.trim().is_empty() && checked.is_none() {
+            return None; // "- " with nothing: not an item yet
+        }
+        return Some((indent, false, checked, parse_inline_runs(content.trim())));
+    }
+
+    // Ordered: digits + `.` or `)` + space.
+    let digits = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && digits <= 9 && digits < rest.len() {
+        let sep = rest.as_bytes()[digits];
+        if (sep == b'.' || sep == b')')
+            && digits + 1 < rest.len()
+            && rest.as_bytes()[digits + 1] == b' '
+        {
+            let (checked, content) = take_checkbox_prefix(&rest[digits + 2..]);
+            if content.trim().is_empty() && checked.is_none() {
+                return None;
+            }
+            return Some((indent, true, checked, parse_inline_runs(content.trim())));
+        }
+    }
+    None
+}
+
+/// GFM table delimiter row (`| :--- | ---: |`).
+fn is_table_delimiter(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') {
+        return false;
+    }
+    let cells = split_table_row(t);
+    if cells.iter().all(|c| c.is_empty()) {
+        return false;
+    }
+    cells
+        .iter()
+        .filter(|c| !c.is_empty())
+        .all(|c| c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// Split a pipe row into trimmed cells, ignoring outer pipes.
+fn split_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    // Only a real (unescaped) trailing pipe closes the row: `| a\|` ends
+    // with content, not a separator.
+    let t = match t.strip_suffix('|') {
+        Some(rest) if !tail_is_escaped(rest) => rest,
+        _ => t,
+    };
+    let mut cells: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Keep escape pairs intact: `\\|` is an escaped backslash
+            // followed by a real separator, `\|` is a literal pipe.
+            cur.push('\\');
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_punctuation() {
+                    cur.push(next);
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        if c == '|' {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+            continue;
+        }
+        cur.push(c);
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// Does the char before `s.len()` (i.e. the stripped position) escape the
+/// boundary — an odd run of backslashes directly before it?
+fn tail_is_escaped(s: &str) -> bool {
+    s.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+}
+
+/// Standalone image line: `![alt](path)` and nothing else.
+fn standalone_image(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    let inner = t.strip_prefix("![")?;
+    let close = inner.find("](")?;
+    let alt = &inner[..close];
+    let url = inner[close + 2..].strip_suffix(')')?;
+    if alt.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some((alt.to_string(), url.to_string()))
+}
+
+fn flush_para(para: &mut Vec<&str>, blocks: &mut Vec<doc::Block>, line_spacing: f32) {
+    if para.is_empty() {
+        return;
+    }
+    let joined = para.join(" ");
+    para.clear();
+    let runs = parse_inline_runs(&joined);
+    if !runs.is_empty() {
+        blocks.push(doc::Block::Paragraph {
+            runs,
+            style: doc::ParagraphStyle {
+                line_spacing,
+                space_before: 0.0,
+                space_after: 8.0,
+            },
+        });
+    }
+}
+
+fn flush_quote(quote: &mut Vec<&str>, quote_level: &mut u8, blocks: &mut Vec<doc::Block>) {
+    if quote.is_empty() {
+        return;
+    }
+    let joined = quote.join(" ");
+    quote.clear();
+    let runs = parse_inline_runs(&joined);
+    if !runs.is_empty() {
+        blocks.push(doc::Block::Quote {
+            level: *quote_level,
+            runs,
+        });
+    }
+}
+
+fn flush_list(items: &mut Vec<doc::ListItem>, blocks: &mut Vec<doc::Block>) {
+    if items.is_empty() {
+        return;
+    }
+    let taken = std::mem::take(items);
+    blocks.push(doc::Block::List { items: taken });
+}
+
+/// Parse editor content into structured blocks. Line scanner dispatch:
+/// fenced code, blockquotes, lists (bulleted/ordered/task/nested), pipe
+/// tables, headings, thematic breaks, standalone images, then paragraphs
+/// (consecutive lines join with a space — soft wrap).
+fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut blocks: Vec<doc::Block> = Vec::new();
+    let mut para: Vec<&str> = Vec::new();
+    let mut quote: Vec<&str> = Vec::new();
+    let mut quote_level: u8 = 1;
+    let mut items: Vec<doc::ListItem> = Vec::new();
+    // List nesting bookkeeping: base indent of the current list + the first
+    // deeper indent observed (2-space vs 4-space style).
+    let mut list_base: Option<usize> = None;
+    let mut list_step: Option<usize> = None;
+
+    let mut in_fence = false;
+    let mut fence_lang = String::new();
+    let mut fence_body: Vec<&str> = Vec::new();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
+
+        // ── Fenced code: consume raw lines until closing fence or EOF ──
+        if in_fence {
+            if raw.trim_start().starts_with("```") {
+                in_fence = false;
+                blocks.push(doc::Block::CodeBlock {
+                    language: std::mem::take(&mut fence_lang),
+                    text: fence_body.join("\n"),
+                });
+                fence_body.clear();
+            } else {
+                fence_body.push(raw);
+            }
+            i += 1;
+            continue;
+        }
+
+        let line = raw.trim_end();
+
+        // ── Fence open ──
+        if line.trim_start().starts_with("```") {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
+            in_fence = true;
+            fence_lang = line.trim_start()[3..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            i += 1;
+            continue;
+        }
+
+        // ── Blank line: every pending construct ends ──
+        if line.trim().is_empty() {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
+            i += 1;
+            continue;
+        }
+
+        // ── Page break: exactly what the Markdown exporter emits for
+        //    `Block::PageBreak` (pandoc-style `\newpage`). Recognizing
+        //    the directive keeps rich exports a byte-identical fixed
+        //    point and lets authors type a real page break. ──
+        if line.trim() == "\\newpage" {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
+            blocks.push(doc::Block::page_break());
+            i += 1;
+            continue;
+        }
+
+        // ── Blockquote ──
+        if let Some((lvl, content)) = strip_quote(line) {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_list(&mut items, &mut blocks);
+            if content.is_empty() {
+                // `>` alone: paragraph break inside/after the quote.
+                flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            } else {
+                if !quote.is_empty() {
+                    quote_level = quote_level.max(lvl);
+                } else {
+                    quote_level = lvl;
+                }
+                quote.push(content);
+            }
+            i += 1;
+            continue;
+        }
+        if !quote.is_empty() {
+            // Non-quote line ends the quote; keep processing this line.
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+        }
+
+        // ── Heading (≤3 leading spaces tolerated via trim_start) ──
+        if let Some((level, content)) = heading_level_and_text(line.trim_start()) {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
             blocks.push(doc::Block::Heading {
                 level,
                 runs: parse_inline_runs(content),
             });
-        } else if line.trim().is_empty() {
-            flush(&mut para, &mut blocks);
-        } else {
-            para.push(line.trim());
+            i += 1;
+            continue;
         }
+
+        // ── Thematic break (checked before list: `* * *` is a rule, not
+        //    a bullet whose content is `* *`) ──
+        if is_horizontal_rule(line) {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
+            blocks.push(doc::Block::HorizontalRule);
+            i += 1;
+            continue;
+        }
+
+        // ── List item ──
+        if let Some((indent, ordered, checked, runs)) = parse_list_item(line) {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            // Nesting depth is relative to the list's base indent; the step
+            // is the first observed deeper indent (2- or 4-space style).
+            if items.is_empty() {
+                list_base = Some(indent);
+                list_step = None;
+            }
+            let base = list_base.unwrap_or(indent);
+            let diff = indent.saturating_sub(base);
+            let level = if diff == 0 {
+                0
+            } else {
+                let step = *list_step.get_or_insert(diff);
+                diff.div_ceil(step).min(4) as u8
+            };
+            items.push(doc::ListItem {
+                level,
+                ordered,
+                checked,
+                runs,
+            });
+            i += 1;
+            continue;
+        }
+
+        // ── Standalone image ──
+        if let Some((alt, path)) = standalone_image(line) {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
+            let mut data = doc::ImageData::new(path);
+            data.alt_text = alt;
+            blocks.push(doc::Block::Image { data });
+            i += 1;
+            continue;
+        }
+
+        // ── Pipe table: row + delimiter row + body rows ──
+        if line.contains('|') && i + 1 < lines.len() && is_table_delimiter(lines[i + 1]) {
+            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_list(&mut items, &mut blocks);
+            let mut raw_rows: Vec<Vec<String>> = vec![split_table_row(line)];
+            i += 2; // skip delimiter
+            while i < lines.len() {
+                let body = lines[i].trim_end();
+                if body.trim().is_empty() || !body.contains('|') {
+                    break;
+                }
+                raw_rows.push(split_table_row(body));
+                i += 1;
+            }
+            let num_cols = raw_rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let rows = raw_rows
+                .into_iter()
+                .map(|mut row| {
+                    while row.len() < num_cols {
+                        row.push(String::new());
+                    }
+                    row.truncate(num_cols);
+                    row.into_iter()
+                        .map(|cell| doc::TableCell {
+                            runs: parse_inline_runs(&cell),
+                        })
+                        .collect()
+                })
+                .collect();
+            blocks.push(doc::Block::Table {
+                data: doc::TableData {
+                    rows,
+                    caption: None,
+                    column_widths: vec![100.0 / num_cols as f32; num_cols],
+                },
+            });
+            continue; // i already advanced past consumed rows
+        }
+
+        // ── List continuation: indented wrapped text joins last item ──
+        if !items.is_empty() && (line.starts_with(' ') || line.starts_with('\t')) {
+            if let Some(last) = items.last_mut() {
+                last.runs.push(doc::TextRun::plain(" "));
+                last.runs.extend(parse_inline_runs(line.trim()));
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── Plain paragraph line ──
+        flush_quote(&mut quote, &mut quote_level, &mut blocks);
+        flush_list(&mut items, &mut blocks);
+        para.push(line.trim());
+        i += 1;
     }
-    flush(&mut para, &mut blocks);
+
+    flush_para(&mut para, &mut blocks, line_spacing);
+    flush_quote(&mut quote, &mut quote_level, &mut blocks);
+    flush_list(&mut items, &mut blocks);
+    // Unclosed fence at EOF still renders its content (never drop text).
+    if in_fence {
+        blocks.push(doc::Block::CodeBlock {
+            language: std::mem::take(&mut fence_lang),
+            text: fence_body.join("\n"),
+        });
+    }
     blocks
 }
 
@@ -4271,11 +5359,13 @@ fn export_model(structured: &doc::Document, content: &str) -> doc::Document {
 
 fn print_export_usage(program: &str) {
     eprintln!("Usage:");
-    eprintln!("  {program} --export-pdf <input.json> <out.pdf>");
-    eprintln!("  {program} --export-docx <input.json> <out.docx>");
-    eprintln!("  {program} --export-md <input.json> <out.md>");
+    eprintln!("  {program} --export-pdf <input.(json|md)> <out.pdf>");
+    eprintln!("  {program} --export-docx <input.(json|md)> <out.docx>");
+    eprintln!("  {program} --export-md <input.(json|md)> <out.md>");
     eprintln!();
     eprintln!("input.json is a serde-serialized sylph-core Document (rich model).");
+    eprintln!("input.md is parsed with the SAME markdown parser the editor uses,");
+    eprintln!("then exported — the end-to-end proof for typed markdown.");
     eprintln!("No window is opened in headless mode. Exit 0 on success, 1 on failure.");
 }
 
@@ -4309,19 +5399,47 @@ fn try_headless_export(args: &[String]) -> Option<i32> {
     }
     let input_path = &args[2];
     let output_path = &args[3];
-    let json = match std::fs::read_to_string(input_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read {input_path}: {e}");
+    let json = if input_path.ends_with(".md") || input_path.ends_with(".markdown") {
+        // Markdown input: run the exact parser the GUI editor export uses,
+        // so this CLI proves the full "type markdown → document" pipeline.
+        let content = match std::fs::read_to_string(input_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {input_path}: {e}");
+                return Some(1);
+            }
+        };
+        let mut structured = sylph_core::document::Document::new();
+        if let Some(stem) = std::path::Path::new(input_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            structured.title = stem.to_string();
+        }
+        let model = export_model(&structured, &content);
+        match serde_json::to_string(&model) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: parsed document failed to serialize: {e}");
+                return Some(1);
+            }
+        }
+    } else {
+        let content = match std::fs::read_to_string(input_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {input_path}: {e}");
+                return Some(1);
+            }
+        };
+        // Validate that the input is a real Document before touching Python,
+        // so JSON shape errors are reported honestly instead of as export output.
+        if let Err(e) = serde_json::from_str::<sylph_core::document::Document>(&content) {
+            eprintln!("error: {input_path} is not a valid Document JSON: {e}");
             return Some(1);
         }
+        content
     };
-    // Validate that the input is a real Document before touching Python,
-    // so JSON shape errors are reported honestly instead of as export output.
-    if let Err(e) = serde_json::from_str::<sylph_core::document::Document>(&json) {
-        eprintln!("error: {input_path} is not a valid Document JSON: {e}");
-        return Some(1);
-    }
     let result = match mode {
         "--export-pdf" => sylph_py_bridge::export_rich_pdf(&json, output_path),
         "--export-docx" => sylph_py_bridge::export_rich_docx(&json, output_path),
@@ -4428,6 +5546,11 @@ fn main() {
                         last_bounds: None,
                         all_lines: Vec::new(),
                         line_char_offsets: Vec::new(),
+                        markdown_mode: false,
+                        row_metas: Vec::new(),
+                        content_height: px(0.0),
+                        display_lines: Vec::new(),
+                        cursor_row: 0,
                         line_height: px(20.0),
                         scroll_offset_y: px(0.0),
                         is_selecting: false,
@@ -4456,6 +5579,7 @@ fn main() {
                             document: sylph_core::document::Document::new(),
                             focus_handle: cx.focus_handle(),
                             sidebar_visible: true,
+                            web_layout: false,
                             preview_visible: false,
                             find: FindReplaceState {
                                 visible: false,
@@ -4607,6 +5731,284 @@ mod export_model_tests {
     }
 
     #[test]
+    fn bullet_ordered_nested_and_task_lists_parse() {
+        use sylph_core::document::Block;
+        let md = "- alpha\n- **beta**\n  - nested\n    - deeper\n1. first\n2) second\n- [ ] todo\n- [x] done";
+        let blocks = parse_content_blocks(md, 1.15);
+        // Consecutive items (no blank lines) form ONE list block; each item
+        // carries its own ordered/task/level flags.
+        let items = match &blocks[..] {
+            [Block::List { items }] => items,
+            other => panic!("expected one list, got {other:?}"),
+        };
+        assert_eq!(items.len(), 8);
+        let levels: Vec<u8> = items.iter().map(|i| i.level).collect();
+        assert_eq!(levels, [0, 0, 1, 2, 0, 0, 0, 0]);
+        assert!(!items[0].ordered && items[0].checked.is_none());
+        assert_eq!(items[0].runs[0].text, "alpha");
+        // beta run is bold
+        assert!(items[1]
+            .runs
+            .iter()
+            .any(|r| r.text == "beta" && !r.styles.is_empty()));
+
+        // ordered items, including the `)` separator form
+        let ordered: Vec<_> = items.iter().filter(|i| i.ordered).collect();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].runs[0].text, "first");
+        assert_eq!(ordered[1].runs[0].text, "second");
+        // task items
+        let tasks: Vec<_> = items.iter().filter(|i| i.checked.is_some()).collect();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].checked, Some(false));
+        assert_eq!(tasks[0].runs[0].text, "todo");
+        assert_eq!(tasks[1].checked, Some(true));
+        assert_eq!(tasks[1].runs[0].text, "done");
+    }
+
+    #[test]
+    fn pipe_table_with_styles_and_padding() {
+        use sylph_core::document::Block;
+        let md = "| Name | Value |\n| :--- | ---: |\n| **A** | 1 |\n| only-one |";
+        let blocks = parse_content_blocks(md, 1.15);
+        let data = match &blocks[..] {
+            [Block::Table { data }] => data,
+            other => panic!("expected one table, got {other:?}"),
+        };
+        assert_eq!(data.rows.len(), 3); // header + 2 body
+        assert_eq!(data.col_count(), 2);
+        assert_eq!(data.rows[0][0].text(), "Name");
+        assert_eq!(data.rows[1][0].text(), "A");
+        assert!(!data.rows[1][0].runs[0].styles.is_empty(), "bold in cell");
+        // ragged row padded to 2 columns (empty cell → empty runs)
+        assert_eq!(data.rows[2][1].text(), "");
+        assert!(data.rows[2][1].runs.is_empty());
+    }
+
+    #[test]
+    fn page_break_directive_parses_back() {
+        use sylph_core::document::Block;
+        // `\newpage` is exactly what the Markdown exporter emits for a
+        // page break; parsing it back keeps rich exports a fixed point.
+        let md = "Before\n\n\\newpage\n\n# After";
+        let blocks = parse_content_blocks(md, 1.15);
+        assert!(matches!(blocks[0], Block::Paragraph { .. }));
+        assert!(matches!(blocks[1], Block::PageBreak));
+        assert!(matches!(blocks[2], Block::Heading { .. }));
+        // The directive only counts as a whole line — the same text
+        // mid-sentence stays an ordinary paragraph.
+        let text = parse_content_blocks("see the \\newpage later", 1.15);
+        assert!(matches!(text.as_slice(), [Block::Paragraph { .. }]));
+    }
+
+    #[test]
+    fn table_row_split_is_escape_aware() {
+        // `a\|b` is one cell whose content is a literal pipe; a naive
+        // split-on-pipe would invent an extra column (silent corruption).
+        let cells = split_table_row("| a\\|b | c |");
+        assert_eq!(cells, vec!["a\\|b", "c"]);
+        let runs = parse_inline_runs(&cells[0]);
+        assert_eq!(runs[0].text, "a|b");
+
+        // A row ending in an escaped pipe has content, not a closing
+        // separator: the escape stays with the cell.
+        let cells = split_table_row("| a\\|");
+        assert_eq!(cells, vec!["a\\|"]);
+
+        // Even number of backslashes: `\\` is a literal backslash and the
+        // pipe after it really is a separator.
+        let cells = split_table_row("| a\\\\ | b |");
+        assert_eq!(cells, vec!["a\\\\", "b"]);
+
+        // Rows without any pipe still yield one cell.
+        assert_eq!(split_table_row("only"), vec!["only"]);
+    }
+
+    #[test]
+    fn blockquote_multiline_and_depth() {
+        use sylph_core::document::Block;
+        let md = "> first line\n> second line\n\n>> deep quote";
+        let blocks = parse_content_blocks(md, 1.15);
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            Block::Quote { level, runs } => {
+                assert_eq!(*level, 1);
+                assert_eq!(runs[0].text, "first line second line");
+            }
+            b => panic!("expected quote, got {b:?}"),
+        }
+        match &blocks[1] {
+            Block::Quote { level, runs } => {
+                assert_eq!(*level, 2);
+                assert_eq!(runs[0].text, "deep quote");
+            }
+            b => panic!("expected quote, got {b:?}"),
+        }
+    }
+
+    #[test]
+    fn fenced_code_is_verbatim_with_language() {
+        use sylph_core::document::Block;
+        let md = "before\n\n```rust\nfn main() {\n    **not bold** # not heading\n}\n```\nafter";
+        let blocks = parse_content_blocks(md, 1.15);
+        match &blocks[..] {
+            [Block::Paragraph { .. }, Block::CodeBlock { language, text }, Block::Paragraph { .. }] =>
+            {
+                assert_eq!(language, "rust");
+                assert_eq!(text, "fn main() {\n    **not bold** # not heading\n}");
+            }
+            other => panic!("expected para/code/para, got {other:?}"),
+        }
+        // Unclosed fence at EOF still yields its body
+        let open = parse_content_blocks("```\nno close", 1.15);
+        assert!(matches!(&open[..], [Block::CodeBlock { text, .. }] if text == "no close"));
+    }
+
+    #[test]
+    fn horizontal_rules_vs_lookalikes() {
+        use sylph_core::document::{Block, SpanStyle};
+        let md = "---\n\n* * *\n\n___\n\n- item\n\n***bold***\n\n-";
+        let blocks = parse_content_blocks(md, 1.15);
+        let rules = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::HorizontalRule))
+            .count();
+        assert_eq!(rules, 3, "three thematic breaks, got {blocks:?}");
+        // "- item" is a list, "***bold***" is a paragraph, "-" is a paragraph
+        assert!(blocks.iter().any(|b| matches!(b, Block::List { .. })));
+        let para_texts: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { runs, .. } => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        // "***bold***" is NOT a thematic break: marker chars are consumed
+        // by the bold-italic parse, leaving text "bold" with styles.
+        assert!(para_texts.iter().any(|t| t == "bold"));
+        assert!(para_texts.iter().any(|t| t == "-"));
+        let bold_para = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph { runs, .. }
+                    if runs.iter().map(|r| r.text.as_str()).collect::<String>() == "bold" =>
+                {
+                    Some(runs)
+                }
+                _ => None,
+            })
+            .expect("bold paragraph present");
+        assert!(bold_para[0]
+            .styles
+            .iter()
+            .any(|s| matches!(s, SpanStyle::BoldItalic)));
+    }
+
+    #[test]
+    fn links_autolinks_images_and_escapes() {
+        use sylph_core::document::{Block, SpanStyle};
+        // inline link with nested emphasis + autolink + escape
+        let runs =
+            parse_inline_runs("see [**docs**](https://x.io/a) or <https://y.io> and \\*literal\\*");
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "see docs or https://y.io and *literal*");
+        let doc_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.styles.iter().any(|s| matches!(s, SpanStyle::Link(_))))
+            .collect();
+        assert_eq!(doc_runs.len(), 2, "two link runs (docs + autolink)");
+        match &doc_runs[0].styles[..] {
+            [SpanStyle::Bold, SpanStyle::Link(url)] => assert_eq!(url, "https://x.io/a"),
+            other => panic!("expected bold+link, got {other:?}"),
+        }
+        match &doc_runs[1].styles[..] {
+            [SpanStyle::Link(url)] => assert_eq!(url, "https://y.io"),
+            other => panic!("expected link, got {other:?}"),
+        }
+        // Non-URL angle text stays literal
+        let plain = parse_inline_runs("<not a link>");
+        assert_eq!(plain[0].text, "<not a link>");
+        assert!(plain[0].styles.is_empty());
+
+        // Standalone image line → Image block
+        let blocks = parse_content_blocks("![diagram](fixtures/proof.png)", 1.15);
+        match &blocks[..] {
+            [Block::Image { data }] => {
+                assert_eq!(data.path, "fixtures/proof.png");
+                assert_eq!(data.alt_text, "diagram");
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
+        // Inline image inside text → alt as plain text
+        let inline = parse_inline_runs("top ![icon](i.png) end");
+        let joined: String = inline.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "top icon end");
+    }
+
+    #[test]
+    fn list_continuation_joins_wrapped_item() {
+        use sylph_core::document::Block;
+        let md = "- first line\n  wrapped tail\n- second";
+        let blocks = parse_content_blocks(md, 1.15);
+        match &blocks[..] {
+            [Block::List { items }] => {
+                assert_eq!(items.len(), 2);
+                let t: String = items[0].runs.iter().map(|r| r.text.as_str()).collect();
+                assert_eq!(t, "first line wrapped tail");
+                assert_eq!(items[1].runs[0].text, "second");
+            }
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kitchen_sink_document_order() {
+        use sylph_core::document::Block;
+        let md = concat!(
+            "# Title\n\n",
+            "Para with [link](https://a.b) and **strong**.\n\n",
+            "> quote\n\n",
+            "- one\n- two\n\n",
+            "| h |\n| --- |\n| 1 |\n\n",
+            "```py\nx = 1\n```\n\n",
+            "---\n\n",
+            "![alt](p.png)\n\n",
+            "end"
+        );
+        let blocks = parse_content_blocks(md, 1.15);
+        let kinds: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Heading { .. } => "heading",
+                Block::Paragraph { .. } => "paragraph",
+                Block::Quote { .. } => "quote",
+                Block::List { .. } => "list",
+                Block::Table { .. } => "table",
+                Block::CodeBlock { .. } => "code",
+                Block::HorizontalRule => "hr",
+                Block::Image { .. } => "image",
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "heading",
+                "paragraph",
+                "quote",
+                "list",
+                "table",
+                "code",
+                "hr",
+                "image",
+                "paragraph"
+            ]
+        );
+    }
+
+    #[test]
     fn export_model_serializes_to_python_expected_shapes() {
         use sylph_core::document::Document;
         let structured = Document::new();
@@ -4642,5 +6044,430 @@ mod export_model_tests {
         std::fs::create_dir_all("/tmp/opencode").expect("tmp dir");
         std::fs::write("/tmp/opencode/merged.json", &json).expect("write proof");
         assert!(json.contains("Merged Head"));
+    }
+}
+
+#[cfg(test)]
+mod editor_highlight_tests {
+    use super::*;
+
+    fn font() -> gpui::Font {
+        gpui::font("monospace")
+    }
+
+    fn base() -> gpui::Hsla {
+        hsla(0.0, 0.0, 0.2, 1.0)
+    }
+
+    fn bold_color() -> gpui::Hsla {
+        hsla(0.0, 0.0, 0.15, 1.0)
+    }
+
+    fn code_color() -> gpui::Hsla {
+        hsla(120.0 / 360.0, 0.5, 0.35, 1.0)
+    }
+
+    fn link_color() -> gpui::Hsla {
+        hsla(210.0 / 360.0, 0.8, 0.45, 1.0)
+    }
+
+    fn list_color() -> gpui::Hsla {
+        hsla(30.0 / 360.0, 0.7, 0.45, 1.0)
+    }
+
+    fn total_len(runs: &[TextRun]) -> usize {
+        runs.iter().map(|r| r.len).sum()
+    }
+
+    #[test]
+    fn struck_runs_carry_a_strike_line() {
+        // The canvas draws a real strike line under `~~…~~` content —
+        // the same thing the PDF/DOCX export renders for strikethrough.
+        let runs = TextInput::markdown_runs("a ~~gone~~ b", font(), base(), false);
+        let struck_len: usize = runs
+            .iter()
+            .filter(|r| r.strikethrough.is_some())
+            .map(|r| r.len)
+            .sum();
+        assert_eq!(struck_len, "gone".len(), "only content is struck");
+        assert_eq!(
+            runs.iter().map(|r| r.len).sum::<usize>(),
+            "a ~~gone~~ b".len()
+        );
+    }
+
+    #[test]
+    fn highlight_runs_cover_every_line_exactly() {
+        // If runs don't cover the line, paint boundaries shift left and
+        // the editor claims styles the export won't render.
+        let lines = [
+            "**bold** and *italic* and `code` and ~~gone~~",
+            "- [ ] todo",
+            "- [x] done",
+            "1) ordered and 2. also",
+            "> quote **strong**",
+            ">> deeper",
+            "# Head with `code`",
+            "* * *",
+            "- - -",
+            "---",
+            "| a | **b** |",
+            "snake_case_name.txt stays plain",
+            "[docs](https://example.com) vs <https://x.io>",
+            "escaped \\* star stays literal",
+            "![alt](img.png)",
+            "plain paragraph",
+            "",
+            "    indented line",
+        ];
+        for line in lines {
+            for in_fence in [false, true] {
+                let runs = TextInput::markdown_runs(line, font(), base(), in_fence);
+                assert_eq!(
+                    total_len(&runs),
+                    line.len(),
+                    "coverage mismatch for {line:?} (in_fence={in_fence})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_snake_case_stays_plain() {
+        // `_..._` is not an emphasis marker in export; the editor must
+        // not pretend it is.
+        let line = "some_file_name.txt";
+        let runs = TextInput::markdown_runs(line, font(), base(), false);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, line.len());
+        assert_eq!(runs[0].color, base());
+    }
+
+    #[test]
+    fn highlight_spaced_rule_is_a_rule_not_a_bullet() {
+        // Export parses `* * *` as a thematic break before list detection.
+        for line in ["* * *", "- - -"] {
+            let runs = TextInput::markdown_runs(line, font(), base(), false);
+            assert_eq!(runs.len(), 1, "{line}");
+            assert_eq!(runs[0].color, list_color(), "{line}");
+        }
+    }
+
+    #[test]
+    fn highlight_ordered_accepts_paren_separator() {
+        let line = "3) third";
+        let runs = TextInput::markdown_runs(line, font(), base(), false);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len, 3, "marker includes the space");
+        assert_eq!(runs[0].color, list_color());
+        assert_eq!(runs[1].len, 5);
+        assert_eq!(runs[1].color, base());
+        assert_eq!(total_len(&runs), line.len());
+    }
+
+    #[test]
+    fn highlight_fence_body_is_verbatim() {
+        // Inside a fence export stores text verbatim: no headings, no
+        // lists and no emphasis may be claimed by the editor either.
+        let line = "# not a heading - still code";
+        let runs = TextInput::markdown_runs(line, font(), base(), true);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, line.len());
+        assert_eq!(runs[0].color, code_color());
+    }
+
+    #[test]
+    fn highlight_emphasis_does_not_shift_boundaries() {
+        // Marker bytes used to fall outside every run, shifting colors
+        // left: `**ab**` painted `**ab` bold. Runs must cover exactly.
+        let runs = TextInput::markdown_runs("**ab**", font(), base(), false);
+        let lens: Vec<usize> = runs.iter().map(|r| r.len).collect();
+        assert_eq!(lens, vec![2, 2, 2]);
+        assert_eq!(runs[0].color, base(), "opening marker stays plain");
+        assert_eq!(runs[1].color, bold_color());
+        assert_eq!(runs[2].color, base(), "closing marker stays plain");
+    }
+
+    #[test]
+    fn highlight_task_box_shares_the_marker_color() {
+        // Export treats `[x]` as metadata, not as link-ish text.
+        let line = "- [x] done";
+        let runs = TextInput::markdown_runs(line, font(), base(), false);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].len, 2);
+        assert_eq!(runs[0].color, list_color());
+        assert_eq!(runs[1].len, 4);
+        assert_eq!(runs[1].color, list_color());
+        assert_eq!(runs[2].len, 4);
+        assert_eq!(runs[2].color, base());
+        assert_eq!(total_len(&runs), line.len());
+    }
+
+    #[test]
+    fn highlight_link_span_colors_whole_link_like_export() {
+        let line = "[docs](https://example.com)";
+        let runs = TextInput::markdown_runs(line, font(), base(), false);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, line.len());
+        assert_eq!(runs[0].color, link_color());
+    }
+
+    #[test]
+    fn highlight_inline_image_alt_stays_plain() {
+        // Export keeps image alt text plain; the editor must not paint
+        // the whole span as a link.
+        let line = "see ![alt](img.png) here";
+        let runs = TextInput::markdown_runs(line, font(), base(), false);
+        assert_eq!(total_len(&runs), line.len());
+        assert!(runs.iter().all(|r| r.color == base()));
+    }
+
+    #[test]
+    fn export_format_extension_matches_renderer_targets() {
+        // The GUI menu writes .md through the same model + renderer as
+        // the headless CLI; the extension is the observable contract.
+        assert_eq!(ExportFormat::Pdf.ext(), "pdf");
+        assert_eq!(ExportFormat::Docx.ext(), "docx");
+        assert_eq!(ExportFormat::Markdown.ext(), "md");
+    }
+}
+
+#[cfg(test)]
+mod markdown_wysiwyg_tests {
+    use super::*;
+
+    #[test]
+    fn heading_metrics_have_a_pt_source_and_px_render() {
+        // The style inspector shows the spec's points; the canvas paints
+        // pixels (pt × 4/3 at 96dpi). One source, two renderings.
+        assert_eq!(heading_metrics_pt(1), (28.0, 12.0, 6.0));
+        assert_eq!(heading_metrics_pt(6), (12.0, 4.0, 4.0));
+        let (s, b, a) = heading_metrics(1);
+        assert!((s - 28.0 * 4.0 / 3.0).abs() < 1e-4, "size px");
+        assert!((b - 12.0 * 4.0 / 3.0).abs() < 1e-4, "space before px");
+        assert!((a - 6.0 * 4.0 / 3.0).abs() < 1e-4, "space after px");
+    }
+
+    fn on(line: &str) -> DisplayLine {
+        display_line(line, false, true)
+    }
+
+    fn off(line: &str) -> DisplayLine {
+        display_line(line, false, false)
+    }
+
+    #[test]
+    fn heading_on_hides_syntax_and_applies_spec_metrics() {
+        let dl = on("# working as a header 1");
+        assert_eq!(dl.kind, DisplayKind::Heading);
+        // The spec: `line.slice(2).trim()` — marker gone, text kept.
+        assert_eq!(dl.text, "working as a header 1");
+        assert!(dl.bold);
+        let (size, before, after) = heading_metrics(1);
+        assert_eq!(dl.font_size, Some(size));
+        assert_eq!((dl.space_before, dl.space_after), (before, after));
+        // 28pt bold, 12pt space before, 6pt space after → px at 96dpi.
+        assert!((size - 112.0 / 3.0).abs() < 0.01);
+        assert!((before - 16.0).abs() < 0.01);
+        assert!((after - 8.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn heading_off_stays_literal_paragraph() {
+        let dl = off("# working as a header 1");
+        assert_eq!(dl.kind, DisplayKind::Paragraph);
+        assert_eq!(dl.text, "# working as a header 1");
+        assert!(dl.font_size.is_none());
+        // Identity mapping: every source offset maps to itself.
+        for i in 0..=dl.text.len() {
+            assert_eq!(dl.src_to_disp(i), i);
+            assert_eq!(dl.disp_to_src(i), i);
+        }
+    }
+
+    #[test]
+    fn off_mode_never_transforms_any_construct() {
+        for line in ["# h", "> q", "- x", "---", "```", "1. a", "* * *"] {
+            let dls = build_display_lines(&[line.to_string()], false);
+            let dl = &dls[0];
+            assert_eq!(dl.text, line, "line: {line}");
+            assert_eq!(dl.kind, DisplayKind::Paragraph, "line: {line}");
+            assert!(dl.font_size.is_none(), "line: {line}");
+        }
+    }
+
+    #[test]
+    fn heading_mapping_addresses_source_positions() {
+        let dl = on("# Title");
+        // Marker bytes clamp to the start of the visible text.
+        assert_eq!(dl.src_to_disp(0), 0); // before `#`
+        assert_eq!(dl.src_to_disp(2), 0); // after `# `
+        assert_eq!(dl.src_to_disp(3), 1); // inside "Title"
+                                          // Clicks: display start lands on the line start, content maps back
+                                          // into the source content.
+        assert_eq!(dl.disp_to_src(0), 0);
+        assert_eq!(dl.disp_to_src(1), 3); // after 'T' → after 'T' in source
+        assert_eq!(dl.disp_to_src(5), 7); // end of "Title" = line end
+        assert_eq!(dl.disp_to_src(dl.text.len()), "# Title".len());
+    }
+
+    #[test]
+    fn bullet_and_task_box_replacements_map_to_markers() {
+        let dl = on("- [x] ship it");
+        assert_eq!(dl.kind, DisplayKind::List);
+        assert_eq!(dl.text, "• ☑ ship it");
+        // `- ` renders as `• `, `[x] ` as `☑ ` — source inside either
+        // marker clamps to the marker's start.
+        assert_eq!(dl.src_to_disp(1), 0); // inside `- `
+        assert_eq!(dl.src_to_disp(5), 4); // inside `[x] `
+        assert_eq!(dl.disp_to_src(5), 2); // on `☑` → marker source start
+        assert_eq!(dl.disp_to_src(10), 8); // in "ship it" content
+        assert_eq!(dl.disp_to_src(dl.text.len()), "- [x] ship it".len());
+    }
+
+    #[test]
+    fn ordered_list_marker_stays_verbatim() {
+        let dl = on("3) third");
+        assert_eq!(dl.kind, DisplayKind::List);
+        assert_eq!(dl.text, "3) third");
+    }
+
+    #[test]
+    fn quote_rule_and_fence_are_transformed() {
+        let q = on("> hello");
+        assert_eq!(q.kind, DisplayKind::Quote);
+        assert_eq!(q.text, "hello");
+        assert!(q.italic);
+
+        let r = on("---");
+        assert_eq!(r.kind, DisplayKind::Rule);
+        assert_eq!(r.text, "");
+
+        let f = on("```rust");
+        assert_eq!(f.kind, DisplayKind::Fence);
+        assert_eq!(f.text, "");
+    }
+
+    #[test]
+    fn fence_state_tracks_across_lines() {
+        let lines: Vec<String> = ["```rust", "let x = # 1;", "```"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let dls = build_display_lines(&lines, true);
+        assert_eq!(dls[0].kind, DisplayKind::Fence);
+        assert_eq!(dls[1].kind, DisplayKind::Code);
+        assert!(dls[1].mono);
+        assert_eq!(dls[1].text, "let x = # 1;");
+        assert_eq!(dls[2].kind, DisplayKind::Fence);
+        // Source offsets stay absolute across the block.
+        assert_eq!(dls[2].src_offset, lines[0].len() + 1 + lines[1].len() + 1);
+        // OFF keeps fence state as a highlighter flag, display literal.
+        let dls_off = build_display_lines(&lines, false);
+        assert!(dls_off[1].fenced);
+        assert_eq!(dls_off[1].text, "let x = # 1;");
+    }
+
+    #[test]
+    fn all_six_heading_levels_get_metrics() {
+        for level in 1..=6u8 {
+            let line = format!("{} text", "#".repeat(level as usize));
+            let dl = on(&line);
+            assert_eq!(dl.kind, DisplayKind::Heading, "level {level}");
+            assert_eq!(dl.text, "text");
+            let (size, before, after) = heading_metrics(level);
+            assert_eq!(dl.font_size, Some(size), "level {level}");
+            assert!(before >= after);
+        }
+        // Seven hashes is not a heading — export keeps it literal, and
+        // so must the canvas.
+        let dl = on("####### not");
+        assert_eq!(dl.kind, DisplayKind::Paragraph);
+        assert_eq!(dl.text, "####### not");
+    }
+
+    #[test]
+    fn mapping_round_trips_across_constructs() {
+        for line in [
+            "# h",
+            "###### deep heading",
+            "> quoted",
+            "- item",
+            "1. ordered",
+            "- [ ] todo",
+            "plain text",
+            "```",
+            "",
+            "  ## indented",
+            "***",
+        ] {
+            let dl = display_line(line, false, true);
+            // Display end maps to source end (trailing markers included);
+            // fully hidden lines (fences, rules) have no display end to map.
+            if !dl.text.is_empty() {
+                assert_eq!(dl.disp_to_src(dl.text.len()), line.len(), "line: {line:?}");
+            }
+            for d in 0..=dl.text.len() {
+                if !dl.text.is_char_boundary(d) {
+                    continue;
+                }
+                let s = dl.disp_to_src(d);
+                assert!(s <= line.len(), "line: {line:?}, d: {d}");
+                // Re-mapping lands at or before the same spot (markers
+                // clamp to their display start).
+                assert!(dl.src_to_disp(s) <= d, "line: {line:?}, d: {d}");
+            }
+            for s in 0..=line.len() {
+                let d = dl.src_to_disp(s);
+                assert!(d <= dl.text.len(), "line: {line:?}, s: {s}");
+                assert!(dl.disp_to_src(d) <= s, "line: {line:?}, s: {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn heading_runs_are_bold_and_cover_text() {
+        let dl = on("# Title");
+        let runs = display_runs(
+            dl.kind,
+            &dl.text,
+            gpui::font("monospace"),
+            hsla(0., 0., 0.2, 1.0),
+        );
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        assert_eq!(total, dl.text.len());
+        let bold = gpui::font("monospace").bold();
+        assert!(runs.iter().all(|r| r.font.weight == bold.weight));
+    }
+
+    #[test]
+    fn word_count_never_counts_markdown_tokens() {
+        use crate::ui::count_words;
+        // The screenshot case: 10 whitespace tokens, but `#` is a markdown
+        // token — 9 words.
+        assert_eq!(
+            count_words("# working as a header 1\nworks like a charm"),
+            9
+        );
+        assert_eq!(count_words("## Three hashes ##"), 2);
+        assert_eq!(count_words("**bold** and ~~strike~~"), 3);
+        assert_eq!(count_words("# ## ###"), 0);
+        assert_eq!(count_words(""), 0);
+    }
+
+    #[test]
+    fn status_counts_logical_lines_and_char_columns() {
+        use crate::ui::cursor_status;
+        let content = "# working as a header 1\nworks like a charm";
+        // Cursor at the end of line 2 → Ln 2, Col 19 (characters, not
+        // bytes), 9 words.
+        assert_eq!(cursor_status(content, content.len()), (2, 19, 9));
+        // Blank lines are logical lines; soft wraps never add lines.
+        let blank = "one\n\n\ntwo";
+        assert_eq!(cursor_status(blank, blank.len()), (4, 4, 2));
+        // Multi-byte characters count as one column.
+        let emoji = "ab\u{1F642}cd";
+        assert_eq!(cursor_status(emoji, emoji.len()).0, 1);
+        assert_eq!(cursor_status(emoji, emoji.len()).1, 6);
     }
 }

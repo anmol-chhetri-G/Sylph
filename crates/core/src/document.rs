@@ -8,6 +8,9 @@ pub enum SpanStyle {
     Code,
     Strikethrough,
     Underline,
+    /// Inline link. Serializes as `{"Link": "url"}` (newtype variant) so it
+    /// carries its target; unit variants stay bare strings (`"Bold"`).
+    Link(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +62,16 @@ impl Default for ParagraphStyle {
             space_after: 8.0,
         }
     }
+}
+
+/// One list item. Nesting uses `level` (0-based); `ordered` distinguishes
+/// numbered from bulleted; `checked` is `Some` only for task-list items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListItem {
+    pub level: u8,
+    pub ordered: bool,
+    pub checked: Option<bool>,
+    pub runs: Vec<TextRun>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -271,6 +284,21 @@ pub enum Block {
     CoverPage {
         data: CoverPageData,
     },
+    /// Bulleted/numbered/task items, consecutive lines grouped into one
+    /// block, nesting carried per item via `ListItem::level`.
+    List {
+        items: Vec<ListItem>,
+    },
+    /// A blockquote paragraph; `level` counts `>` depth (1 = `>`).
+    Quote {
+        level: u8,
+        runs: Vec<TextRun>,
+    },
+    /// Fenced code block; content is verbatim, never inline-parsed.
+    CodeBlock {
+        language: String,
+        text: String,
+    },
     HorizontalRule,
     PageBreak,
 }
@@ -326,6 +354,24 @@ impl Block {
         Self::PageBreak
     }
 
+    pub fn list(items: Vec<ListItem>) -> Self {
+        Self::List { items }
+    }
+
+    pub fn quote(level: u8, runs: Vec<TextRun>) -> Self {
+        Self::Quote {
+            level: level.clamp(1, 4),
+            runs,
+        }
+    }
+
+    pub fn code_block(language: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::CodeBlock {
+            language: language.into(),
+            text: text.into(),
+        }
+    }
+
     pub fn plain_text(&self) -> String {
         match self {
             Self::Paragraph { runs, .. } => runs.iter().map(|r| r.text.as_str()).collect(),
@@ -341,6 +387,18 @@ impl Block {
             Self::CoverPage { data } => {
                 format!("{} {} {}", data.title, data.subtitle, data.author)
             }
+            Self::List { items } => items
+                .iter()
+                .map(|item| {
+                    item.runs
+                        .iter()
+                        .map(|r| r.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Quote { runs, .. } => runs.iter().map(|r| r.text.as_str()).collect(),
+            Self::CodeBlock { text, .. } => text.clone(),
             Self::HorizontalRule => String::new(),
             Self::PageBreak => String::new(),
         }
@@ -478,12 +536,20 @@ impl Document {
 
     pub fn page_width(&self) -> f32 {
         let (w, h) = self.page_size.dimensions();
-        if self.landscape { h } else { w }
+        if self.landscape {
+            h
+        } else {
+            w
+        }
     }
 
     pub fn page_height(&self) -> f32 {
         let (w, h) = self.page_size.dimensions();
-        if self.landscape { w } else { h }
+        if self.landscape {
+            w
+        } else {
+            h
+        }
     }
 
     pub fn content_width(&self) -> f32 {
@@ -1073,6 +1139,101 @@ mod tests {
         assert_eq!(CoverTemplate::Minimal, CoverTemplate::Minimal);
         assert_eq!(CoverTemplate::Bold, CoverTemplate::Bold);
         assert_eq!(CoverTemplate::Academic, CoverTemplate::Academic);
+    }
+
+    // ── Markdown blocks (List / Quote / CodeBlock / Link) ───────
+
+    #[test]
+    fn test_list_block_serde_shape() {
+        let items = vec![
+            ListItem {
+                level: 0,
+                ordered: false,
+                checked: Some(false),
+                runs: vec![TextRun::plain("task")],
+            },
+            ListItem {
+                level: 1,
+                ordered: true,
+                checked: None,
+                runs: vec![TextRun::plain("nested")],
+            },
+        ];
+        let block = Block::list(items);
+        let json = serde_json::to_string(&block).unwrap();
+        assert_eq!(
+            json,
+            r#"{"List":{"items":[{"level":0,"ordered":false,"checked":false,"runs":[{"text":"task","styles":[]}]},{"level":1,"ordered":true,"checked":null,"runs":[{"text":"nested","styles":[]}]}]}}"#
+        );
+        let back: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, block);
+    }
+
+    #[test]
+    fn test_quote_and_code_block_serde_shapes() {
+        let q = Block::quote(2, vec![TextRun::plain("deep thought")]);
+        let q_json = serde_json::to_string(&q).unwrap();
+        assert!(q_json.starts_with(r#"{"Quote":{"level":2,"runs":[{"text":"deep thought""#));
+        let level = match &q {
+            Block::Quote { level, .. } => *level,
+            other => panic!("expected quote, got {other:?}"),
+        };
+        assert_eq!(level, 2);
+        assert_eq!(serde_json::from_str::<Block>(&q_json).unwrap(), q);
+        // clamp: level 9 → 4
+        assert!(matches!(
+            Block::quote(9, vec![]),
+            Block::Quote { level: 4, .. }
+        ));
+
+        let c = Block::code_block("rust", "fn main() {}");
+        let c_json = serde_json::to_string(&c).unwrap();
+        assert!(c_json.contains(r#"{"CodeBlock":{"language":"rust","text":"fn main() {}"}}"#));
+        assert_eq!(serde_json::from_str::<Block>(&c_json).unwrap(), c);
+    }
+
+    #[test]
+    fn test_link_span_style_serde_shape() {
+        let run = TextRun::styled("site", vec![SpanStyle::Link("https://example.com".into())]);
+        let json = serde_json::to_string(&run).unwrap();
+        assert_eq!(
+            json,
+            r#"{"text":"site","styles":[{"Link":"https://example.com"}]}"#
+        );
+        let back: TextRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, run);
+        // Unit-variant styles still serialize as bare strings.
+        let mixed = TextRun::styled("x", vec![SpanStyle::Bold, SpanStyle::Link("u".into())]);
+        assert!(serde_json::to_string(&mixed).unwrap().contains(r#""Bold""#));
+    }
+
+    #[test]
+    fn test_plain_text_for_markdown_blocks() {
+        assert_eq!(
+            Block::list(vec![ListItem {
+                level: 0,
+                ordered: true,
+                checked: None,
+                runs: vec![TextRun::plain("one"), TextRun::plain(" two")],
+            }])
+            .plain_text(),
+            "one two"
+        );
+        assert_eq!(
+            Block::quote(1, vec![TextRun::plain("quoted")]).plain_text(),
+            "quoted"
+        );
+        assert_eq!(Block::code_block("py", "x = 1").plain_text(), "x = 1");
+        assert!(Block::horizontal_rule().plain_text().is_empty());
+    }
+
+    #[test]
+    fn test_new_block_constructors() {
+        assert!(matches!(Block::list(vec![]), Block::List { items } if items.is_empty()));
+        assert!(matches!(
+            Block::code_block("rs", "code"),
+            Block::CodeBlock { ref language, ref text } if language == "rs" && text == "code"
+        ));
     }
 
     // ── Compile-time Type Checks ────────────────────────────────

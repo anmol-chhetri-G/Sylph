@@ -45,8 +45,9 @@ fn with_python_module<T>(
         if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
             let pattern = format!("{}/lib/python*/site-packages", venv);
             if let Ok(glob) = py.import("glob") {
-                if let Ok(paths) =
-                    glob.call_method1("glob", (pattern,))?.extract::<Vec<String>>()
+                if let Ok(paths) = glob
+                    .call_method1("glob", (pattern,))?
+                    .extract::<Vec<String>>()
                 {
                     for p in paths {
                         let _ = path.call_method1("append", (p,));
@@ -284,6 +285,63 @@ mod tests {
         ]}"#;
         let result = export_rich_markdown(doc, "/tmp/sylph_test_rich.md");
         assert!(result.starts_with("Exported"), "got: {result}");
+    }
+
+    #[test]
+    fn test_export_rich_kitchen_sink_blocks() {
+        // Every markdown-typed block shape (List/Quote/CodeBlock/Link)
+        // must survive all three renderers — and the markdown output is
+        // read back to prove no content was silently dropped.
+        let doc = r#"{"blocks": [
+            {"Heading": {"level": 1, "runs": [{"text": "Title", "styles": [{"Link": "https://example.com/h"}]}]}},
+            {"Paragraph": {"runs": [
+                {"text": "see ", "styles": []},
+                {"text": "nested", "styles": ["Bold", {"Link": "https://example.com/b"}]},
+                {"text": " now", "styles": [{"Link": "https://example.com/b"}]}
+            ], "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}},
+            {"List": {"items": [
+                {"level": 0, "ordered": false, "checked": null, "runs": [{"text": "bullet", "styles": []}]},
+                {"level": 1, "ordered": false, "checked": true, "runs": [{"text": "task", "styles": []}]},
+                {"level": 0, "ordered": true, "checked": null, "runs": [{"text": "first", "styles": []}]},
+                {"level": 0, "ordered": true, "checked": null, "runs": [{"text": "second", "styles": []}]}
+            ]}},
+            {"Quote": {"level": 2, "runs": [{"text": "quoted", "styles": ["Italic"]}]}},
+            {"CodeBlock": {"language": "rust", "text": "let x = **literal**;"}},
+            {"Table": {"data": {"rows": [
+                [{"runs": [{"text": "Hdr", "styles": []}]},
+                 {"runs": [{"text": "Two", "styles": []}]}],
+                [{"runs": [{"text": "bold", "styles": ["Bold"]}]},
+                 {"runs": [{"text": "site", "styles": [{"Link": "https://example.com/c"}]}]}]
+            ], "caption": null, "column_widths": [50.0, 50.0]}}},
+            "HorizontalRule"
+        ]}"#;
+
+        let r = export_rich_docx(doc, "/tmp/sylph_test_kitchen.docx");
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let r = export_rich_pdf(doc, "/tmp/sylph_test_kitchen.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        let r = export_rich_markdown(doc, "/tmp/sylph_test_kitchen.md");
+        assert!(r.starts_with("Exported"), "md: {r}");
+
+        let md = std::fs::read_to_string("/tmp/sylph_test_kitchen.md").unwrap();
+        for probe in [
+            "[Title](https://example.com/h)",
+            "[**nested** now](https://example.com/b)", // grouped runs, one link
+            "- bullet",
+            "- [x] task",
+            "1. first",
+            "2. second",
+            ">> *quoted*",
+            "```rust",
+            "let x = **literal**;",
+            // Table cell styles must survive re-export — flattening cells
+            // to plain text would silently drop bold/links in tables.
+            "| Hdr | Two |",
+            "| **bold** | [site](https://example.com/c) |",
+            "---",
+        ] {
+            assert!(md.contains(probe), "missing {probe:?} in:\n{md}");
+        }
     }
     #[test]
     fn test_bridge_call_error_handling() {
