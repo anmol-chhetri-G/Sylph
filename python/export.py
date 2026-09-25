@@ -534,7 +534,8 @@ def rich_docx(doc_json: str, output_path: str) -> bool:
 
 def _render_block_docx(doc, block: dict):
     """Render a single block to a DOCX document."""
-    from docx.shared import Pt, Inches
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
@@ -547,8 +548,8 @@ def _render_block_docx(doc, block: dict):
         for run_data in h.get('runs', []):
             run = heading.add_run(run_data['text'])
             styles = run_data.get('styles', [])
-            run.bold = 'Bold' in styles
-            run.italic = 'Italic' in styles
+            run.bold = 'Bold' in styles or 'BoldItalic' in styles
+            run.italic = 'Italic' in styles or 'BoldItalic' in styles
     elif 'Paragraph' in block:
         p = block['Paragraph']
         para = doc.add_paragraph()
@@ -574,24 +575,30 @@ def _render_block_docx(doc, block: dict):
     elif 'Image' in block:
         img_data = block['Image']['data']
         path = img_data.get('path', '')
+
+        def _image_caption():
+            caption = img_data.get('caption')
+            if caption:
+                cap_para = doc.add_paragraph()
+                cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cap_run = cap_para.add_run(caption)
+                cap_run.font.size = Pt(9)
+                cap_run.font.italic = True
+                cap_run.font.color.rgb = RGBColor(100, 100, 100)
+
         if path and os.path.exists(path):
             try:
                 para = doc.add_paragraph()
                 para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = para.add_run()
                 run.add_picture(path, width=Inches(min(img_data.get('width', 400) / 96, 6.0)))
-                caption = img_data.get('caption')
-                if caption:
-                    cap_para = doc.add_paragraph()
-                    cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    cap_run = cap_para.add_run(caption)
-                    cap_run.font.size = Pt(9)
-                    cap_run.font.italic = True
-                    cap_run.font.color.rgb = RGBColor(100, 100, 100)
+                _image_caption()
             except Exception:
                 doc.add_paragraph(f'[Image: {path}]')
+                _image_caption()
         else:
             doc.add_paragraph(f'[Image: {path}]')
+            _image_caption()
     elif 'Table' in block:
         table_data = block['Table']['data']
         rows = table_data.get('rows', [])
@@ -794,11 +801,25 @@ def _render_block_pdf(pdf, block: dict):
                 pdf.set_font('Helvetica', '', 10)
                 pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
                 pdf.ln(3)
+                caption = img_data.get('caption')
+                if caption:
+                    pdf.set_x(pdf.l_margin)
+                    pdf.set_font('Helvetica', 'I', 9)
+                    pdf.set_text_color(100, 100, 100)
+                    pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
+                    pdf.ln(3)
         else:
             pdf.set_x(pdf.l_margin)
             pdf.set_font('Helvetica', '', 10)
             pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
             pdf.ln(3)
+            caption = img_data.get('caption')
+            if caption:
+                pdf.set_x(pdf.l_margin)
+                pdf.set_font('Helvetica', 'I', 9)
+                pdf.set_text_color(100, 100, 100)
+                pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
+                pdf.ln(3)
     elif 'Table' in block:
         _render_table_pdf(pdf, block['Table']['data'])
     elif 'Caption' in block:
@@ -843,7 +864,7 @@ def _render_cover_page_pdf(pdf, data: dict):
             pdf.set_font('Helvetica', 'B', 30)
         pdf.set_text_color(0, 0, 0)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(pdf.epw, 15, data['title'], align='C')
+        pdf.cell(pdf.epw, 15, _pdf_safe(data['title']), align='C')
         pdf.ln(15)
 
     # Subtitle
@@ -851,7 +872,7 @@ def _render_cover_page_pdf(pdf, data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font('Helvetica', '', 16)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(pdf.epw, 10, data['subtitle'], align='C')
+        pdf.cell(pdf.epw, 10, _pdf_safe(data['subtitle']), align='C')
         pdf.ln(15)
 
     pdf.ln(20)
@@ -861,7 +882,7 @@ def _render_cover_page_pdf(pdf, data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font('Helvetica', '', 14)
         pdf.set_text_color(0, 0, 0)
-        pdf.cell(pdf.epw, 10, data['author'], align='C')
+        pdf.cell(pdf.epw, 10, _pdf_safe(data['author']), align='C')
         pdf.ln(10)
 
     # Date
@@ -869,7 +890,7 @@ def _render_cover_page_pdf(pdf, data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font('Helvetica', '', 12)
         pdf.set_text_color(128, 128, 128)
-        pdf.cell(pdf.epw, 10, data['date'], align='C')
+        pdf.cell(pdf.epw, 10, _pdf_safe(data['date']), align='C')
         pdf.ln(10)
 
     pdf.add_page()
@@ -884,6 +905,8 @@ def _render_table_pdf(pdf, table_data: dict):
     num_cols = max(len(r) for r in rows)
     col_width = (pdf.w - pdf.l_margin - pdf.r_margin) / num_cols
 
+    # Captions leave text color gray; tables must not inherit that.
+    pdf.set_text_color(0, 0, 0)
     pdf.set_font('Helvetica', '', 10)
     for i, row in enumerate(rows):
         pdf.set_x(pdf.l_margin)
