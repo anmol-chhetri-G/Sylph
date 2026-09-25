@@ -257,14 +257,6 @@ impl SylphApp {
         }
     }
 
-    fn ui_faint(&self) -> Rgba {
-        if self.dark_mode {
-            rgb(0x64748b)
-        } else {
-            rgb(0x747686)
-        }
-    }
-
     fn ui_workspace(&self) -> Rgba {
         if self.dark_mode {
             rgb(0x0b1220)
@@ -2139,7 +2131,7 @@ impl SylphApp {
                     .child(self.render_blank_page(page_number));
             }
         }
-        let canvas = div()
+        div()
             .id("document-canvas")
             .flex_1()
             .h_full()
@@ -2154,8 +2146,7 @@ impl SylphApp {
             } else {
                 div().h(px(0.0))
             })
-            .child(pages);
-        canvas
+            .child(pages)
     }
 
     /*
@@ -2266,35 +2257,30 @@ impl SylphApp {
             .gap(px(2.0))
             .p(px(2.0))
             .bg(panel)
-            .children(
-                ["1.0", "1.15", "1.5", "2.0"]
-                    .iter()
-                    .enumerate()
-                    .map(|(_i, v)| {
-                        let val: f32 = v.parse().unwrap_or(1.0);
-                        let is_active = (current_ls - val).abs() < 0.01;
-                        div()
-                            .flex_1()
-                            .py(px(10.0))
-                            .text_center()
-                            .font_family(MONO_FONT)
-                            .text_size(px(11.0))
-                            .text_color(if is_active { primary } else { muted })
-                            .cursor_pointer()
-                            .hover(|s| s.bg(self.surface_color()))
-                            .when(is_active, |s| {
-                                s.bg(self.surface_color())
-                                    .font_weight(gpui::FontWeight(700.0))
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.set_line_spacing_value(val, window, cx);
-                                }),
-                            )
-                            .child(*v)
-                    }),
-            );
+            .children(["1.0", "1.15", "1.5", "2.0"].iter().map(|v| {
+                let val: f32 = v.parse().unwrap_or(1.0);
+                let is_active = (current_ls - val).abs() < 0.01;
+                div()
+                    .flex_1()
+                    .py(px(10.0))
+                    .text_center()
+                    .font_family(MONO_FONT)
+                    .text_size(px(11.0))
+                    .text_color(if is_active { primary } else { muted })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(self.surface_color()))
+                    .when(is_active, |s| {
+                        s.bg(self.surface_color())
+                            .font_weight(gpui::FontWeight(700.0))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.set_line_spacing_value(val, window, cx);
+                        }),
+                    )
+                    .child(*v)
+            }));
         let align = div()
             .flex()
             .items_center()
