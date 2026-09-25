@@ -1426,12 +1426,16 @@ impl Element for TextElement {
                     &runs,
                     None,
                 );
-                let rule_color = if dl.kind == DisplayKind::Rule {
-                    let mut color = text_color;
-                    color.a = 0.35;
-                    Some(color)
-                } else {
-                    None
+                let rule_color = match dl.kind {
+                    DisplayKind::Rule => {
+                        let mut color = text_color;
+                        color.a = 0.35;
+                        Some(color)
+                    }
+                    // Page breaks reuse the rule painter, but stay visibly
+                    // distinct from ordinary `---` rules.
+                    DisplayKind::PageBreak => Some(hsla(210.0 / 360.0, 0.8, 0.4, 0.6)),
+                    _ => None,
                 };
                 rows.push(PrepRow {
                     shaped,
@@ -4575,6 +4579,7 @@ enum DisplayKind {
     List,
     Quote,
     Rule,
+    PageBreak,
     Code,
     Fence,
 }
@@ -4759,8 +4764,8 @@ fn heading_metrics(level: u8) -> (f32, f32, f32) {
 }
 
 /// Transform one logical source line for the canvas, with the export
-/// parser's block order: fence → quote → heading → rule → list →
-/// paragraph. With `markdown_on == false` this is the identity
+/// parser's block order: fence → page break → quote → heading → rule →
+/// list → paragraph. With `markdown_on == false` this is the identity
 /// transform (display == source) so nothing is parsed or hidden.
 fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
     if !markdown_on {
@@ -4784,6 +4789,11 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
         b.ident(line, line.len());
         kind = DisplayKind::Code;
         mono = true;
+    } else if line.trim() == "\\newpage" {
+        // Typed page-break directive: hidden source, drawn as a page-break
+        // line by the painter (matching `Block::PageBreak` in export).
+        b.hide(line.len());
+        kind = DisplayKind::PageBreak;
     } else if trimmed.starts_with('>') {
         // Quote: strip `>` markers with the export's own loop.
         b.ident(line, indent);
@@ -4909,7 +4919,7 @@ fn display_runs(
             TextInput::inline_runs(slice, font.italic(), color)
         }
         DisplayKind::Code => flat(font, hsla(120.0 / 360.0, 0.5, 0.35, 1.0), None),
-        DisplayKind::Rule | DisplayKind::Fence => Vec::new(),
+        DisplayKind::Rule | DisplayKind::Fence | DisplayKind::PageBreak => Vec::new(),
         DisplayKind::List | DisplayKind::Paragraph => TextInput::inline_runs(slice, font, base),
     }
 }
@@ -6389,6 +6399,21 @@ mod markdown_wysiwyg_tests {
         let f = on("```rust");
         assert_eq!(f.kind, DisplayKind::Fence);
         assert_eq!(f.text, "");
+    }
+
+    #[test]
+    fn page_break_directive_matches_export_parser() {
+        let page_break = on("\\newpage");
+        assert_eq!(page_break.kind, DisplayKind::PageBreak);
+        assert!(page_break.text.is_empty());
+
+        let literal = off("\\newpage");
+        assert_eq!(literal.kind, DisplayKind::Paragraph);
+        assert_eq!(literal.text, "\\newpage");
+
+        let fenced = display_line("\\newpage", true, true);
+        assert_eq!(fenced.kind, DisplayKind::Code);
+        assert_eq!(fenced.text, "\\newpage");
     }
 
     #[test]
