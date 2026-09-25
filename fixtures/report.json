@@ -1,0 +1,75 @@
+{
+  "title": "Sylph Export Proof",
+  "page_size": "A4",
+  "page_margins": { "top": 72.0, "bottom": 72.0, "left": 72.0, "right": 72.0 },
+  "line_spacing": 1.15,
+  "body_font": "Noto Serif",
+  "body_font_size": 11.0,
+  "landscape": false,
+  "blocks": [
+    { "CoverPage": { "data": {
+      "title": "Sylph Export Proof",
+      "subtitle": "Headless CLI — solid proof",
+      "author": "Anmol",
+      "date": "2026-09-25",
+      "background_image": null,
+      "logo": null,
+      "template": "Classic"
+    } } },
+    { "Heading": { "level": 1, "runs": [
+      { "text": "Headers work — “quotes”", "styles": [] }
+    ] } },
+    { "Paragraph": { "runs": [
+      { "text": "Plain lead. ", "styles": [] },
+      { "text": "Bold", "styles": ["Bold"] },
+      { "text": " + ", "styles": [] },
+      { "text": "Italic", "styles": ["Italic"] },
+      { "text": " + ", "styles": [] },
+      { "text": "Both", "styles": ["BoldItalic"] },
+      { "text": " + ", "styles": [] },
+      { "text": "code", "styles": ["Code"] },
+      { "text": " + ", "styles": [] },
+      { "text": "struck", "styles": ["Strikethrough"] },
+      { "text": " + ", "styles": [] },
+      { "text": "under", "styles": ["Underline"] },
+      { "text": " — em dash, “smart quotes”.", "styles": [] }
+    ], "style": { "line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0 } } },
+    { "Heading": { "level": 2, "runs": [
+      { "text": "Table + caption", "styles": [] }
+    ] } },
+    { "Table": { "data": {
+      "rows": [
+        [ { "runs": [{ "text": "Name", "styles": ["Bold"] }] }, { "runs": [{ "text": "Value", "styles": ["Bold"] }] } ],
+        [ { "runs": [{ "text": "Alpha", "styles": [] }] }, { "runs": [{ "text": "1 — one", "styles": [] }] } ],
+        [ { "runs": [{ "text": "Beta", "styles": ["Italic"] }] }, { "runs": [{ "text": "2", "styles": [] }] } ]
+      ],
+      "caption": "Table 1 — proof table",
+      "column_widths": [50.0, 50.0]
+    } } },
+    { "Image": { "data": {
+      "path": "fixtures/missing-proof.png",
+      "alt_text": "proof image",
+      "width": 400.0,
+      "height": 300.0,
+      "caption": "Figure 1 — placeholder (missing file stays honest)"
+    } } },
+    { "Image": { "data": {
+      "path": "fixtures/proof.png",
+      "alt_text": "real pasted image",
+      "width": 400.0,
+      "height": 300.0,
+      "caption": "Figure 2 — real file (exercises embed path)"
+    } } },
+    "HorizontalRule",
+    { "Paragraph": { "runs": [
+      { "text": "Page one ends here.", "styles": [] }
+    ], "style": { "line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0 } } },
+    "PageBreak",
+    { "Heading": { "level": 1, "runs": [
+      { "text": "Page two", "styles": [] }
+    ] } },
+    { "Paragraph": { "runs": [
+      { "text": "Second page body — if this paginates, breaks work.", "styles": [] }
+    ], "style": { "line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0 } } }
+  ]
+}

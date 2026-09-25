@@ -2234,18 +2234,38 @@ impl SylphApp {
 
     fn export_document(&mut self, to_pdf: bool, cx: &mut Context<Self>) {
         let ext = if to_pdf { "pdf" } else { "docx" };
-        let path = format!("output/{}.{}", self.doc_title.replace(' ', "_"), ext);
+        // Keep the file inside output/: doc_title is user-editable, so strip
+        // path separators and other unsafe filename characters.
+        let safe_title: String = self
+            .doc_title
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = format!("output/{}.{}", safe_title.replace(' ', "_"), ext);
         let _ = std::fs::create_dir_all("output");
-        let result = if to_pdf {
-            // Rich export: cover, headings, images, tables, margins.
-            // Falls back to markdown text if serialization fails.
-            match serde_json::to_string(&self.document) {
-                Ok(json) => sylph_py_bridge::export_rich_pdf(&json, &path),
-                Err(e) => format!("Export failed to serialize document: {}", e),
+        let content = self.editor.read(cx).content.clone();
+        // Neither buffer alone is the document yet: typed text lives in the
+        // editor, cover/tables/images/page breaks live in self.document.
+        // Merge both so export never silently drops content.
+        let model = export_model(&self.document, &content);
+        let result = match serde_json::to_string(&model) {
+            Ok(json) if to_pdf => sylph_py_bridge::export_rich_pdf(&json, &path),
+            Ok(json) => sylph_py_bridge::export_rich_docx(&json, &path),
+            Err(e) => {
+                if to_pdf {
+                    // Never write DOCX bytes into a .pdf path.
+                    format!("Export failed to serialize document: {e}")
+                } else {
+                    let fallback = sylph_py_bridge::export_to_docx(&content, &path);
+                    format!("Export failed to serialize document: {e}. Fallback: {fallback}")
+                }
             }
-        } else {
-            let text = self.editor.read(cx).content.clone();
-            sylph_py_bridge::export_to_docx(&text, &path)
         };
         self.status_message = Some(result);
         cx.notify();
@@ -4105,7 +4125,225 @@ impl SylphApp {
     }
 }
 
+// ── Headless export support ─────────────────────────────────────────────
+// The GUI keeps typed text in the editor buffer while cover/tables/images/
+// page breaks live in `self.document`. These helpers merge both into the
+// single rich model that export serializes, and parse editor content
+// (markdown-shaped text) into structured blocks.
+
+use sylph_core::document as doc;
+
+/// Parse one line's leading `#` markers. Byte index equals char count here
+/// because `#` is ASCII; a non-`#` start yields count 0 → None.
+fn heading_level_and_text(line: &str) -> Option<(u8, &str)> {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) {
+        if let Some(stripped) = line[hashes..].strip_prefix(' ') {
+            let text = stripped.trim();
+            if !text.is_empty() {
+                return Some((hashes as u8, text));
+            }
+        }
+    }
+    None
+}
+
+/// Split inline markdown markers into styled runs. Markers are ASCII, so
+/// byte scanning never splits a UTF-8 char; `_..._` is deliberately not a
+/// marker (snake_case words must stay plain).
+fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
+    let markers: [(&str, Vec<doc::SpanStyle>); 5] = [
+        ("***", vec![doc::SpanStyle::BoldItalic]),
+        ("**", vec![doc::SpanStyle::Bold]),
+        ("~~", vec![doc::SpanStyle::Strikethrough]),
+        ("`", vec![doc::SpanStyle::Code]),
+        ("*", vec![doc::SpanStyle::Italic]),
+    ];
+    let mut runs: Vec<doc::TextRun> = Vec::new();
+    let mut plain = String::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let n = text.len();
+    while i < n {
+        let c = bytes[i];
+        if c == b'*' || c == b'`' || c == b'~' {
+            let rest = &text[i..];
+            let found = markers.iter().find_map(|(m, s)| {
+                // `m: &&str`; deref so `starts_with` gets a plain `&str`.
+                rest.starts_with(*m).then(|| (*m, s.clone()))
+            });
+            if let Some((marker, styles)) = found {
+                let start = i + marker.len();
+                if let Some(rel) = text[start..].find(marker) {
+                    let inner = &text[start..start + rel];
+                    if !inner.is_empty() {
+                        if !plain.is_empty() {
+                            runs.push(doc::TextRun::plain(std::mem::take(&mut plain)));
+                        }
+                        runs.push(doc::TextRun::styled(inner, styles));
+                        i = start + rel + marker.len();
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+        plain.push_str(&text[i..i + ch_len]);
+        i += ch_len;
+    }
+    if !plain.is_empty() {
+        runs.push(doc::TextRun::plain(plain));
+    }
+    runs
+}
+
+/// Parse editor content into blocks: blank lines separate paragraphs,
+/// `# `-lines become headings, consecutive other lines join with a space
+/// (soft wrap), inline markers become styled runs.
+fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
+    let mut blocks: Vec<doc::Block> = Vec::new();
+    let mut para: Vec<&str> = Vec::new();
+    let flush = |para: &mut Vec<&str>, blocks: &mut Vec<doc::Block>| {
+        if para.is_empty() {
+            return;
+        }
+        let joined = para.join(" ");
+        para.clear();
+        let runs = parse_inline_runs(&joined);
+        if !runs.is_empty() {
+            blocks.push(doc::Block::Paragraph {
+                runs,
+                style: doc::ParagraphStyle {
+                    line_spacing,
+                    space_before: 0.0,
+                    space_after: 8.0,
+                },
+            });
+        }
+    };
+    for line in text.split('\n') {
+        let line = line.trim_end();
+        if let Some((level, content)) = heading_level_and_text(line) {
+            flush(&mut para, &mut blocks);
+            blocks.push(doc::Block::Heading {
+                level,
+                runs: parse_inline_runs(content),
+            });
+        } else if line.trim().is_empty() {
+            flush(&mut para, &mut blocks);
+        } else {
+            para.push(line.trim());
+        }
+    }
+    flush(&mut para, &mut blocks);
+    blocks
+}
+
+/// Merge the structured model with typed editor content for export.
+/// Order mirrors the canvas: cover first, then typed text, then inserted
+/// objects (tables/images/captions/page breaks) in insertion order.
+/// The empty placeholder paragraph from `Document::new()` is dropped.
+/// True interleaving of cursor position with blocks needs the editor-kernel
+/// phase (SYLPH_PLAN.md §10); this approximation keeps export truthful.
+fn export_model(structured: &doc::Document, content: &str) -> doc::Document {
+    let mut out = structured.clone();
+    let mut blocks: Vec<doc::Block> = Vec::new();
+    for b in &structured.blocks {
+        if matches!(b, doc::Block::CoverPage { .. }) {
+            blocks.push(b.clone());
+        }
+    }
+    blocks.extend(parse_content_blocks(content, structured.line_spacing));
+    for b in &structured.blocks {
+        match b {
+            doc::Block::CoverPage { .. } => {}
+            doc::Block::Paragraph { runs, .. } if runs.iter().all(|r| r.text.trim().is_empty()) => {
+            }
+            other => blocks.push(other.clone()),
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(doc::Block::paragraph(""));
+    }
+    out.blocks = blocks;
+    out
+}
+
+fn print_export_usage(program: &str) {
+    eprintln!("Usage:");
+    eprintln!("  {program} --export-pdf <input.json> <out.pdf>");
+    eprintln!("  {program} --export-docx <input.json> <out.docx>");
+    eprintln!("  {program} --export-md <input.json> <out.md>");
+    eprintln!();
+    eprintln!("input.json is a serde-serialized sylph-core Document (rich model).");
+    eprintln!("No window is opened in headless mode. Exit 0 on success, 1 on failure.");
+}
+
+fn try_headless_export(args: &[String]) -> Option<i32> {
+    if args.len() < 2 {
+        return None;
+    }
+    let program = args[0].clone();
+    let mode = args[1].as_str();
+    let is_export = matches!(
+        mode,
+        "--export-pdf"
+            | "--export-docx"
+            | "--export-md"
+            | "--export-markdown"
+            | "--help"
+            | "-h"
+            | "help"
+    );
+    if !is_export {
+        return None;
+    }
+    if matches!(mode, "--help" | "-h" | "help") {
+        print_export_usage(&program);
+        return Some(0);
+    }
+    if args.len() != 4 {
+        eprintln!("error: expected <input.json> and <output> arguments");
+        print_export_usage(&program);
+        return Some(2);
+    }
+    let input_path = &args[2];
+    let output_path = &args[3];
+    let json = match std::fs::read_to_string(input_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {input_path}: {e}");
+            return Some(1);
+        }
+    };
+    // Validate that the input is a real Document before touching Python,
+    // so JSON shape errors are reported honestly instead of as export output.
+    if let Err(e) = serde_json::from_str::<sylph_core::document::Document>(&json) {
+        eprintln!("error: {input_path} is not a valid Document JSON: {e}");
+        return Some(1);
+    }
+    let result = match mode {
+        "--export-pdf" => sylph_py_bridge::export_rich_pdf(&json, output_path),
+        "--export-docx" => sylph_py_bridge::export_rich_docx(&json, output_path),
+        "--export-md" | "--export-markdown" => {
+            sylph_py_bridge::export_rich_markdown(&json, output_path)
+        }
+        _ => unreachable!(),
+    };
+    if result.starts_with("Exported") {
+        println!("{result}");
+        Some(0)
+    } else {
+        eprintln!("{result}");
+        Some(1)
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = try_headless_export(&args) {
+        std::process::exit(code);
+    }
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             // ── Core Editing (always active) ──
@@ -4267,4 +4505,142 @@ fn main() {
             })
             .expect("Failed to initialize window");
     });
+}
+
+#[cfg(test)]
+mod export_model_tests {
+    use super::*;
+
+    #[test]
+    fn heading_parse_requires_space_after_hashes() {
+        assert_eq!(heading_level_and_text("# One"), Some((1, "One")));
+        assert_eq!(heading_level_and_text("###### Six"), Some((6, "Six")));
+        assert_eq!(heading_level_and_text("#nospace"), None);
+        assert_eq!(heading_level_and_text("####### Seven"), None);
+        assert_eq!(heading_level_and_text("no heading"), None);
+        assert_eq!(heading_level_and_text("#"), None);
+    }
+
+    #[test]
+    fn inline_markers_become_styled_runs() {
+        use sylph_core::document::SpanStyle;
+        let runs = parse_inline_runs("a **b** *c* `d` ~~e~~ ***f***");
+        assert_eq!(runs[0].text, "a ");
+        assert!(runs[0].styles.is_empty());
+        // Plain separator runs interleave; assert the styled ones in order.
+        let styled: Vec<(String, Vec<SpanStyle>)> = runs
+            .iter()
+            .filter(|r| !r.styles.is_empty())
+            .map(|r| (r.text.clone(), r.styles.clone()))
+            .collect();
+        assert_eq!(styled.len(), 5);
+        assert_eq!(styled[0], ("b".to_string(), vec![SpanStyle::Bold]));
+        assert_eq!(styled[1], ("c".to_string(), vec![SpanStyle::Italic]));
+        assert_eq!(styled[2], ("d".to_string(), vec![SpanStyle::Code]));
+        assert_eq!(styled[3], ("e".to_string(), vec![SpanStyle::Strikethrough]));
+        assert_eq!(styled[4], ("f".to_string(), vec![SpanStyle::BoldItalic]));
+        // No marker text survives in the output.
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "a b c d e f");
+    }
+
+    #[test]
+    fn snake_case_stays_plain_and_unclosed_markers_are_literal() {
+        let runs = parse_inline_runs("snake_case_var and a *unclosed");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "snake_case_var and a *unclosed");
+        assert!(runs[0].styles.is_empty());
+    }
+
+    #[test]
+    fn content_parses_headings_paragraphs_and_blank_separators() {
+        let blocks = parse_content_blocks("# Title\n\nline one\nline two\n\n## Sub", 1.15);
+        assert_eq!(blocks.len(), 3);
+        match &blocks[0] {
+            sylph_core::document::Block::Heading { level, runs } => {
+                assert_eq!(*level, 1);
+                assert_eq!(runs[0].text, "Title");
+            }
+            b => panic!("expected heading, got {b:?}"),
+        }
+        match &blocks[1] {
+            sylph_core::document::Block::Paragraph { runs, style } => {
+                assert_eq!(runs[0].text, "line one line two");
+                assert_eq!(style.line_spacing, 1.15);
+            }
+            b => panic!("expected paragraph, got {b:?}"),
+        }
+        match &blocks[2] {
+            sylph_core::document::Block::Heading { level, .. } => assert_eq!(*level, 2),
+            b => panic!("expected heading, got {b:?}"),
+        }
+    }
+
+    #[test]
+    fn export_model_orders_cover_text_then_structure() {
+        use sylph_core::document::{Block, CoverPageData, Document};
+        let mut structured = Document::new(); // starts with empty placeholder
+        structured.push_block(Block::page_break());
+        structured.push_block(Block::table(2, 2));
+        structured.set_cover_page(CoverPageData::new().with_title("Cover"));
+        let model = export_model(&structured, "# Head\n\nbody");
+        assert!(matches!(model.blocks[0], Block::CoverPage { .. }));
+        assert!(matches!(model.blocks[1], Block::Heading { .. }));
+        assert!(matches!(model.blocks[2], Block::Paragraph { .. }));
+        // placeholder dropped; page break and table preserved in order
+        assert!(matches!(model.blocks[3], Block::PageBreak));
+        assert!(matches!(model.blocks[4], Block::Table { .. }));
+        assert_eq!(model.blocks.len(), 5);
+        // page setup survives the clone
+        assert_eq!(model.title, structured.title);
+        assert_eq!(model.line_spacing, structured.line_spacing);
+    }
+
+    #[test]
+    fn export_model_empty_content_still_yields_block() {
+        use sylph_core::document::{Block, Document};
+        let mut structured = Document::new();
+        structured.push_block(Block::page_break());
+        let model = export_model(&structured, "");
+        assert!(!model.blocks.is_empty());
+        assert!(matches!(model.blocks[0], Block::PageBreak));
+    }
+
+    #[test]
+    fn export_model_serializes_to_python_expected_shapes() {
+        use sylph_core::document::Document;
+        let structured = Document::new();
+        let model = export_model(&structured, "# H\n\n**bold** text");
+        let json = serde_json::to_string(&model).expect("serialize");
+        // Rust-shape checks: unit variants as strings, styles as strings.
+        assert!(json.contains("\"Heading\""));
+        assert!(json.contains("\"PageBreak\"") || json.contains("\"Paragraph\""));
+        assert!(json.contains("\"Bold\""));
+        // Round-trip: the same JSON the headless CLI validates.
+        let back: Document = serde_json::from_str(&json).expect("parse back");
+        assert_eq!(back, model);
+    }
+
+    #[test]
+    #[ignore = "writes a proof artifact for manual headless CLI verification"]
+    fn write_merged_proof_json() {
+        use sylph_core::document::{Block, CoverPageData, Document};
+        let mut structured = Document::new();
+        structured.set_cover_page(
+            CoverPageData::new()
+                .with_title("Merge Proof — cover")
+                .with_subtitle("subtitle")
+                .with_author("Anmol"),
+        );
+        structured.push_block(Block::page_break());
+        structured.push_block(Block::table(2, 2));
+        let model = export_model(
+            &structured,
+            "# Merged Head\n\nBody **bold** and *italic* text.\n\nSecond paragraph.",
+        );
+        let json = serde_json::to_string_pretty(&model).expect("serialize");
+        std::fs::create_dir_all("/tmp/opencode").expect("tmp dir");
+        std::fs::write("/tmp/opencode/merged.json", &json).expect("write proof");
+        assert!(json.contains("Merged Head"));
+    }
 }

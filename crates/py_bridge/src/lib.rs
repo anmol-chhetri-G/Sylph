@@ -5,14 +5,40 @@
 
 use pyo3::prelude::*;
 
+fn python_search_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(dir) = std::env::var("SYLPH_PYTHON_DIR") {
+        out.push(dir);
+    }
+    out.push("./python".to_string());
+    // `cargo test -p sylph-py-bridge` runs with cwd = crates/py_bridge,
+    // so "./python" alone misses. Walk up looking for python/export.py.
+    let mut dir = std::env::current_dir().ok();
+    for _ in 0..6 {
+        let Some(d) = dir else { break };
+        let cand = d.join("python").join("export.py");
+        if cand.is_file() {
+            out.push(d.join("python").to_string_lossy().into_owned());
+            break;
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+    out
+}
+
 fn with_python_module<T>(
     module_name: &str,
     f: impl FnOnce(&Bound<'_, PyModule>) -> PyResult<T>,
 ) -> Result<T, PyErr> {
-    Python::try_attach(|py| {
+    // Blocking attach (not try_attach): concurrent callers — e.g. parallel
+    // `cargo test` threads — wait for the GIL instead of failing with
+    // "Python not initialized".
+    Python::attach(|py| {
         let sys = py.import("sys")?;
         let path = sys.getattr("path")?;
-        path.call_method1("append", ("./python",))?;
+        for cand in python_search_paths() {
+            path.call_method1("append", (cand,))?;
+        }
         // Honor an active venv (PEP-668 systems like Arch forbid system
         // pip installs, so export deps live in .venv). The embedded
         // interpreter does not pick up $VIRTUAL_ENV automatically.
@@ -30,11 +56,6 @@ fn with_python_module<T>(
         }
         let module = py.import(module_name)?;
         f(&module)
-    })
-    .unwrap_or_else(|| {
-        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            "Python not initialized",
-        ))
     })
 }
 
@@ -68,15 +89,10 @@ pub fn summarize_text(text: &str) -> String {
 /// Check if Python bridge is working.
 pub fn ping() -> String {
     bridge_call(|| {
-        Python::try_attach(|py| {
+        Python::attach(|py| {
             let sys = py.import("sys")?;
             let version: String = sys.getattr("version")?.extract()?;
             Ok::<_, PyErr>(format!("Python {}", version))
-        })
-        .unwrap_or_else(|| {
-            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Python not initialized",
-            ))
         })
     })
 }
@@ -217,15 +233,58 @@ mod tests {
     #[test]
     fn test_export_to_docx() {
         let result = export_to_docx("# Test", "/tmp/sylph_test_export.docx");
-        assert!(!result.is_empty());
+        assert!(result.starts_with("Exported"), "got: {result}");
     }
 
     #[test]
     fn test_export_to_pdf() {
         let result = export_to_pdf("# Test", "/tmp/sylph_test_export.pdf");
-        assert!(!result.is_empty());
+        assert!(result.starts_with("Exported"), "got: {result}");
     }
 
+    #[test]
+    fn test_export_rich_pdf() {
+        // Cover title carries an em-dash: locks the _pdf_safe fix for
+        // cover-page cell() calls (latin-1 core fonts).
+        let doc = r#"{"blocks": [
+            {"CoverPage": {"data": {"title": "T — cover", "subtitle": "", "author": "", "date": "", "background_image": null, "logo": null, "template": "Classic"}}},
+            {"Heading": {"level": 1, "runs": [{"text": "Hi — “q”", "styles": []}]}},
+            {"Paragraph": {"runs": [
+                {"text": "a", "styles": []},
+                {"text": "b", "styles": ["BoldItalic"]}
+            ], "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}},
+            "PageBreak",
+            {"Paragraph": {"runs": [{"text": "p2", "styles": []}], "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}
+        ]}"#;
+        let result = export_rich_pdf(doc, "/tmp/sylph_test_rich.pdf");
+        assert!(result.starts_with("Exported"), "got: {result}");
+    }
+
+    #[test]
+    fn test_export_rich_docx() {
+        // Missing-file image + caption locks the placeholder-caption path
+        // (and the WD_ALIGN_PARAGRAPH / RGBColor imports it needs).
+        let doc = r#"{"blocks": [
+            {"Heading": {"level": 2, "runs": [{"text": "H", "styles": ["BoldItalic"]}]}},
+            {"Image": {"data": {"path": "fixtures/definitely-missing.png", "alt_text": "x", "width": 400.0, "height": 300.0, "caption": "Fig — cap"}}},
+            {"Table": {"data": {"rows": [
+                [{"runs": [{"text": "A", "styles": ["Bold"]}]}],
+                [{"runs": [{"text": "1", "styles": []}]}]
+            ], "caption": null, "column_widths": [100.0]}}},
+            "PageBreak"
+        ]}"#;
+        let result = export_rich_docx(doc, "/tmp/sylph_test_rich.docx");
+        assert!(result.starts_with("Exported"), "got: {result}");
+    }
+
+    #[test]
+    fn test_export_rich_markdown() {
+        let doc = r#"{"blocks": [
+            {"Heading": {"level": 1, "runs": [{"text": "T", "styles": []}]}}
+        ]}"#;
+        let result = export_rich_markdown(doc, "/tmp/sylph_test_rich.md");
+        assert!(result.starts_with("Exported"), "got: {result}");
+    }
     #[test]
     fn test_bridge_call_error_handling() {
         let result = bridge_call(|| Err(pyo3::exceptions::PyRuntimeError::new_err("test error")));
@@ -252,7 +311,7 @@ mod tests {
         let _: String = summarize_text("test");
         let _: String = rewrite_text("test", "formal");
         let _: String = chat_with_doc("q", "ctx");
-        let _: String = export_to_docx("md", "path");
-        let _: String = export_to_pdf("md", "path");
+        let _: String = export_to_docx("md", "/tmp/sylph_test_sig.docx");
+        let _: String = export_to_pdf("md", "/tmp/sylph_test_sig.pdf");
     }
 }
