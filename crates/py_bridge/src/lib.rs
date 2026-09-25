@@ -10,6 +10,14 @@ fn python_search_paths() -> Vec<String> {
     if let Ok(dir) = std::env::var("SYLPH_PYTHON_DIR") {
         out.push(dir);
     }
+    // Build-time repo location: works no matter where the binary or test
+    // binary is launched from (cwd-relative paths break otherwise).
+    if let Some(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+    {
+        out.push(root.join("python").to_string_lossy().into_owned());
+    }
     out.push("./python".to_string());
     // `cargo test -p sylph-py-bridge` runs with cwd = crates/py_bridge,
     // so "./python" alone misses. Walk up looking for python/export.py.
@@ -22,6 +30,43 @@ fn python_search_paths() -> Vec<String> {
             break;
         }
         dir = d.parent().map(|p| p.to_path_buf());
+    }
+    out
+}
+
+/// Site-packages of the repo's own `.venv`, located from the crate's
+/// build-time directory. The embedded interpreter does not honor
+/// `$VIRTUAL_ENV` unless the shell exported it, so without this plain
+/// `cargo test` misses python-docx/fpdf and the export proofs fail.
+fn repo_venv_site_packages() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    for _ in 0..6 {
+        if root.join("python").join("export.py").is_file() {
+            let venv = root.join(".venv");
+            // Unix layout: .venv/lib/pythonX.Y/site-packages
+            if let Ok(lib) = venv.join("lib").read_dir() {
+                for entry in lib.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("python") {
+                        let sp = entry.path().join("site-packages");
+                        if sp.is_dir() {
+                            out.push(sp.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+            // Windows layout: .venv/Lib/site-packages
+            let win = venv.join("Lib").join("site-packages");
+            if win.is_dir() {
+                out.push(win.to_string_lossy().into_owned());
+            }
+            break;
+        }
+        if !root.pop() {
+            break;
+        }
     }
     out
 }
@@ -54,6 +99,11 @@ fn with_python_module<T>(
                     }
                 }
             }
+        }
+        // …and fall back to the repo's own .venv, so tests and CLI exports
+        // work without requiring `source .venv/bin/activate` first.
+        for p in repo_venv_site_packages() {
+            let _ = path.call_method1("append", (p,));
         }
         let module = py.import(module_name)?;
         f(&module)
