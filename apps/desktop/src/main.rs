@@ -2802,15 +2802,13 @@ impl SylphApp {
             6 => 0,
             l => l + 1,
         };
-        // Picking a style from the dropdown is an explicit request for a
-        // heading; Markdown mode is the single source of truth for what
-        // the canvas shows, so turn it on to show the result.
+        // Style controls never change the Markdown toggle: when it is OFF,
+        // the user asked for literal source, so say so instead of changing
+        // modes behind their back.
         if !self.markdown_mode {
-            self.markdown_mode = true;
-            self.editor.update(cx, |editor, cx| {
-                editor.markdown_mode = true;
-                cx.notify();
-            });
+            self.status_message = Some("Turn on Markdown to use heading styles".into());
+            cx.notify();
+            return;
         }
 
         // Modify the current line in the editor

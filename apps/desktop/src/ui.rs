@@ -928,6 +928,7 @@ impl SylphApp {
             6 => "Heading 6",
             _ => "Normal",
         };
+        let heading_enabled = self.markdown_mode;
         let font_size_display = self.document.body_font_size.round() as i32;
         let controls = div()
             .flex()
@@ -953,12 +954,22 @@ impl SylphApp {
                             this.cycle_heading(&CycleHeading, window, cx);
                         }),
                     )
-                    .child(label(heading_label, text, 12.0))
+                    .child(label(
+                        heading_label,
+                        if heading_enabled { text } else { muted },
+                        12.0,
+                    ))
                     .child(icon("⌄", muted, 12.0))
                     .id("heading-style")
-                    .tooltip(|_, cx| {
-                        cx.new(|_| ToolbarTip("Block style — click to cycle Normal → H1 … H6"))
-                            .into()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| {
+                            ToolbarTip(if heading_enabled {
+                                "Block style — click to cycle Normal → H1 … H6"
+                            } else {
+                                "Styles need Markdown mode (toggle in the toolbar)"
+                            })
+                        })
+                        .into()
                     }),
             )
             .child(
