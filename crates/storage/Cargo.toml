@@ -5,4 +5,5 @@ edition = "2021"
 description = "Local-first SQLite storage for Sylph"
 
 [dependencies]
+dirs = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }

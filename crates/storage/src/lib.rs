@@ -1,33 +1,55 @@
 use rusqlite::{params, Connection};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-const DB_PATH: &str = "output/sylph.db";
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT 'Untitled',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS crdt_updates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER REFERENCES documents(id),
+    update_blob BLOB NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);";
+
+/// Platform data directory for Sylph (database, exports, images).
+/// Not relative to the launch cwd: starting the app from another folder
+/// must not scatter or lose its files.
+pub fn data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("sylph")
+}
 
 pub struct Storage {
     conn: Connection,
 }
 
 impl Storage {
+    /// Open the database in the platform data directory.
     pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
-        if let Some(parent) = Path::new(DB_PATH).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(DB_PATH)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL DEFAULT 'Untitled',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS crdt_updates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER REFERENCES documents(id),
-                update_blob BLOB NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );",
-        )?;
+        Self::open_in(data_dir())
+    }
+
+    /// Open a database inside `dir` (created if missing). Tests use this
+    /// with a private temp dir so they never touch the real user data.
+    pub fn open_in(dir: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let conn = Connection::open(dir.join("sylph.db"))?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
+    }
+
+    /// Working in-memory database; the fallback when the data dir cannot
+    /// be opened (read-only system, missing permissions).
+    fn in_memory() -> Self {
+        let conn = Connection::open(":memory:").expect("Failed to open in-memory database");
+        conn.execute_batch(SCHEMA)
+            .expect("Failed to create in-memory tables");
+        Self { conn }
     }
 
     pub fn save_document(
@@ -114,62 +136,69 @@ impl Storage {
 
 impl Default for Storage {
     fn default() -> Self {
-        Self::open().unwrap_or_else(|_| {
-            let conn = Connection::open(":memory:").expect("Failed to open in-memory database");
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS documents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL DEFAULT 'Untitled',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS crdt_updates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    document_id INTEGER REFERENCES documents(id),
-                    update_blob BLOB NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );",
-            )
-            .expect("Failed to create in-memory tables");
-            Self { conn }
-        })
+        Self::open().unwrap_or_else(|_| Self::in_memory())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A unique on-disk database per call: parallel tests never share
+    /// state and the real user data dir stays untouched.
+    fn temp_storage() -> Storage {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sylph-storage-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        Storage::open_in(&dir).unwrap()
+    }
 
     // ── Construction ──────────────────────────────────────────────
 
     #[test]
+    fn test_data_dir_is_not_relative_to_the_launch_cwd() {
+        let dir = data_dir();
+        assert!(
+            dir.is_absolute(),
+            "data dir must not depend on the launch cwd: {}",
+            dir.display()
+        );
+        assert!(dir.ends_with("sylph"));
+    }
+
+    #[test]
     fn test_open_creates_database() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Test Doc").unwrap();
         assert!(id > 0);
     }
 
     #[test]
-    fn test_default_uses_in_memory_fallback() {
-        let storage = Storage::default();
+    fn test_in_memory_fallback_creates_working_database() {
+        let storage = Storage::in_memory();
         let id = storage.create_document("Fallback Doc").unwrap();
         assert!(id > 0);
     }
 
     #[test]
-    fn test_default_has_correct_schema() {
-        let storage = Storage::default();
-        let id = storage.create_document("Schema Test").unwrap();
-        storage.save_text(id, "test content").unwrap();
-        let loaded = storage.load_text(id).unwrap();
-        assert_eq!(loaded.as_deref(), Some("test content"));
+    fn test_schema_is_identical_for_disk_and_memory() {
+        for storage in [temp_storage(), Storage::in_memory()] {
+            let id = storage.create_document("Schema Test").unwrap();
+            storage.save_text(id, "test content").unwrap();
+            let loaded = storage.load_text(id).unwrap();
+            assert_eq!(loaded.as_deref(), Some("test content"));
+        }
     }
 
     // ── Create Document ───────────────────────────────────────────
 
     #[test]
     fn test_create_document_returns_unique_ids() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id1 = storage.create_document("Doc 1").unwrap();
         let id2 = storage.create_document("Doc 2").unwrap();
         let id3 = storage.create_document("Doc 3").unwrap();
@@ -180,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_create_document_with_empty_title() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("").unwrap();
         let title = storage.get_title(id).unwrap();
         assert_eq!(title, "");
@@ -188,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_create_document_with_long_title() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let long_title = "A".repeat(1000);
         let id = storage.create_document(&long_title).unwrap();
         let title = storage.get_title(id).unwrap();
@@ -199,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_text_round_trip() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Round-trip").unwrap();
         storage.save_text(id, "Hello, Sylph!").unwrap();
         let loaded = storage.load_text(id).unwrap();
@@ -208,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_save_empty_text() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Empty").unwrap();
         storage.save_text(id, "").unwrap();
         let loaded = storage.load_text(id).unwrap();
@@ -217,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_save_unicode_text() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Unicode").unwrap();
         let text = "Hello 🌍 こんにちは مرحبا";
         storage.save_text(id, text).unwrap();
@@ -227,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_save_multiline_text() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Multiline").unwrap();
         let text = "line1\nline2\nline3\n";
         storage.save_text(id, text).unwrap();
@@ -237,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_text() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Overwrite").unwrap();
         storage.save_text(id, "first version").unwrap();
         storage.save_text(id, "second version").unwrap();
@@ -247,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent_document() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let loaded = storage.load_text(99999).unwrap();
         assert_eq!(loaded, None);
     }
@@ -279,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_list_documents_multiple() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let _ = storage.create_document("Doc A");
         let _ = storage.create_document("Doc B");
         let _ = storage.create_document("Doc C");
@@ -289,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_list_documents_contains_titles() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let _id = storage.create_document("My Document").unwrap();
         let docs = storage.list_documents().unwrap();
         let titles: Vec<&str> = docs.iter().map(|(_, t)| t.as_str()).collect();
@@ -327,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_update_title() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Old Title").unwrap();
         storage.update_title(id, "New Title").unwrap();
         let title = storage.get_title(id).unwrap();
@@ -336,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_update_title_to_empty() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Title").unwrap();
         storage.update_title(id, "").unwrap();
         let title = storage.get_title(id).unwrap();
@@ -345,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_get_title_nonexistent_document() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let title = storage.get_title(99999).unwrap();
         assert_eq!(title, "Untitled");
     }
@@ -354,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_document_blob() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Blob Test").unwrap();
         let blob = vec![0x01, 0x02, 0x03, 0xFF];
         storage.save_document(id, &blob).unwrap();
@@ -364,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_save_document_loads_latest() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let id = storage.create_document("Latest").unwrap();
         storage.save_document(id, b"first").unwrap();
         storage.save_document(id, b"second").unwrap();
@@ -374,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_load_document_nonexistent() {
-        let storage = Storage::open().unwrap();
+        let storage = temp_storage();
         let loaded = storage.load_document(99999).unwrap();
         assert_eq!(loaded, None);
     }
@@ -387,7 +416,7 @@ mod tests {
 
         assert_send::<Storage>();
 
-        let storage = Storage::default();
+        let storage = Storage::in_memory();
         let _: Result<i64, Box<dyn std::error::Error>> = storage.create_document("test");
         let _: Result<(), Box<dyn std::error::Error>> = storage.save_text(1, "test");
         let _: Result<Option<String>, Box<dyn std::error::Error>> = storage.load_text(1);

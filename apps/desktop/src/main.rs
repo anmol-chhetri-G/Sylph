@@ -961,8 +961,7 @@ impl TextInput {
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         let text = self.content.clone();
-        let _ = std::fs::create_dir_all("output");
-        let _ = std::fs::write("output/document.txt", &text);
+        let _ = std::fs::write(data_path("document.txt"), &text);
         let _ = self.storage.save_text(self.doc_id, &text);
         cx.notify();
     }
@@ -976,8 +975,7 @@ impl TextInput {
                 // Keep writes out of the typing path while saving shortly after
                 // the user pauses. Dropping the previous task debounces bursts.
                 gpui::Timer::after(std::time::Duration::from_millis(750)).await;
-                let _ = std::fs::create_dir_all("output");
-                let _ = std::fs::write("output/document.txt", &text);
+                let _ = std::fs::write(data_path("document.txt"), &text);
                 if let Ok(storage) = sylph_storage::Storage::open() {
                     let _ = storage.save_text(doc_id, &text);
                 }
@@ -988,8 +986,7 @@ impl TextInput {
     fn summarize(&mut self, _: &Summarize, _: &mut Window, cx: &mut Context<Self>) {
         let text = self.content.clone();
         let summary = sylph_py_bridge::summarize_text(&text);
-        let _ = std::fs::create_dir_all("output");
-        let _ = std::fs::write("output/summary.txt", &summary);
+        let _ = std::fs::write(data_path("summary.txt"), &summary);
         cx.notify();
     }
 
@@ -1922,8 +1919,7 @@ impl SylphApp {
     fn save_doc(&mut self, _: &SaveDoc, _window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             let text = editor.content.clone();
-            let _ = std::fs::create_dir_all("output");
-            let _ = std::fs::write("output/document.txt", &text);
+            let _ = std::fs::write(data_path("document.txt"), &text);
             let _ = editor.storage.save_text(editor.doc_id, &text);
             cx.notify();
         });
@@ -1932,8 +1928,7 @@ impl SylphApp {
     fn summarize_doc(&mut self, _: &SummarizeDoc, _window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).content.clone();
         let summary = sylph_py_bridge::summarize_text(&text);
-        let _ = std::fs::create_dir_all("output");
-        let _ = std::fs::write("output/summary.txt", &summary);
+        let _ = std::fs::write(data_path("summary.txt"), &summary);
         cx.notify();
     }
 
@@ -2379,8 +2374,8 @@ impl SylphApp {
 
     fn export_document(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let ext = format.ext();
-        // Keep the file inside output/: doc_title is user-editable, so strip
-        // path separators and other unsafe filename characters.
+        // Keep the file inside the data dir: doc_title is user-editable, so
+        // strip path separators and other unsafe filename characters.
         let safe_title: String = self
             .doc_title
             .chars()
@@ -2393,8 +2388,7 @@ impl SylphApp {
             })
             .collect();
         let file_name = format!("{}.{}", safe_title.replace(' ', "_"), ext);
-        let path = format!("output/{}", file_name);
-        let _ = std::fs::create_dir_all("output");
+        let path = data_path(&file_name).to_string_lossy().into_owned();
         let content = self.editor.read(cx).content.clone();
         // Neither buffer alone is the document yet: typed text lives in the
         // editor, cover/tables/images/page breaks live in self.document.
@@ -2419,11 +2413,11 @@ impl SylphApp {
             },
         };
         // The status bar shows the file name, never the internal
-        // `output/` build path (Google Docs / Word say "Exported · x").
+        // storage path (Google Docs / Word say "Exported · x").
         self.status_message = Some(if result.starts_with("Exported to ") {
             format!("Exported · {}", file_name)
         } else {
-            result.replace("output/", "")
+            result.replace(&sylph_storage::data_dir().display().to_string(), "")
         });
         cx.notify();
     }
@@ -2471,9 +2465,8 @@ impl SylphApp {
             .unwrap_or_default()
             .as_millis();
         let filename = format!("image_{}.{}", timestamp, extension);
-        let dir = "output/images";
-        let _ = std::fs::create_dir_all(dir);
-        let path = format!("{}/{}", dir, filename);
+        let stored = data_path(&format!("images/{}", filename));
+        let path = stored.to_string_lossy().into_owned();
         if std::fs::write(&path, bytes).is_ok() {
             self.document
                 .push_block(sylph_core::document::Block::image(&path));
@@ -2504,9 +2497,7 @@ impl SylphApp {
             .unwrap_or_default()
             .as_millis();
         let filename = format!("image_{}.{}", timestamp, extension);
-        let dir = PathBuf::from("output/images");
-        let _ = std::fs::create_dir_all(&dir);
-        let destination = dir.join(&filename);
+        let destination = data_path(&format!("images/{}", filename));
         if std::fs::copy(&source, &destination).is_ok() {
             let path = destination.to_string_lossy().into_owned();
             self.document
@@ -5325,6 +5316,16 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
         });
     }
     blocks
+}
+
+/// A path under the platform data directory (never relative to the launch
+/// cwd). Creates the parent directory so callers can write immediately.
+fn data_path(rel: &str) -> PathBuf {
+    let path = sylph_storage::data_dir().join(rel);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    path
 }
 
 /// Merge the structured model with typed editor content for export.
