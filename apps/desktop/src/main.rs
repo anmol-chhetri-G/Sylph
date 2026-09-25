@@ -2393,7 +2393,7 @@ impl SylphApp {
         // Neither buffer alone is the document yet: typed text lives in the
         // editor, cover/tables/images/page breaks live in self.document.
         // Merge both so export never silently drops content.
-        let model = export_model(&self.document, &content);
+        let model = export_model(&self.document, &content, self.markdown_mode);
         let result = match serde_json::to_string(&model) {
             Ok(json) => match format {
                 ExportFormat::Pdf => sylph_py_bridge::export_rich_pdf(&json, &path),
@@ -5328,13 +5328,35 @@ fn data_path(rel: &str) -> PathBuf {
     path
 }
 
+/// OFF = what you see is what you export: one paragraph per nonblank
+/// source line, verbatim — no `parse_inline_runs`, so `#`, `**` and
+/// `\newpage` stay literal. Styling matches `flush_para` exactly.
+fn literal_blocks(content: &str, line_spacing: f32) -> Vec<doc::Block> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            // Blank lines are spacing, not content.
+            continue;
+        }
+        out.push(doc::Block::Paragraph {
+            runs: vec![doc::TextRun::plain(line)],
+            style: doc::ParagraphStyle {
+                line_spacing,
+                space_before: 0.0,
+                space_after: 8.0,
+            },
+        });
+    }
+    out
+}
+
 /// Merge the structured model with typed editor content for export.
 /// Order mirrors the canvas: cover first, then typed text, then inserted
 /// objects (tables/images/captions/page breaks) in insertion order.
 /// The empty placeholder paragraph from `Document::new()` is dropped.
 /// True interleaving of cursor position with blocks needs the editor-kernel
 /// phase (SYLPH_PLAN.md §10); this approximation keeps export truthful.
-fn export_model(structured: &doc::Document, content: &str) -> doc::Document {
+fn export_model(structured: &doc::Document, content: &str, markdown_on: bool) -> doc::Document {
     let mut out = structured.clone();
     let mut blocks: Vec<doc::Block> = Vec::new();
     for b in &structured.blocks {
@@ -5342,7 +5364,11 @@ fn export_model(structured: &doc::Document, content: &str) -> doc::Document {
             blocks.push(b.clone());
         }
     }
-    blocks.extend(parse_content_blocks(content, structured.line_spacing));
+    if markdown_on {
+        blocks.extend(parse_content_blocks(content, structured.line_spacing));
+    } else {
+        blocks.extend(literal_blocks(content, structured.line_spacing));
+    }
     for b in &structured.blocks {
         match b {
             doc::Block::CoverPage { .. } => {}
@@ -5417,7 +5443,9 @@ fn try_headless_export(args: &[String]) -> Option<i32> {
         {
             structured.title = stem.to_string();
         }
-        let model = export_model(&structured, &content);
+        // Markdown input is Markdown by definition: headless proofs always
+        // parse markdown, whatever the last GUI toggle state may have been.
+        let model = export_model(&structured, &content, true);
         match serde_json::to_string(&model) {
             Ok(j) => j,
             Err(e) => {
@@ -5708,7 +5736,7 @@ mod export_model_tests {
         structured.push_block(Block::page_break());
         structured.push_block(Block::table(2, 2));
         structured.set_cover_page(CoverPageData::new().with_title("Cover"));
-        let model = export_model(&structured, "# Head\n\nbody");
+        let model = export_model(&structured, "# Head\n\nbody", true);
         assert!(matches!(model.blocks[0], Block::CoverPage { .. }));
         assert!(matches!(model.blocks[1], Block::Heading { .. }));
         assert!(matches!(model.blocks[2], Block::Paragraph { .. }));
@@ -5726,9 +5754,22 @@ mod export_model_tests {
         use sylph_core::document::{Block, Document};
         let mut structured = Document::new();
         structured.push_block(Block::page_break());
-        let model = export_model(&structured, "");
+        let model = export_model(&structured, "", true);
         assert!(!model.blocks.is_empty());
         assert!(matches!(model.blocks[0], Block::PageBreak));
+    }
+
+    #[test]
+    fn export_off_mode_keeps_markdown_literal() {
+        use sylph_core::document::{Block, Document};
+        let structured = Document::new();
+        let model = export_model(&structured, "# Title\n\n\\newpage\n\n**bold**", false);
+        assert!(model
+            .blocks
+            .iter()
+            .all(|b| matches!(b, Block::Paragraph { .. })));
+        let texts: Vec<String> = model.blocks.iter().map(Block::plain_text).collect();
+        assert_eq!(texts, ["# Title", "\\newpage", "**bold**"]);
     }
 
     #[test]
@@ -6013,7 +6054,7 @@ mod export_model_tests {
     fn export_model_serializes_to_python_expected_shapes() {
         use sylph_core::document::Document;
         let structured = Document::new();
-        let model = export_model(&structured, "# H\n\n**bold** text");
+        let model = export_model(&structured, "# H\n\n**bold** text", true);
         let json = serde_json::to_string(&model).expect("serialize");
         // Rust-shape checks: unit variants as strings, styles as strings.
         assert!(json.contains("\"Heading\""));
@@ -6040,6 +6081,7 @@ mod export_model_tests {
         let model = export_model(
             &structured,
             "# Merged Head\n\nBody **bold** and *italic* text.\n\nSecond paragraph.",
+            true,
         );
         let json = serde_json::to_string_pretty(&model).expect("serialize");
         std::fs::create_dir_all("/tmp/opencode").expect("tmp dir");
