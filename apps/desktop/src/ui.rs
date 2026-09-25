@@ -1338,14 +1338,8 @@ impl SylphApp {
                 }
             }
             NavigatorTab::Pages => {
-                // Real page count = explicit PageBreak blocks + 1. Thumbnails not built.
-                let breaks = self
-                    .document
-                    .blocks
-                    .iter()
-                    .filter(|b| matches!(b, sylph_core::document::Block::PageBreak))
-                    .count();
-                let count = breaks + 1;
+                // Page chrome and export share one truth: the export view.
+                let count = self.page_count(cx);
                 body = body
                     .child(
                         label(format!("PAGES ({})", count), muted, 11.0)
@@ -2084,12 +2078,7 @@ impl SylphApp {
     }
 
     fn center_canvas(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let page_count = 1 + self
-            .document
-            .blocks
-            .iter()
-            .filter(|block| matches!(block, sylph_core::document::Block::PageBreak))
-            .count();
+        let page_count = self.page_count(cx);
         let page_w = self.page_width();
         let page_gap_border = self.ui_border();
         let page_gap_muted = self.ui_muted();
@@ -2712,12 +2701,7 @@ impl SylphApp {
             let editor = self.editor.read(cx);
             cursor_status(&editor.content, editor.cursor_offset())
         };
-        let page_count = 1 + self
-            .document
-            .blocks
-            .iter()
-            .filter(|block| matches!(block, sylph_core::document::Block::PageBreak))
-            .count();
+        let page_count = self.page_count(cx);
         // Never leak build paths here — the save indicator reads like
         // Word/Docs ("All changes saved") with transient action feedback.
         let save_state = self

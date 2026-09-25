@@ -2376,6 +2376,21 @@ impl SylphApp {
         }
     }
 
+    /// The document exactly as export will see it — the one truth for chrome.
+    fn export_view(&self, cx: &mut Context<Self>) -> doc::Document {
+        let editor = self.editor.read(cx);
+        export_model(&self.document, &editor.content, self.markdown_mode)
+    }
+
+    fn page_count(&self, cx: &mut Context<Self>) -> usize {
+        1 + self
+            .export_view(cx)
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, doc::Block::PageBreak))
+            .count()
+    }
+
     fn export_document(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let ext = format.ext();
         // Keep the file inside the data dir: doc_title is user-editable, so
@@ -2397,7 +2412,7 @@ impl SylphApp {
         // Neither buffer alone is the document yet: typed text lives in the
         // editor, cover/tables/images/page breaks live in self.document.
         // Merge both so export never silently drops content.
-        let model = export_model(&self.document, &content, self.markdown_mode);
+        let model = self.export_view(cx);
         let result = match serde_json::to_string(&model) {
             Ok(json) => match format {
                 ExportFormat::Pdf => sylph_py_bridge::export_rich_pdf(&json, &path),
