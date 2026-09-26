@@ -296,6 +296,25 @@ mod tests {
     }
 
     #[test]
+    fn test_launch_skips_a_document_whose_latest_save_is_empty() {
+        // A document that had text and was then cleared: an earlier save
+        // is non-empty, the current one is empty. Ranking must use the
+        // current save, the same row load_text returns, or the launch
+        // would open an empty page.
+        let storage = temp_storage();
+        let kept = storage.create_document("Kept").unwrap();
+        let cleared = storage.create_document("Cleared").unwrap();
+        storage.save_text(kept, "real text").unwrap();
+        storage.save_text(cleared, "draft").unwrap();
+        storage.save_text(cleared, "").unwrap();
+        assert_eq!(storage.open_last_or_create().unwrap(), kept);
+        assert_eq!(
+            storage.load_text(kept).unwrap().as_deref(),
+            Some("real text")
+        );
+    }
+
+    #[test]
     fn test_last_opened_ignores_a_deleted_document() {
         let storage = temp_storage();
         let a = storage.create_document("A").unwrap();
