@@ -6551,4 +6551,33 @@ mod markdown_wysiwyg_tests {
         assert_eq!(cursor_status(emoji, emoji.len()).0, 1);
         assert_eq!(cursor_status(emoji, emoji.len()).1, 6);
     }
+
+    #[test]
+    fn block_status_counts_logical_blocks() {
+        use crate::ui::block_status;
+        // A soft-wrapped paragraph is one block; Ln would have said 3.
+        let p = "one\ntwo\nthree";
+        assert_eq!(block_status(p, p.len()), (1, 1));
+
+        let doc = "# H\n\npara a\npara b\n\n- x\n- y";
+        // Caret inside a soft-wrapped paragraph → that paragraph's block.
+        assert_eq!(block_status(doc, doc.find("para b").unwrap()), (2, 3));
+        // The list is one block, whatever line the caret sits on.
+        assert_eq!(block_status(doc, doc.len()), (3, 3));
+        // A blank line reports the block before it.
+        assert_eq!(block_status(doc, 3), (1, 3));
+
+        // A table header only counts as a table once its delimiter row is
+        // read, so the counter looks one line ahead.
+        let t = "intro\na | b\n--- | ---\n1 | 2";
+        assert_eq!(block_status(t, t.find("a | b").unwrap()), (2, 2));
+
+        // An unclosed fence still flushes its code block at end of text.
+        let fenced = "```\ncode\n```\nafter";
+        assert_eq!(block_status(fenced, fenced.find("code").unwrap()), (1, 2));
+
+        assert_eq!(block_status("", 0), (1, 1));
+        // A byte offset inside a multi-byte character must not panic.
+        assert_eq!(block_status("a\u{1F642}b", 2), (1, 1));
+    }
 }

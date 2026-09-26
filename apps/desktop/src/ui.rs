@@ -121,6 +121,41 @@ pub(crate) fn cursor_status(content: &str, cursor: usize) -> (usize, usize, usiz
     (line, column, count_words(content))
 }
 
+/// Status-bar block position in Markdown mode: 1-based block at the caret
+/// and the document's block total, both from the export parser itself —
+/// parse up to the end of the caret's line and count, so the counter can
+/// never disagree with export. Soft-wrapped lines of one paragraph share a
+/// block; a blank line reports the block before it.
+pub(crate) fn block_status(content: &str, cursor: usize) -> (usize, usize) {
+    // Snap the cursor exactly like `cursor_status` (a raw byte offset may
+    // point into the middle of a multi-byte character).
+    let mut cursor = cursor.min(content.len());
+    while cursor < content.len() && !content.is_char_boundary(cursor) {
+        cursor += 1;
+    }
+    // `line_spacing` never changes how text groups into blocks, so any
+    // value counts the same.
+    let total = crate::parse_content_blocks(content, 1.0).len().max(1);
+
+    let mut end = content[cursor..]
+        .find('\n')
+        .map_or(content.len(), |p| cursor + p);
+    // One exception to "the prefix ends at the caret's line": a pipe-table
+    // header only becomes a table when its delimiter row follows, so
+    // include that row or the header would count as a paragraph.
+    if let Some(rest) = content[end..].strip_prefix('\n') {
+        let next = rest.split('\n').next().unwrap_or_default();
+        if crate::is_table_delimiter(next) {
+            end += 1 + next.len();
+        }
+    }
+
+    // The parser flushes whatever is pending at end of text, so a partly
+    // parsed caret block still counts as exactly one block.
+    let index = crate::parse_content_blocks(&content[..end], 1.0).len();
+    (index.clamp(1, total), total)
+}
+
 fn icon(glyph: &str, color: Rgba, size: f32) -> Div {
     div()
         .font_family("Noto Sans")
@@ -2640,9 +2675,20 @@ impl SylphApp {
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let muted = self.ui_muted();
         let text = self.ui_text();
-        let (line, column, word_count) = {
+        // Markdown ON counts the blocks export will produce; OFF exports
+        // one paragraph per source line, so the line *is* the block.
+        let markdown_on = self.markdown_mode;
+        let (position, word_count) = {
             let editor = self.editor.read(cx);
-            cursor_status(&editor.content, editor.cursor_offset())
+            let cursor = editor.cursor_offset();
+            let (line, column, words) = cursor_status(&editor.content, cursor);
+            let position = if markdown_on {
+                let (block, of_blocks) = block_status(&editor.content, cursor);
+                format!("Block {block} of {of_blocks}")
+            } else {
+                format!("Ln {line}, Col {column}")
+            };
+            (position, words)
         };
         let page_count = self.page_count(cx);
         // Never leak build paths here — the save indicator reads like
@@ -2666,10 +2712,7 @@ impl SylphApp {
             .text_color(muted)
             .child(
                 label(
-                    format!(
-                        "Page 1 of {}  ·  Section 1  ·  Ln {}, Col {}",
-                        page_count, line, column
-                    ),
+                    format!("Page 1 of {}  ·  Section 1  ·  {}", page_count, position),
                     muted,
                     11.0,
                 )
