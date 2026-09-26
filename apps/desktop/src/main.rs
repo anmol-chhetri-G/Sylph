@@ -1459,7 +1459,7 @@ impl Element for TextElement {
 
                 let slice = &dl.text[d0..d1];
                 let runs = if markdown_on {
-                    display_runs(dl.kind, slice, font.clone(), text_color)
+                    display_runs(dl, d0..d1, font.clone(), text_color)
                 } else {
                     TextInput::markdown_runs(slice, font.clone(), text_color, dl.fenced)
                 };
@@ -4560,6 +4560,18 @@ fn inline_pieces(text: &str) -> Vec<InlinePiece> {
             *next_run += 1;
             *next_run - 1
         });
+        // Plain text of one run is one piece, not one piece per character.
+        if let Some(InlinePiece::Text {
+            len: last,
+            run: last_run,
+            ..
+        }) = pieces.last_mut()
+        {
+            if *last_run == run {
+                *last += len;
+                return;
+            }
+        }
         pieces.push(InlinePiece::Text {
             len,
             run,
@@ -4872,6 +4884,9 @@ struct DisplayLine {
     text: String,
     /// Monotonic source↔display mapping covering the whole line.
     segments: Vec<DisplaySegment>,
+    /// Inline styles over display byte ranges (Markdown mode ON), from the
+    /// export's own scanner: bold, italic, code, strikethrough, links.
+    styles: Vec<(Range<usize>, Vec<doc::SpanStyle>)>,
     kind: DisplayKind,
     /// Explicit font size in px (headings); `None` inherits the editor's.
     font_size: Option<f32>,
@@ -4904,6 +4919,7 @@ impl DisplayLine {
             src_offset,
             text: text.to_string(),
             segments,
+            styles: Vec::new(),
             kind: DisplayKind::Paragraph,
             font_size: None,
             space_before: 0.0,
@@ -4952,6 +4968,7 @@ impl DisplayLine {
 struct DisplayBuilder {
     text: String,
     segments: Vec<DisplaySegment>,
+    styles: Vec<(Range<usize>, Vec<doc::SpanStyle>)>,
     src: usize,
 }
 
@@ -4987,6 +5004,31 @@ impl DisplayBuilder {
             identity: true,
         });
         self.src += n;
+    }
+
+    /// Render the next `n` source bytes as inline Markdown with the export's
+    /// own scanner: syntax is hidden, kept text is copied and its styles
+    /// recorded, so the canvas shows exactly the text the export keeps.
+    fn inline(&mut self, line: &str, n: usize) {
+        let content = &line[self.src..self.src + n];
+        for piece in inline_pieces(content) {
+            match piece {
+                InlinePiece::Syntax(len) => self.hide(len),
+                InlinePiece::Text { len, styles, .. } => {
+                    let start = self.text.len();
+                    self.ident(line, len);
+                    let end = self.text.len();
+                    match self.styles.last_mut() {
+                        // Contiguous text with the same styles is one range.
+                        Some((range, last)) if range.end == start && *last == styles => {
+                            range.end = end;
+                        }
+                        _ if !styles.is_empty() => self.styles.push((start..end, styles)),
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// Consume `n` source bytes and render `disp` in their place.
@@ -5068,7 +5110,7 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
             rest = r.strip_prefix(' ').unwrap_or(r);
         }
         b.hide(trimmed.len() - rest.len());
-        b.ident(line, rest.trim_end().len());
+        b.inline(line, rest.trim_end().len());
         b.hide(rest.len() - rest.trim_end().len());
         kind = DisplayKind::Quote;
         italic = true;
@@ -5081,7 +5123,7 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
         let content = &line[indent + hashes + ws..];
         b.ident(line, indent);
         b.hide(hashes + ws);
-        b.ident(line, content.trim_end().len());
+        b.inline(line, content.trim_end().len());
         b.hide(content.len() - content.trim_end().len());
         kind = DisplayKind::Heading;
         let (size, before, after) = heading_metrics(level);
@@ -5107,18 +5149,20 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
             b.replace(item.len() - rest.len(), if checked { "☑ " } else { "☐ " });
             item_rest = rest;
         }
-        b.ident(line, item_rest.len());
+        b.inline(line, item_rest.len());
         b.hide(line.len() - b.src);
         kind = DisplayKind::List;
     } else {
-        // Paragraph (and table rows): verbatim.
-        b.ident(line, line.len());
+        // Paragraph: inline Markdown (build_display_lines puts pipe-table
+        // rows back to raw text).
+        b.inline(line, line.len());
     }
 
     DisplayLine {
         src_offset: 0,
         text: b.text,
         segments: b.segments,
+        styles: b.styles,
         kind,
         font_size,
         space_before,
@@ -5136,12 +5180,19 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
     let mut out = Vec::with_capacity(lines.len());
     let mut offset = 0usize;
     let mut in_fence = false;
-    for line in lines {
+    let tables = table_rows(lines);
+    for (line, table_row) in lines.iter().zip(tables) {
         let line_in_fence = in_fence;
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
         let mut dl = display_line(line, line_in_fence, markdown_on);
+        if markdown_on && table_row && dl.kind == DisplayKind::Paragraph {
+            // Pipe tables stay raw text until the canvas draws real grids:
+            // the export reads their cells one by one, so styling a whole
+            // row could hide markers the export keeps.
+            dl = DisplayLine::identity(0, line, false);
+        }
         dl.src_offset = offset;
         offset += line.len() + 1;
         out.push(dl);
@@ -5149,45 +5200,130 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
     out
 }
 
-/// Runs for one display row (a slice of a `DisplayLine`'s text) with
-/// Markdown mode ON: headings bold + heading-colored, quotes italic +
-/// muted, fenced code flat code color — the styles the export renderer
-/// applies, using GPUI's per-run font weight/style.
+/// Which lines belong to pipe tables, by the export parser's own loop: a
+/// line with `|` followed by a delimiter row starts a table (header and
+/// delimiter), and the table continues while lines are non-blank and
+/// contain `|`. Lines inside code fences never count.
+fn table_rows(lines: &[String]) -> Vec<bool> {
+    let mut rows = vec![false; lines.len()];
+    let mut in_fence = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence
+            && line.contains('|')
+            && lines
+                .get(i + 1)
+                .is_some_and(|next| is_table_delimiter(next))
+        {
+            rows[i] = true;
+            rows[i + 1] = true;
+            i += 2;
+            while i < lines.len() {
+                let body = lines[i].trim_end();
+                if body.trim().is_empty() || !body.contains('|') {
+                    break;
+                }
+                rows[i] = true;
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    rows
+}
+
+/// Runs for display bytes `range` of `dl` with Markdown mode ON. The block
+/// kind sets the base (headings bold and heading-coloured, quotes italic and
+/// muted, code in the code colour); the line's inline styles, from the
+/// export's own scanner, sit on top: real bold and italic faces, monospace
+/// for code, a strike line, underlined links. Markers are already hidden.
 fn display_runs(
-    kind: DisplayKind,
-    slice: &str,
+    dl: &DisplayLine,
+    range: Range<usize>,
     font: gpui::Font,
     base: gpui::Hsla,
 ) -> Vec<TextRun> {
-    let flat = |font: gpui::Font, color: gpui::Hsla, bg: Option<gpui::Hsla>| {
-        vec![TextRun {
-            len: slice.len(),
-            font,
-            color,
-            background_color: bg,
-            underline: None,
-            strikethrough: None,
-        }]
+    let color_code = hsla(120.0 / 360.0, 0.5, 0.35, 1.0);
+    let color_link = hsla(210.0 / 360.0, 0.8, 0.45, 1.0);
+    let (font, base) = match dl.kind {
+        DisplayKind::Rule | DisplayKind::Fence | DisplayKind::PageBreak => return Vec::new(),
+        DisplayKind::Code => {
+            return vec![TextRun {
+                len: range.len(),
+                font,
+                color: color_code,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }]
+        }
+        DisplayKind::Heading => (font.bold(), hsla(210.0 / 360.0, 0.8, 0.4, 1.0)),
+        DisplayKind::Quote => (font.italic(), hsla(0.0, 0.0, 0.5, 1.0)),
+        DisplayKind::List | DisplayKind::Paragraph => (font, base),
     };
-    match kind {
-        DisplayKind::Heading => {
-            let color = hsla(210.0 / 360.0, 0.8, 0.4, 1.0);
-            let bold_font = font.bold();
-            let mut runs = TextInput::inline_runs(slice, bold_font.clone(), color);
-            for r in &mut runs {
-                r.font = bold_font.clone();
-                r.color = color;
-            }
-            runs
-        }
-        DisplayKind::Quote => {
-            let color = hsla(0.0, 0.0, 0.5, 1.0);
-            TextInput::inline_runs(slice, font.italic(), color)
-        }
-        DisplayKind::Code => flat(font, hsla(120.0 / 360.0, 0.5, 0.35, 1.0), None),
-        DisplayKind::Rule | DisplayKind::Fence | DisplayKind::PageBreak => Vec::new(),
-        DisplayKind::List | DisplayKind::Paragraph => TextInput::inline_runs(slice, font, base),
+    // Cut the row at every style boundary inside it; each piece is one run.
+    let mut cuts = vec![range.start, range.end];
+    for (r, _) in &dl.styles {
+        cuts.extend([r.start, r.end].into_iter().filter(|p| range.contains(p)));
     }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|w| {
+            let (start, end) = (w[0], w[1]);
+            let (mut run_font, mut color) = (font.clone(), base);
+            let (mut underline, mut strikethrough) = (None, None);
+            let styles = dl
+                .styles
+                .iter()
+                .filter(|(r, _)| r.start <= start && end <= r.end)
+                .flat_map(|(_, s)| s);
+            for style in styles {
+                match style {
+                    doc::SpanStyle::Bold => run_font = run_font.bold(),
+                    doc::SpanStyle::Italic => run_font = run_font.italic(),
+                    doc::SpanStyle::BoldItalic => run_font = run_font.bold().italic(),
+                    doc::SpanStyle::Code => {
+                        run_font.family = ui::MONO_FONT.into();
+                        color = color_code;
+                    }
+                    doc::SpanStyle::Strikethrough => {
+                        strikethrough = Some(gpui::StrikethroughStyle {
+                            thickness: px(1.0),
+                            color: None,
+                        })
+                    }
+                    doc::SpanStyle::Underline => {
+                        underline = Some(gpui::UnderlineStyle {
+                            thickness: px(1.0),
+                            color: None,
+                            wavy: false,
+                        })
+                    }
+                    doc::SpanStyle::Link(_) => {
+                        color = color_link;
+                        underline = Some(gpui::UnderlineStyle {
+                            thickness: px(1.0),
+                            color: Some(color_link),
+                            wavy: false,
+                        });
+                    }
+                }
+            }
+            TextRun {
+                len: end - start,
+                font: run_font,
+                color,
+                background_color: None,
+                underline,
+                strikethrough,
+            }
+        })
+        .collect()
 }
 
 /// One bullet (`-`/`*`/`+`) or ordered (`1.`/`1)`) item, with task-box
@@ -6881,11 +7017,124 @@ mod markdown_wysiwyg_tests {
     }
 
     #[test]
+    fn inline_markers_are_hidden_and_styled() {
+        use sylph_core::document::SpanStyle;
+        let dl = on("a **b** c");
+        assert_eq!(dl.text, "a b c");
+        assert_eq!(dl.styles, vec![(2..3, vec![SpanStyle::Bold])]);
+        // The caret maps across the hidden markers like Word's formatting:
+        // before the bold text it sits before `**` (typing stays plain),
+        // after it, before the closing `**` (typing continues the bold).
+        assert_eq!(dl.src_to_disp(4), 2);
+        assert_eq!(dl.disp_to_src(2), 2);
+        assert_eq!(dl.disp_to_src(3), 5);
+
+        let dl = on("see [docs](https://x.io) now");
+        assert_eq!(dl.text, "see docs now");
+        assert_eq!(
+            dl.styles,
+            vec![(4..8, vec![SpanStyle::Link("https://x.io".into())])]
+        );
+
+        // An escape drops only its backslash; code keeps inner markers.
+        let dl = on("\\*lit\\*");
+        assert_eq!(dl.text, "*lit*");
+        assert!(dl.styles.is_empty());
+        let dl = on("`a*b`");
+        assert_eq!(dl.text, "a*b");
+        assert_eq!(dl.styles, vec![(0..3, vec![SpanStyle::Code])]);
+
+        // Headings and list items get the same treatment.
+        let dl = on("# **Bold** title");
+        assert_eq!(
+            (dl.text.as_str(), dl.kind),
+            ("Bold title", DisplayKind::Heading)
+        );
+        assert_eq!(dl.styles, vec![(0..4, vec![SpanStyle::Bold])]);
+        let dl = on("- *it*");
+        assert_eq!(dl.text, "• it");
+        assert_eq!(
+            dl.styles,
+            vec![("• ".len().."• it".len(), vec![SpanStyle::Italic])]
+        );
+
+        // Markdown OFF stays literal.
+        let off = display_line("a **b**", false, false);
+        assert_eq!(off.text, "a **b**");
+        assert!(off.styles.is_empty());
+    }
+
+    #[test]
+    fn pipe_table_rows_stay_raw_text() {
+        let lines: Vec<String> = [
+            "| **a** | b |",
+            "|---|---|",
+            "| c | *d* |",
+            "",
+            "after **x**",
+        ]
+        .map(String::from)
+        .to_vec();
+        let dls = build_display_lines(&lines, true);
+        assert_eq!(dls[0].text, "| **a** | b |");
+        assert_eq!(dls[2].text, "| c | *d* |");
+        assert!(dls[0].styles.is_empty());
+        // The table ends at the blank line; later lines render inline.
+        assert_eq!(dls[4].text, "after x");
+    }
+
+    #[test]
+    fn canvas_shows_exactly_the_text_and_styles_the_export_keeps() {
+        use sylph_core::document::SpanStyle;
+        fn per_byte(len: usize, spans: &[(Range<usize>, Vec<SpanStyle>)]) -> Vec<Vec<SpanStyle>> {
+            let mut out = vec![Vec::new(); len];
+            for (range, styles) in spans {
+                for byte in range.clone() {
+                    out[byte].extend(styles.iter().cloned());
+                }
+            }
+            out
+        }
+        let lines: Vec<String> = include_str!("../../../fixtures/kitchen-sink.md")
+            .lines()
+            .map(String::from)
+            .collect();
+        let dls = build_display_lines(&lines, true);
+        let mut checked = 0;
+        for ((line, dl), table) in lines.iter().zip(&dls).zip(table_rows(&lines)) {
+            // What the export reads for this line's inline Markdown.
+            let content = match dl.kind {
+                DisplayKind::Paragraph if !table && standalone_image(line.trim_end()).is_none() => {
+                    line.as_str()
+                }
+                DisplayKind::Heading => heading_level_and_text(line.trim()).unwrap().1,
+                _ => continue,
+            };
+            let runs = parse_inline_runs(content);
+            let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+            assert_eq!(dl.text, text, "text of {line:?}");
+            let mut spans = Vec::new();
+            let mut at = 0;
+            for run in &runs {
+                spans.push((at..at + run.text.len(), run.styles.clone()));
+                at += run.text.len();
+            }
+            assert_eq!(
+                per_byte(dl.text.len(), &dl.styles),
+                per_byte(text.len(), &spans),
+                "styles of {line:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 5, "only {checked} fixture lines checked");
+    }
+
+    #[test]
     fn heading_runs_are_bold_and_cover_text() {
         let dl = on("# Title");
         let runs = display_runs(
-            dl.kind,
-            &dl.text,
+            &dl,
+            0..dl.text.len(),
             gpui::font("monospace"),
             hsla(0., 0., 0.2, 1.0),
         );

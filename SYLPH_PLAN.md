@@ -443,6 +443,12 @@ text rather than dropped):
 - `_..._` is deliberately not emphasis (snake_case must stay plain).
 - PDF core fonts are latin-1: bullet markers render as `·` in PDF while DOCX uses
   `•`; Markdown output uses the standard `- ` prefix.
+- Canvas inline rendering (Markdown mode) uses the export's own inline scanner,
+  one source line at a time: markers are hidden and bold/italic/code/strike/links
+  get real faces. Two known gaps: emphasis that spans a line break is styled in
+  export (paragraph and quote lines are joined first) but shows its markers on the
+  canvas; and pipe tables stay raw text on the canvas until grids are drawn (the
+  export parses their cells one by one).
 - PDF typefaces are core-font stand-ins: fpdf2 embeds only the 14 standard fonts,
   so the body typeface maps to one of them (serif faces such as Noto/Liberation/
   DejaVu Serif, Garamond and Georgia → Times; monospace → Courier; everything
