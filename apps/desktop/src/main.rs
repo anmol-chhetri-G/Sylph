@@ -5180,22 +5180,25 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
     let mut out = Vec::with_capacity(lines.len());
     let mut offset = 0usize;
     let mut in_fence = false;
-    let tables = table_rows(lines);
-    for (line, table_row) in lines.iter().zip(tables) {
+    for line in lines {
         let line_in_fence = in_fence;
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
         let mut dl = display_line(line, line_in_fence, markdown_on);
-        if markdown_on && table_row && dl.kind == DisplayKind::Paragraph {
-            // Pipe tables stay raw text until the canvas draws real grids:
-            // the export reads their cells one by one, so styling a whole
-            // row could hide markers the export keeps.
-            dl = DisplayLine::identity(0, line, false);
-        }
         dl.src_offset = offset;
         offset += line.len() + 1;
         out.push(dl);
+    }
+    if markdown_on {
+        for (i, row) in table_rows(lines, &out).into_iter().enumerate() {
+            if row && out[i].kind == DisplayKind::Paragraph {
+                // Pipe tables stay raw text until the canvas draws real
+                // grids: the export reads their cells one by one, so
+                // styling a whole row could hide markers the export keeps.
+                out[i] = DisplayLine::identity(out[i].src_offset, &lines[i], false);
+            }
+        }
     }
     out
 }
@@ -5203,8 +5206,10 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
 /// Which lines belong to pipe tables, by the export parser's own loop: a
 /// line with `|` followed by a delimiter row starts a table (header and
 /// delimiter), and the table continues while lines are non-blank and
-/// contain `|`. Lines inside code fences never count.
-fn table_rows(lines: &[String]) -> Vec<bool> {
+/// contain `|`. Only a line that reaches the parser's table check can start
+/// one: headings, quotes, list items, rules and images are checked first
+/// (`dls` holds each line's display kind). Fenced lines never count.
+fn table_rows(lines: &[String], dls: &[DisplayLine]) -> Vec<bool> {
     let mut rows = vec![false; lines.len()];
     let mut in_fence = false;
     let mut i = 0;
@@ -5213,6 +5218,8 @@ fn table_rows(lines: &[String]) -> Vec<bool> {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         } else if !in_fence
+            && dls[i].kind == DisplayKind::Paragraph
+            && standalone_image(line).is_none()
             && line.contains('|')
             && lines
                 .get(i + 1)
@@ -7084,6 +7091,33 @@ mod markdown_wysiwyg_tests {
     }
 
     #[test]
+    fn only_a_paragraph_line_starts_a_table() {
+        // The parser checks headings, list items, quotes and images before
+        // tables, so none of them starts one: the rows under them are an
+        // ordinary paragraph, and the canvas must style them like one.
+        for first in ["# a | b", "- a | b", "> a | b", "![a | b](p.png)"] {
+            let lines: Vec<String> = [first, "|---|---|", "| **x** | y |"]
+                .map(String::from)
+                .to_vec();
+            let blocks = parse_content_blocks(&lines.join("\n"), 1.0);
+            assert!(
+                !blocks.iter().any(|b| matches!(b, doc::Block::Table { .. })),
+                "export made a table under {first:?}"
+            );
+            assert_eq!(
+                build_display_lines(&lines, true)[2].text,
+                "| x | y |",
+                "canvas rows under {first:?}"
+            );
+        }
+        // A paragraph line does start one, and its rows stay raw text.
+        let lines: Vec<String> = ["a | b", "|---|---|", "| **x** | y |"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(build_display_lines(&lines, true)[2].text, "| **x** | y |");
+    }
+
+    #[test]
     fn canvas_shows_exactly_the_text_and_styles_the_export_keeps() {
         use sylph_core::document::SpanStyle;
         fn per_byte(len: usize, spans: &[(Range<usize>, Vec<SpanStyle>)]) -> Vec<Vec<SpanStyle>> {
@@ -7101,7 +7135,7 @@ mod markdown_wysiwyg_tests {
             .collect();
         let dls = build_display_lines(&lines, true);
         let mut checked = 0;
-        for ((line, dl), table) in lines.iter().zip(&dls).zip(table_rows(&lines)) {
+        for ((line, dl), table) in lines.iter().zip(&dls).zip(table_rows(&lines, &dls)) {
             // What the export reads for this line's inline Markdown.
             let content = match dl.kind {
                 DisplayKind::Paragraph if !table && standalone_image(line.trim_end()).is_none() => {
