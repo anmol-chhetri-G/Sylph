@@ -2579,6 +2579,31 @@ impl SylphApp {
         self.open_image_picker(cx);
     }
 
+    /// Why a formatting command must refuse, or `None` when it may run.
+    /// Markdown OFF means literal text: inserting `# ` or `**` would only
+    /// add raw markers that stay literal on the canvas *and* in the export,
+    /// so the user would get a stray character instead of a heading.
+    fn markdown_required_message(markdown_on: bool) -> Option<&'static str> {
+        if markdown_on {
+            None
+        } else {
+            Some("Turn on Markdown to use formatting")
+        }
+    }
+
+    /// `true` when the command may proceed; otherwise reports why not.
+    /// Every Markdown-driven formatting command starts with this guard.
+    fn require_markdown(&mut self, cx: &mut Context<Self>) -> bool {
+        match Self::markdown_required_message(self.markdown_mode) {
+            None => true,
+            Some(message) => {
+                self.status_message = Some(message.to_string());
+                cx.notify();
+                false
+            }
+        }
+    }
+
     /// Wrap the selection in `marker` markdown (the same source-level
     /// syntax the export parser reads back).
     fn wrap_selection(&mut self, marker: &str, cx: &mut Context<Self>) {
@@ -2594,11 +2619,17 @@ impl SylphApp {
     }
 
     fn bold_text(&mut self, _: &BoldText, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.require_markdown(cx) {
+            return;
+        }
         self.wrap_selection("**", cx);
         cx.notify();
     }
 
     fn italic_text(&mut self, _: &ItalicText, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.require_markdown(cx) {
+            return;
+        }
         self.wrap_selection("*", cx);
         cx.notify();
     }
@@ -2609,11 +2640,17 @@ impl SylphApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.require_markdown(cx) {
+            return;
+        }
         self.wrap_selection("~~", cx);
         cx.notify();
     }
 
     fn set_heading(&mut self, level: u8, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.require_markdown(cx) {
+            return;
+        }
         let prefix = "#".repeat(level as usize);
         self.editor.update(cx, |editor, cx| {
             let text = editor.content.clone();
@@ -2805,9 +2842,7 @@ impl SylphApp {
         // Style controls never change the Markdown toggle: when it is OFF,
         // the user asked for literal source, so say so instead of changing
         // modes behind their back.
-        if !self.markdown_mode {
-            self.status_message = Some("Turn on Markdown to use heading styles".into());
-            cx.notify();
+        if !self.require_markdown(cx) {
             return;
         }
 
@@ -6579,5 +6614,23 @@ mod markdown_wysiwyg_tests {
         assert_eq!(block_status("", 0), (1, 1));
         // A byte offset inside a multi-byte character must not panic.
         assert_eq!(block_status("a\u{1F642}b", 2), (1, 1));
+    }
+
+    #[test]
+    fn formatting_commands_refuse_while_markdown_is_off() {
+        // The refusal policy: with Markdown OFF the guard blocks every
+        // formatting command, so content is left byte-identical instead of
+        // gaining a literal `#` or `**` that would stay literal on canvas
+        // and in export.
+        //
+        // This covers the guard's decision, not the full command path:
+        // building a `SylphApp` needs a gpui test context plus storage,
+        // which this workspace has no harness for yet. Every command
+        // calls this guard as its first statement.
+        assert_eq!(
+            SylphApp::markdown_required_message(false),
+            Some("Turn on Markdown to use formatting")
+        );
+        assert_eq!(SylphApp::markdown_required_message(true), None);
     }
 }

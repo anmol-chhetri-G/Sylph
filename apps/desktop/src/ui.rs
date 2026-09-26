@@ -963,7 +963,7 @@ impl SylphApp {
             6 => "Heading 6",
             _ => "Normal",
         };
-        let heading_enabled = self.markdown_mode;
+        let markdown_on = self.markdown_mode;
         let font_size_display = self.document.body_font_size.round() as i32;
         let controls = div()
             .flex()
@@ -991,14 +991,14 @@ impl SylphApp {
                     )
                     .child(label(
                         heading_label,
-                        if heading_enabled { text } else { muted },
+                        if markdown_on { text } else { muted },
                         12.0,
                     ))
                     .child(icon("⌄", muted, 12.0))
                     .id("heading-style")
                     .tooltip(move |_, cx| {
                         cx.new(|_| {
-                            ToolbarTip(if heading_enabled {
+                            ToolbarTip(if markdown_on {
                                 "Block style — click to cycle Normal → H1 … H6"
                             } else {
                                 "Styles need Markdown mode (toggle in the toolbar)"
@@ -1091,7 +1091,21 @@ impl SylphApp {
             ),
             ("S", "emph-strike", 3, false, "Strikethrough"),
         ] {
-            let button = with_tip(self.compact_button(glyph, active), id, tip);
+            // Markdown OFF = literal text, so B/I/S would only insert raw
+            // markers: dim them and say why. Underline is unwired either
+            // way, so it keeps its own honest tip.
+            let enabled = action == 2 || markdown_on;
+            let button = if enabled {
+                self.compact_button(glyph, active)
+            } else {
+                self.compact_button(glyph, false).opacity(0.45)
+            };
+            let tip = if enabled {
+                tip
+            } else {
+                "Formatting needs Markdown mode"
+            };
+            let button = with_tip(button, id, tip);
             emphasis = emphasis.child(match action {
                 0 => button.on_mouse_down(
                     MouseButton::Left,
@@ -2779,6 +2793,10 @@ impl SylphApp {
         .iter()
         .enumerate()
         {
+            // Heading rows call a Markdown-only command, so they dim with
+            // the rest of the Markdown-driven controls.
+            let markdown_command = title.starts_with("Heading");
+            let enabled = !markdown_command || self.markdown_mode;
             let row = div()
                 .h(px(50.0))
                 .px(px(32.0))
@@ -2788,8 +2806,20 @@ impl SylphApp {
                 .when(index == 0, |s| s.bg(self.ui_panel_low()))
                 .hover(|s| s.bg(self.ui_panel_low()))
                 .cursor_pointer()
-                .child(label(*glyph, if index == 0 { primary } else { muted }, 14.0).w(px(20.0)))
-                .child(label(*title, text, 16.0))
+                .when(!enabled, |s| s.opacity(0.45))
+                .child(
+                    label(
+                        *glyph,
+                        if index == 0 && enabled {
+                            primary
+                        } else {
+                            muted
+                        },
+                        14.0,
+                    )
+                    .w(px(20.0)),
+                )
+                .child(label(*title, if enabled { text } else { muted }, 16.0))
                 .child(
                     label(*shortcut, muted, 12.0)
                         .font_family(MONO_FONT)
