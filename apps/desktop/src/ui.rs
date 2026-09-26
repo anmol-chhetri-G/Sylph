@@ -2,10 +2,10 @@ use crate::{
     heading_level_and_text, heading_metrics_pt, BoldText, CloseOverlay, ContextMenuCopy,
     ContextMenuCut, ContextMenuPaste, CycleBodyFont, CycleHeading, ExportPdf, InsertPageBreak,
     InsertTable, InspectorMode, ItalicText, NavigatorTab, NewDocument, OpenCommandPalette,
-    OpenFindBar, OpenModalShowcase, PasteImage, Redo, SaveDoc, SetPageMargins, SetPageSize,
-    ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, StrikethroughText, SylphApp,
-    ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo,
-    WorkspaceOverlay,
+    OpenFindBar, OpenModalShowcase, PasteImage, Redo, SaveDoc, SaveState, SetPageMargins,
+    SetPageSize, ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, StrikethroughText,
+    SylphApp, ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar,
+    Undo, WorkspaceOverlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -297,6 +297,22 @@ impl SylphApp {
             rgb(0x94a3b8)
         } else {
             rgb(0x515f74)
+        }
+    }
+
+    fn ui_success(&self) -> Rgba {
+        if self.dark_mode {
+            rgb(0x34d399)
+        } else {
+            rgb(0x059669)
+        }
+    }
+
+    fn ui_danger(&self) -> Rgba {
+        if self.dark_mode {
+            rgb(0xf87171)
+        } else {
+            rgb(0xb91c1c)
         }
     }
 
@@ -2700,7 +2716,7 @@ impl SylphApp {
         // Markdown ON counts the blocks export will produce; OFF exports
         // one paragraph per source line, so the line *is* the block.
         let markdown_on = self.markdown_mode;
-        let (position, word_count) = {
+        let (position, word_count, save_state) = {
             let editor = self.editor.read(cx);
             let cursor = editor.cursor_offset();
             let (line, column, words) = cursor_status(&editor.content, cursor);
@@ -2710,15 +2726,17 @@ impl SylphApp {
             } else {
                 format!("Ln {line}, Col {column}")
             };
-            (position, words)
+            (position, words, editor.save_state.clone())
         };
         let page_count = self.page_count(cx);
-        // Never leak build paths here — the save indicator reads like
-        // Word/Docs ("All changes saved") with transient action feedback.
-        let save_state = self
-            .status_message
-            .as_deref()
-            .unwrap_or("All changes saved");
+        // The save indicator always shows the real save state in Word/Docs
+        // wording (never a storage path). Transient action feedback gets
+        // its own slot beside it and clears itself.
+        let save_color = match save_state {
+            SaveState::Saved => self.ui_success(),
+            SaveState::Saving => muted,
+            SaveState::Failed(_) => self.ui_danger(),
+        };
         div()
             .h(px(28.0))
             .w_full()
@@ -2749,11 +2767,18 @@ impl SylphApp {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .when_some(self.status_message.clone(), |row, message| {
+                        row.child(label(message, text, 11.0)).child("·")
+                    })
                     .child("English (US)")
                     .child("·")
                     .child("UTF-8")
                     .child("·")
-                    .child(label(format!("●  {}", save_state), rgb(0x059669), 11.0))
+                    .child(label(
+                        format!("●  {}", save_state.label()),
+                        save_color,
+                        11.0,
+                    ))
                     .child("·")
                     .child(icon("⌕", muted, 12.0))
                     .child(
@@ -2771,13 +2796,6 @@ impl SylphApp {
                             ),
                     )
                     .child(format!("{}%", self.zoom_percent)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.status_message = Some("All changes are saved locally".to_string());
-                    cx.notify();
-                }),
             )
     }
 

@@ -56,6 +56,34 @@ struct EditAction {
     selection_before: Range<usize>,
 }
 
+/// Where the typed text stands relative to storage. The status bar shows
+/// this instead of assuming every save worked.
+#[derive(Clone, Debug, PartialEq)]
+enum SaveState {
+    Saved,
+    /// Edited; waiting for the autosave debounce or the write itself.
+    Saving,
+    Failed(String),
+}
+
+impl SaveState {
+    fn from_result(result: Result<(), Box<dyn std::error::Error>>) -> Self {
+        match result {
+            Ok(()) => Self::Saved,
+            Err(e) => Self::Failed(e.to_string()),
+        }
+    }
+
+    /// Status-bar wording (Word/Docs style); a failure says why.
+    fn label(&self) -> String {
+        match self {
+            Self::Saved => "All changes saved".to_string(),
+            Self::Saving => "Saving…".to_string(),
+            Self::Failed(reason) => format!("Save failed: {reason}"),
+        }
+    }
+}
+
 struct TextInput {
     focus_handle: FocusHandle,
     content: String,
@@ -90,6 +118,7 @@ struct TextInput {
     show_line_numbers: bool,
     word_wrap: bool,
     save_task: Option<Task<()>>,
+    save_state: SaveState,
 }
 
 impl TextInput {
@@ -960,25 +989,39 @@ impl TextInput {
     }
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_now(cx);
+    }
+
+    /// Write the text immediately and record whether it worked. Supersedes
+    /// a pending autosave, which would only write the same text again.
+    fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_task.take();
         let text = self.content.clone();
         let _ = std::fs::write(data_path("document.txt"), &text);
-        let _ = self.storage.save_text(self.doc_id, &text);
+        self.save_state = SaveState::from_result(self.storage.save_text(self.doc_id, &text));
         cx.notify();
+        self.save_state == SaveState::Saved
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.save_task.take();
+        self.save_state = SaveState::Saving;
         let doc_id = self.doc_id;
         let text = self.content.clone();
         self.save_task = Some(cx.spawn(
-            move |_this: WeakEntity<TextInput>, _cx: &mut gpui::AsyncApp| async move {
+            async move |this: WeakEntity<TextInput>, cx: &mut gpui::AsyncApp| {
                 // Keep writes out of the typing path while saving shortly after
                 // the user pauses. Dropping the previous task debounces bursts.
                 gpui::Timer::after(std::time::Duration::from_millis(750)).await;
                 let _ = std::fs::write(data_path("document.txt"), &text);
-                if let Ok(storage) = sylph_storage::Storage::open() {
-                    let _ = storage.save_text(doc_id, &text);
-                }
+                let state = SaveState::from_result(
+                    sylph_storage::Storage::open()
+                        .and_then(|storage| storage.save_text(doc_id, &text)),
+                );
+                let _ = this.update(cx, |this, cx| {
+                    this.save_state = state;
+                    cx.notify();
+                });
             },
         ));
     }
@@ -1821,6 +1864,9 @@ impl ExportFormat {
     }
 }
 
+/// How long transient status-bar feedback ("Table inserted") stays up.
+const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
 struct SylphApp {
     editor: Entity<TextInput>,
     document: sylph_core::document::Document,
@@ -1838,7 +1884,10 @@ struct SylphApp {
     documents: Vec<(i64, String)>,
     dark_mode: bool,
     ai_panel: AiPanelState,
+    /// Transient action feedback; set it with `set_status` so it clears
+    /// itself. The save indicator is separate (`TextInput::save_state`).
     status_message: Option<String>,
+    status_clear_task: Option<Task<()>>,
     editing_field: EditingField,
     field_input: String,
     paragraph_spacing: f32,
@@ -1921,12 +1970,7 @@ actions!(
 
 impl SylphApp {
     fn save_doc(&mut self, _: &SaveDoc, _window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.update(cx, |editor, cx| {
-            let text = editor.content.clone();
-            let _ = std::fs::write(data_path("document.txt"), &text);
-            let _ = editor.storage.save_text(editor.doc_id, &text);
-            cx.notify();
-        });
+        self.editor.update(cx, |editor, cx| editor.save_now(cx));
     }
 
     fn summarize_doc(&mut self, _: &SummarizeDoc, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2253,11 +2297,14 @@ impl SylphApp {
             .unwrap_or_default();
     }
 
-    fn save_current_document(&mut self, cx: &mut Context<Self>) {
-        self.editor.update(cx, |editor, _cx| {
-            let text = editor.content.clone();
-            let _ = editor.storage.save_text(editor.doc_id, &text);
-        });
+    /// `false` when the text could not be written. Callers about to replace
+    /// the editor content must then stay put, or the unsaved text is lost.
+    fn save_current_document(&mut self, cx: &mut Context<Self>) -> bool {
+        let saved = self.editor.update(cx, |editor, cx| editor.save_now(cx));
+        if !saved {
+            self.set_status("Could not save this document, so it stays open", cx);
+        }
+        saved
     }
 
     fn load_document_by_id(&mut self, doc_id: i64, cx: &mut Context<Self>) {
@@ -2286,6 +2333,8 @@ impl SylphApp {
             editor.scroll_offset_y = px(0.0);
             editor.undo_stack.clear();
             editor.redo_stack.clear();
+            // The text just came from storage, so there is nothing to save.
+            editor.save_state = SaveState::Saved;
             cx.notify();
         });
         // Structured blocks are not persisted with the legacy text-only storage yet.
@@ -2296,13 +2345,15 @@ impl SylphApp {
     }
 
     fn new_document(&mut self, _: &NewDocument, _window: &mut Window, cx: &mut Context<Self>) {
-        self.save_current_document(cx);
-        let doc_id = self
-            .editor
-            .read(cx)
-            .storage
-            .create_document("Untitled")
-            .unwrap_or(1);
+        if !self.save_current_document(cx) {
+            return;
+        }
+        let created = self.editor.read(cx).storage.create_document("Untitled");
+        let Ok(doc_id) = created else {
+            // Never fall back to some other document id: say so and stay.
+            self.set_status("Could not create a new document", cx);
+            return;
+        };
         self.load_document_by_id(doc_id, cx);
         self.load_documents(cx);
         cx.notify();
@@ -2313,7 +2364,9 @@ impl SylphApp {
         if doc_id == current_id {
             return;
         }
-        self.save_current_document(cx);
+        if !self.save_current_document(cx) {
+            return;
+        }
         self.load_document_by_id(doc_id, cx);
         cx.notify();
     }
@@ -2435,12 +2488,12 @@ impl SylphApp {
         };
         // The status bar shows the file name, never the internal
         // storage path (Google Docs / Word say "Exported · x").
-        self.status_message = Some(if result.starts_with("Exported to ") {
+        let message = if result.starts_with("Exported to ") {
             format!("Exported · {}", file_name)
         } else {
             result.replace(&sylph_storage::data_dir().display().to_string(), "")
-        });
-        cx.notify();
+        };
+        self.set_status(message, cx);
     }
 
     fn export_docx(&mut self, _: &ExportDocx, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2468,14 +2521,14 @@ impl SylphApp {
     fn add_cover_page(&mut self, _: &AddCoverPage, _window: &mut Window, cx: &mut Context<Self>) {
         if self.document.has_cover_page() {
             self.document.remove_cover_page();
-            self.status_message = Some("Cover page removed".to_string());
+            self.set_status("Cover page removed", cx);
         } else {
             let mut cp = sylph_core::document::CoverPageData::with_template(
                 sylph_core::document::CoverTemplate::Classic,
             );
             cp.title = self.doc_title.clone();
             self.document.set_cover_page(cp);
-            self.status_message = Some("Cover page added (Classic)".to_string());
+            self.set_status("Cover page added (Classic)", cx);
         }
         cx.notify();
     }
@@ -2491,9 +2544,9 @@ impl SylphApp {
         if std::fs::write(&path, bytes).is_ok() {
             self.document
                 .push_block(sylph_core::document::Block::image(&path));
-            self.status_message = Some(format!("Image added: {}", filename));
+            self.set_status(format!("Image added: {}", filename), cx);
         } else {
-            self.status_message = Some("Could not store the selected image".to_string());
+            self.set_status("Could not store the selected image", cx);
         }
         cx.notify();
     }
@@ -2508,7 +2561,7 @@ impl SylphApp {
             "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff",
         ];
         if !allowed.contains(&extension.as_str()) {
-            self.status_message = Some(format!("Unsupported image type: .{}", extension));
+            self.set_status(format!("Unsupported image type: .{}", extension), cx);
             cx.notify();
             return;
         }
@@ -2523,15 +2576,15 @@ impl SylphApp {
             let path = destination.to_string_lossy().into_owned();
             self.document
                 .push_block(sylph_core::document::Block::image(&path));
-            self.status_message = Some(format!("Image added: {}", filename));
+            self.set_status(format!("Image added: {}", filename), cx);
         } else {
-            self.status_message = Some("Could not copy the selected image".to_string());
+            self.set_status("Could not copy the selected image", cx);
         }
         cx.notify();
     }
 
     fn open_image_picker(&mut self, cx: &mut Context<Self>) {
-        self.status_message = Some("Choose an image file…".to_string());
+        self.set_status("Choose an image file…", cx);
         let options = PathPromptOptions {
             files: true,
             directories: false,
@@ -2548,10 +2601,7 @@ impl SylphApp {
                 }
                 Ok(Err(error)) => {
                     let message = format!("Image picker unavailable: {}", error);
-                    let _ = this.update(cx, |this, cx| {
-                        this.status_message = Some(message);
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.set_status(message, cx));
                 }
                 _ => {}
             }
@@ -2581,6 +2631,25 @@ impl SylphApp {
         self.open_image_picker(cx);
     }
 
+    /// Show transient feedback in the status bar; it clears itself after
+    /// `STATUS_MESSAGE_TTL`. A newer message replaces the pending clear.
+    fn set_status(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.status_message = Some(message.clone());
+        self.status_clear_task = Some(cx.spawn(
+            async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
+                gpui::Timer::after(STATUS_MESSAGE_TTL).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.status_message.as_deref() == Some(message.as_str()) {
+                        this.status_message = None;
+                        cx.notify();
+                    }
+                });
+            },
+        ));
+        cx.notify();
+    }
+
     /// Why a formatting command must refuse, or `None` when it may run.
     /// Markdown OFF means literal text: inserting `# ` or `**` would only
     /// add raw markers that stay literal on the canvas *and* in the export,
@@ -2599,8 +2668,7 @@ impl SylphApp {
         match Self::markdown_required_message(self.markdown_mode) {
             None => true,
             Some(message) => {
-                self.status_message = Some(message.to_string());
-                cx.notify();
+                self.set_status(message, cx);
                 false
             }
         }
@@ -2673,7 +2741,7 @@ impl SylphApp {
         // Insert a 3x3 table
         let table_block = sylph_core::document::Block::table(3, 3);
         self.document.push_block(table_block);
-        self.status_message = Some("Table inserted (3×3)".to_string());
+        self.set_status("Table inserted (3×3)", cx);
         cx.notify();
     }
 
@@ -2765,7 +2833,7 @@ impl SylphApp {
         // unified with TextInput in the editor-kernel phase.
         self.document
             .push_block(sylph_core::document::Block::page_break());
-        self.status_message = Some("Page break inserted".to_string());
+        self.set_status("Page break inserted", cx);
         cx.notify();
     }
 
@@ -2775,7 +2843,7 @@ impl SylphApp {
             sylph_core::document::PageSize::A4 => sylph_core::document::PageSize::Letter,
             sylph_core::document::PageSize::Letter => sylph_core::document::PageSize::A4,
         });
-        self.status_message = Some(format!("Page size: {}", self.document.page_size.name()));
+        self.set_status(format!("Page size: {}", self.document.page_size.name()), cx);
         cx.notify();
     }
 
@@ -2808,7 +2876,10 @@ impl SylphApp {
             sylph_core::document::PageMargins::default()
         };
         self.document.set_margins(new_margins);
-        self.status_message = Some(format!("Margins: {:.1}pt", self.document.page_margins.top));
+        self.set_status(
+            format!("Margins: {:.1}pt", self.document.page_margins.top),
+            cx,
+        );
         cx.notify();
     }
 
@@ -2824,13 +2895,13 @@ impl SylphApp {
             1.0
         };
         self.document.set_line_spacing(next);
-        self.status_message = Some(format!("Line spacing: {:.2}", next));
+        self.set_status(format!("Line spacing: {:.2}", next), cx);
         cx.notify();
     }
 
     fn set_line_spacing_value(&mut self, value: f32, _window: &mut Window, cx: &mut Context<Self>) {
         self.document.set_line_spacing(value);
-        self.status_message = Some(format!("Line spacing: {:.2}", value));
+        self.set_status(format!("Line spacing: {:.2}", value), cx);
         cx.notify();
     }
 
@@ -2892,7 +2963,7 @@ impl SylphApp {
             6 => "Heading 6",
             _ => "Normal",
         };
-        self.status_message = Some(format!("Style: {}", label));
+        self.set_status(format!("Style: {}", label), cx);
         cx.notify();
     }
 
@@ -2912,14 +2983,14 @@ impl SylphApp {
             .map(|i| (i + 1) % fonts.len())
             .unwrap_or(0);
         self.document.set_body_font(fonts[next_idx]);
-        self.status_message = Some(format!("Font: {}", fonts[next_idx]));
+        self.set_status(format!("Font: {}", fonts[next_idx]), cx);
         cx.notify();
     }
 
     fn adjust_body_font_size(&mut self, delta: i8, _window: &mut Window, cx: &mut Context<Self>) {
         let new_size = (self.document.body_font_size + delta as f32).clamp(8.0, 72.0);
         self.document.set_body_font_size(new_size);
-        self.status_message = Some(format!("Font size: {}", new_size.round() as i32));
+        self.set_status(format!("Font size: {}", new_size.round() as i32), cx);
         cx.notify();
     }
 
@@ -5652,6 +5723,7 @@ fn main() {
                         show_line_numbers: false,
                         word_wrap: true,
                         save_task: None,
+                        save_state: SaveState::Saved,
                     });
                     cx.new(|cx| {
                         let keystroke_subscription = cx.observe_keystrokes(
@@ -5705,6 +5777,7 @@ fn main() {
                             ruler_visible: true,
                             zoom_percent: 100,
                             image_picker_task: None,
+                            status_clear_task: None,
                             _keystroke_subscription: keystroke_subscription,
                         }
                     })
@@ -6652,5 +6725,25 @@ mod markdown_wysiwyg_tests {
             Some("Turn on Markdown to use formatting")
         );
         assert_eq!(SylphApp::markdown_required_message(true), None);
+    }
+}
+
+#[cfg(test)]
+mod save_state_tests {
+    use super::SaveState;
+
+    #[test]
+    fn save_state_reports_the_real_result() {
+        assert_eq!(SaveState::from_result(Ok(())), SaveState::Saved);
+        let failed = SaveState::from_result(Err("disk full".into()));
+        assert_eq!(failed, SaveState::Failed("disk full".to_string()));
+        // A failure says why instead of claiming the changes were saved.
+        assert_eq!(failed.label(), "Save failed: disk full");
+    }
+
+    #[test]
+    fn save_state_labels_use_word_docs_wording() {
+        assert_eq!(SaveState::Saved.label(), "All changes saved");
+        assert_eq!(SaveState::Saving.label(), "Saving…");
     }
 }
