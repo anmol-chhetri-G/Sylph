@@ -165,6 +165,14 @@ pub(crate) fn block_status(content: &str, cursor: usize) -> (usize, usize) {
     (index.clamp(1, total), total)
 }
 
+/// "A4 · 210 × 297 mm": the paper format with its real dimensions, derived
+/// from the model's points (1 pt = 25.4 / 72 mm) instead of hard-coded.
+pub(crate) fn page_format_label(size: &sylph_core::document::PageSize) -> String {
+    let (w_pt, h_pt) = size.dimensions();
+    let mm = |pt: f32| (pt * 25.4 / 72.0).round();
+    format!("{} · {} × {} mm", size.name(), mm(w_pt), mm(h_pt))
+}
+
 /// 1-based page of the caret within the typed text (Markdown mode): one
 /// more than the page breaks the export parser finds above the caret's
 /// line. A `\newpage` on the caret's own line still belongs to the page it
@@ -2543,12 +2551,8 @@ impl SylphApp {
                             .justify_between()
                             .bg(panel)
                             .child(
-                                label(
-                                    format!("{} · 210 × 297 mm", self.document.page_size.name()),
-                                    text,
-                                    12.0,
-                                )
-                                .font_weight(gpui::FontWeight(600.0)),
+                                label(page_format_label(&self.document.page_size), text, 12.0)
+                                    .font_weight(gpui::FontWeight(600.0)),
                             )
                             .child(icon("⌄", muted, 14.0))
                             .on_mouse_down(
@@ -2910,12 +2914,16 @@ impl SylphApp {
             SaveState::Saving => muted,
             SaveState::Failed(_) => self.ui_danger(),
         };
+        // The position and word count never shrink; long transient
+        // messages and save errors truncate with an ellipsis instead of
+        // squeezing the groups into each other ("Col 169 words…").
         div()
             .h(px(28.0))
             .w_full()
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(16.0))
             .px(px(8.0))
             .bg(self.ui_panel_low())
             .border_t_1()
@@ -2932,29 +2940,33 @@ impl SylphApp {
                     muted,
                     11.0,
                 )
-                .font_family(MONO_FONT),
+                .font_family(MONO_FONT)
+                .flex_shrink_0(),
             )
             .child(
                 label(format!("{} words", word_count), text, 11.0)
-                    .font_weight(gpui::FontWeight(500.0)),
+                    .font_weight(gpui::FontWeight(500.0))
+                    .flex_shrink_0(),
             )
             .child(
                 div()
+                    .min_w(px(0.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
                     .when_some(self.status_message.clone(), |row, message| {
-                        row.child(label(message, text, 11.0)).child("·")
+                        row.child(label(message, text, 11.0).min_w(px(0.0)).truncate())
+                            .child("·")
                     })
-                    .child("English (US)")
+                    .child(div().flex_shrink_0().child("English (US)"))
                     .child("·")
-                    .child("UTF-8")
+                    .child(div().flex_shrink_0().child("UTF-8"))
                     .child("·")
-                    .child(label(
-                        format!("●  {}", save_state.label()),
-                        save_color,
-                        11.0,
-                    ))
+                    .child(
+                        label(format!("●  {}", save_state.label()), save_color, 11.0)
+                            .max_w(px(320.0))
+                            .truncate(),
+                    )
                     .child("·")
                     .child(icon("⌕", muted, 12.0))
                     .child(
@@ -3150,20 +3162,7 @@ impl SylphApp {
                     .justify_between()
                     .bg(self.ui_panel_low())
                     .child(label(
-                        format!(
-                            "{} · {} × {} mm",
-                            self.document.page_size.name(),
-                            if self.document.page_size == sylph_core::document::PageSize::A4 {
-                                210
-                            } else {
-                                216
-                            },
-                            if self.document.page_size == sylph_core::document::PageSize::A4 {
-                                297
-                            } else {
-                                279
-                            }
-                        ),
+                        page_format_label(&self.document.page_size),
                         text,
                         13.0,
                     ))
@@ -3494,6 +3493,17 @@ impl Render for SylphApp {
 #[cfg(test)]
 mod chrome_tests {
     use super::*;
+
+    #[test]
+    fn page_format_label_uses_real_dimensions() {
+        use sylph_core::document::PageSize;
+        assert_eq!(page_format_label(&PageSize::A4), "A4 · 210 × 297 mm");
+        // Letter was shown as "210 × 297 mm" in the inspector.
+        assert_eq!(
+            page_format_label(&PageSize::Letter),
+            "Letter · 216 × 279 mm"
+        );
+    }
 
     #[test]
     fn ruler_marks_follow_page_geometry() {
