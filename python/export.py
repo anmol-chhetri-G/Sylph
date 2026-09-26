@@ -575,6 +575,46 @@ def markdown_to_markdown(text: str, output_path: str) -> bool:
     return True
 
 
+# Portrait page sizes in points, mirroring sylph-core's PageSize::dimensions().
+_PAGE_SIZES_PT = {'A4': (595.0, 842.0), 'Letter': (612.0, 792.0)}
+# Sylph's default margins (PageMargins::default): 1 inch on every side.
+_DEFAULT_MARGINS_PT = {'top': 72.0, 'bottom': 72.0, 'left': 72.0, 'right': 72.0}
+_MM_PER_PT = 25.4 / 72.0
+
+
+def _page_setup(doc_data: dict):
+    """(width_pt, height_pt, margins_pt) of the document, landscape applied.
+
+    Keys a JSON document lacks fall back to Sylph's own defaults (A4,
+    1-inch margins, portrait), never to the export library's defaults,
+    so the file matches the page the editor shows.
+    """
+    width, height = _PAGE_SIZES_PT.get(doc_data.get('page_size'), _PAGE_SIZES_PT['A4'])
+    if doc_data.get('landscape'):
+        width, height = height, width
+    margins = dict(_DEFAULT_MARGINS_PT)
+    margins.update(doc_data.get('page_margins') or {})
+    return width, height, margins
+
+
+def _apply_page_setup_docx(doc, doc_data: dict):
+    """Give every section the document's page size, orientation, margins."""
+    from docx.shared import Pt
+    from docx.enum.section import WD_ORIENT
+
+    width, height, margins = _page_setup(doc_data)
+    for section in doc.sections:
+        section.orientation = (
+            WD_ORIENT.LANDSCAPE if doc_data.get('landscape') else WD_ORIENT.PORTRAIT
+        )
+        section.page_width = Pt(width)
+        section.page_height = Pt(height)
+        section.top_margin = Pt(margins['top'])
+        section.bottom_margin = Pt(margins['bottom'])
+        section.left_margin = Pt(margins['left'])
+        section.right_margin = Pt(margins['right'])
+
+
 def rich_docx(doc_json: str, output_path: str) -> bool:
     """Export a rich document (JSON) to DOCX format.
 
@@ -599,6 +639,9 @@ def rich_docx(doc_json: str, output_path: str) -> bool:
 
     doc_data = json.loads(doc_json)
     doc = Document()
+    # python-docx's template is Letter with 1.25" side margins; use the
+    # document's own page setup instead.
+    _apply_page_setup_docx(doc, doc_data)
 
     # Set default font
     style = doc.styles['Normal']
@@ -868,20 +911,28 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
     from fpdf import FPDF
 
     doc_data = json.loads(doc_json)
+    # The document's page, not fpdf's default (A4 with 10 mm margins).
+    width, height, margins = _page_setup(doc_data)
+    bottom_mm = margins['bottom'] * _MM_PER_PT
 
     class SylphPDF(FPDF):
         def header(self):
             pass
 
         def footer(self):
-            self.set_y(-15)
+            # Centre the 10 mm page-number cell in the bottom margin so it
+            # never overlaps body text, whatever the margin preset.
+            self.set_y(-(bottom_mm / 2 + 5))
             self.set_font('Helvetica', 'I', 8)
             self.set_text_color(128, 128, 128)
             self.cell(0, 10, f'Page {self.page_no()}/{{nb}}', align='C')
 
-    pdf = SylphPDF()
+    pdf = SylphPDF(unit='mm', format=(width * _MM_PER_PT, height * _MM_PER_PT))
+    pdf.set_margins(
+        margins['left'] * _MM_PER_PT, margins['top'] * _MM_PER_PT, margins['right'] * _MM_PER_PT
+    )
     pdf.alias_nb_pages()
-    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_auto_page_break(auto=True, margin=bottom_mm)
     pdf.add_page()
 
     for block in doc_data.get('blocks', []):

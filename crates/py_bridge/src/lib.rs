@@ -328,6 +328,85 @@ mod tests {
         assert!(result.starts_with("Exported"), "got: {result}");
     }
 
+    /// `word/document.xml` of an exported .docx, read with Python's zipfile.
+    fn docx_document_xml(path: &str) -> String {
+        with_python_module("zipfile", |zipfile| {
+            let archive = zipfile.call_method1("ZipFile", (path,))?;
+            let xml = archive.call_method1("read", ("word/document.xml",))?;
+            xml.call_method1("decode", ("utf-8",))?.extract::<String>()
+        })
+        .expect("readable docx")
+    }
+
+    fn pdf_has(path: &str, needle: &str) -> bool {
+        let pdf = std::fs::read(path).expect("readable pdf");
+        pdf.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    #[test]
+    fn test_rich_exports_use_the_documents_page_setup() {
+        // Letter with narrow (36 pt) margins: python-docx's own template
+        // is Letter with 1.25" sides and fpdf's default is A4 with 10 mm,
+        // so both must come from the document instead.
+        let doc = r#"{"page_size": "Letter", "landscape": false,
+            "page_margins": {"top": 36.0, "bottom": 36.0, "left": 36.0, "right": 36.0},
+            "blocks": [{"Paragraph": {"runs": [{"text": "x", "styles": []}],
+                "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}]}"#;
+        let r = export_rich_pdf(doc, "/tmp/sylph_test_setup.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        assert!(pdf_has(
+            "/tmp/sylph_test_setup.pdf",
+            "/MediaBox [0 0 612.00 792.00]"
+        ));
+
+        let r = export_rich_docx(doc, "/tmp/sylph_test_setup.docx");
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let xml = docx_document_xml("/tmp/sylph_test_setup.docx");
+        // Twips: 1 pt = 20. Letter is 612 × 792 pt; margins 36 pt.
+        assert!(xml.contains(r#"<w:pgSz w:w="12240" w:h="15840""#), "{xml}");
+        for side in ["top", "right", "bottom", "left"] {
+            assert!(
+                xml.contains(&format!(r#"w:{side}="720""#)),
+                "{side} in {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rich_exports_default_to_a4_and_honour_landscape() {
+        // No page keys at all: Sylph's defaults (A4, 1-inch margins), not
+        // the libraries' — the editor shows A4 for a new document.
+        let body = r#""blocks": [{"Paragraph": {"runs": [{"text": "x", "styles": []}],
+            "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}]"#;
+        let portrait = format!("{{{body}}}");
+        let r = export_rich_docx(&portrait, "/tmp/sylph_test_a4.docx");
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let xml = docx_document_xml("/tmp/sylph_test_a4.docx");
+        assert!(xml.contains(r#"<w:pgSz w:w="11900" w:h="16840""#), "{xml}");
+        assert!(xml.contains(r#"w:left="1440""#), "{xml}");
+        let r = export_rich_pdf(&portrait, "/tmp/sylph_test_a4.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        assert!(pdf_has(
+            "/tmp/sylph_test_a4.pdf",
+            "/MediaBox [0 0 595.00 842.00]"
+        ));
+
+        let landscape = format!(r#"{{"page_size": "A4", "landscape": true, {body}}}"#);
+        let r = export_rich_pdf(&landscape, "/tmp/sylph_test_a4_landscape.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        assert!(pdf_has(
+            "/tmp/sylph_test_a4_landscape.pdf",
+            "/MediaBox [0 0 842.00 595.00]"
+        ));
+        let r = export_rich_docx(&landscape, "/tmp/sylph_test_a4_landscape.docx");
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let xml = docx_document_xml("/tmp/sylph_test_a4_landscape.docx");
+        assert!(
+            xml.contains(r#"w:w="16840" w:h="11900" w:orient="landscape""#),
+            "{xml}"
+        );
+    }
+
     #[test]
     fn test_export_rich_markdown() {
         let doc = r#"{"blocks": [
