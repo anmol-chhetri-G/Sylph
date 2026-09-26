@@ -493,20 +493,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
         elif btype == 'table':
             rows = block.get('rows', [])
             if rows:
-                num_cols = max(len(r) for r in rows)
-                col_w = (pdf.w - pdf.l_margin - pdf.r_margin) / max(num_cols, 1)
-                for ri, row in enumerate(rows):
-                    pdf.set_x(pdf.l_margin)
-                    is_header = ri == 0
-                    pdf.set_font('Helvetica', 'B' if is_header else '', 10)
-                    if is_header:
-                        pdf.set_fill_color(230, 230, 230)
-                    else:
-                        pdf.set_fill_color(255, 255, 255)
-                    for ci in range(num_cols):
-                        txt = row[ci] if ci < len(row) else ''
-                        pdf.cell(col_w, 8, _pdf_safe(txt[:60]), border=1, fill=is_header)
-                    pdf.ln()
+                _pdf_table(pdf, rows)
                 pdf.ln(2)
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
@@ -529,6 +516,36 @@ def _pdf_safe(text: str) -> str:
         .encode('latin-1', errors='replace')
         .decode('latin-1')
     )
+
+
+def _pdf_table(pdf, rows, col_widths=None):
+    """Draw a table whose cells wrap instead of being cut short.
+
+    `rows` are lists of plain strings and the first row is the header.
+    fpdf2's table grows each row to its tallest cell and repeats the header
+    after a page break, so no cell text is ever dropped. Text uses the
+    document's body family, one point smaller than the body.
+    """
+    from fpdf.fonts import FontFace
+
+    num_cols = max(len(r) for r in rows)
+    if col_widths is not None and len(col_widths) != num_cols:
+        col_widths = None  # equal widths rather than a mismatched layout
+    _family, size, _spacing = _pdf_body(pdf)
+    _pdf_font(pdf, '', -1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_x(pdf.l_margin)
+    with pdf.table(
+        col_widths=col_widths,
+        width=pdf.epw,
+        text_align='LEFT',
+        line_height=_pdf_line_height(size - 1, 1.3),
+        headings_style=FontFace(emphasis='BOLD', fill_color=(230, 230, 230)),
+    ) as table:
+        for row in rows:
+            cells = table.row()
+            for ci in range(num_cols):
+                cells.cell(_pdf_safe(row[ci] if ci < len(row) else ''))
 
 
 def _render_inline_pdf(pdf, text: str, indent: int = 0):
@@ -1296,27 +1313,13 @@ def _render_table_pdf(pdf, table_data: dict):
     if not rows:
         return
 
-    num_cols = max(len(r) for r in rows)
-    col_width = (pdf.w - pdf.l_margin - pdf.r_margin) / num_cols
-
-    # Captions leave text color gray; tables must not inherit that.
-    pdf.set_text_color(0, 0, 0)
-    _pdf_font(pdf, '', -1)
-    for i, row in enumerate(rows):
-        pdf.set_x(pdf.l_margin)
-        for j, cell in enumerate(row):
-            if j < num_cols:
-                text = ''.join(r.get('text', '') for r in cell.get('runs', []))
-                is_header = i == 0
-                if is_header:
-                    _pdf_font(pdf, 'B', -1)
-                    pdf.set_fill_color(230, 230, 230)
-                else:
-                    _pdf_font(pdf, '', -1)
-                    pdf.set_fill_color(255, 255, 255)
-                # Use explicit width and ensure x position
-                pdf.cell(col_width, 8, _pdf_safe(text[:50]), border=1, fill=is_header)
-        pdf.ln()
+    # Cell text is the concatenated runs; the model's column widths are
+    # percentages, which fpdf2 takes as relative widths.
+    text_rows = [
+        [''.join(r.get('text', '') for r in cell.get('runs', [])) for cell in row]
+        for row in rows
+    ]
+    _pdf_table(pdf, text_rows, col_widths=table_data.get('column_widths') or None)
 
     caption = table_data.get('caption')
     if caption:

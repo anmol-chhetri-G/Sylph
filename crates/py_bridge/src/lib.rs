@@ -455,6 +455,53 @@ mod tests {
         );
     }
 
+    /// Text drawn on the pages of a PDF. fpdf2 deflates page streams, so
+    /// they are inflated with Python's zlib before searching.
+    fn pdf_text(path: &str) -> String {
+        const INFLATE: &std::ffi::CStr = cr#"
+import re, zlib
+
+def text(path):
+    data = open(path, 'rb').read()
+    out = []
+    for m in re.finditer(rb'stream\r?\n(.*?)\r?\nendstream', data, re.S):
+        try:
+            out.append(zlib.decompress(m.group(1)))
+        except zlib.error:
+            out.append(m.group(1))
+    return b'\n'.join(out).decode('latin-1')
+"#;
+        with_python_module("zlib", |zlib| {
+            let helper = PyModule::from_code(zlib.py(), INFLATE, c"pdf_text.py", c"pdf_text")?;
+            helper.call_method1("text", (path,))?.extract::<String>()
+        })
+        .expect("readable pdf")
+    }
+
+    #[test]
+    fn test_pdf_table_cells_wrap_instead_of_being_cut() {
+        // Cells were cut to 50 characters (60 in the plain-markdown path):
+        // a silent content drop. A long cell's last word must be drawn.
+        let long = format!("{}TAILWORD", "alpha ".repeat(30));
+        let doc = format!(
+            r#"{{"blocks": [{{"Table": {{"data": {{"rows": [
+                [{{"runs": [{{"text": "Header", "styles": []}}]}}],
+                [{{"runs": [{{"text": "{long}", "styles": []}}]}}]
+            ], "caption": null, "column_widths": [100.0]}}}}}}]}}"#
+        );
+        let r = export_rich_pdf(&doc, "/tmp/sylph_test_table_wrap.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        let text = pdf_text("/tmp/sylph_test_table_wrap.pdf");
+        assert!(text.contains("Header"), "header row drawn");
+        assert!(text.contains("TAILWORD"), "rich table cell cut short");
+
+        let markdown = format!("| H |\n|---|\n| {long} |\n");
+        let r = export_to_pdf(&markdown, "/tmp/sylph_test_table_wrap_md.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        let text = pdf_text("/tmp/sylph_test_table_wrap_md.pdf");
+        assert!(text.contains("TAILWORD"), "markdown table cell cut short");
+    }
+
     #[test]
     fn test_rich_pdf_maps_the_typeface_to_a_core_font() {
         // fpdf2 embeds only the 14 core fonts: serif faces map to Times,
