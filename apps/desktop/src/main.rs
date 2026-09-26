@@ -4519,7 +4519,25 @@ fn looks_like_link_target(url: &str) -> bool {
 /// strikethrough, links `[t](u)`, inline images `![a](p)` (alt as plain
 /// text — block-level images are detected by the line scanner), autolinks
 /// `<https://...>`, and backslash escapes `\*`.
-fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
+/// One piece of an inline Markdown source string, in source order.
+#[derive(Clone, Debug, PartialEq)]
+enum InlinePiece {
+    /// Source bytes the export drops: emphasis markers, the `\` of an
+    /// escape, and the syntax around a link's text or an image's alt text.
+    Syntax(usize),
+    /// Source bytes the export keeps verbatim, as part of output run `run`.
+    Text {
+        len: usize,
+        run: usize,
+        styles: Vec<doc::SpanStyle>,
+    },
+}
+
+/// The one inline scanner behind both the export (`parse_inline_runs`)
+/// and the Markdown-mode canvas. It says, byte for byte, which source text
+/// is kept (and in which styled run) and which is syntax, so the canvas
+/// hides exactly what the export drops and styles exactly what it styles.
+fn inline_pieces(text: &str) -> Vec<InlinePiece> {
     let markers: [(&str, Vec<doc::SpanStyle>); 5] = [
         ("***", vec![doc::SpanStyle::BoldItalic]),
         ("**", vec![doc::SpanStyle::Bold]),
@@ -4527,15 +4545,26 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
         ("`", vec![doc::SpanStyle::Code]),
         ("*", vec![doc::SpanStyle::Italic]),
     ];
-    let mut runs: Vec<doc::TextRun> = Vec::new();
-    let mut plain = String::new();
+    let mut pieces: Vec<InlinePiece> = Vec::new();
+    let mut next_run = 0usize;
+    // The open run of plain text, if any; a styled run closes it.
+    let mut plain_run: Option<usize> = None;
     let bytes = text.as_bytes();
     let mut i = 0;
     let n = text.len();
-    let flush_plain = |plain: &mut String, runs: &mut Vec<doc::TextRun>| {
-        if !plain.is_empty() {
-            runs.push(doc::TextRun::plain(std::mem::take(plain)));
-        }
+    let push_plain = |len: usize,
+                      pieces: &mut Vec<InlinePiece>,
+                      plain_run: &mut Option<usize>,
+                      next_run: &mut usize| {
+        let run = *plain_run.get_or_insert_with(|| {
+            *next_run += 1;
+            *next_run - 1
+        });
+        pieces.push(InlinePiece::Text {
+            len,
+            run,
+            styles: Vec::new(),
+        });
     };
     while i < n {
         let c = bytes[i];
@@ -4543,13 +4572,15 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
 
         // 1. Backslash escape: ASCII punctuation after `\` is literal.
         if c == b'\\' && i + 1 < n && bytes[i + 1].is_ascii_punctuation() {
-            plain.push(bytes[i + 1] as char);
+            pieces.push(InlinePiece::Syntax(1));
+            push_plain(1, &mut pieces, &mut plain_run, &mut next_run);
             i += 2;
             continue;
         }
 
-        // 2. Inline link `[text](url)` — inner text is parsed recursively
-        // so emphasis inside links survives; every run gets the Link style.
+        // 2. Inline link `[text](url)`: the inner text is scanned
+        // recursively so emphasis inside links survives; every run gets
+        // the Link style.
         if c == b'[' {
             if let Some(rel) = rest.find("](") {
                 let inner_start = i + 1;
@@ -4560,13 +4591,33 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
                     let inner = &text[inner_start..inner_end];
                     let url = text[url_start..url_end].trim();
                     if !inner.is_empty() && looks_like_link_target(url) {
-                        let mut inner_runs = parse_inline_runs(inner);
-                        if !inner_runs.is_empty() {
-                            flush_plain(&mut plain, &mut runs);
-                            for r in &mut inner_runs {
-                                r.styles.push(doc::SpanStyle::Link(url.to_string()));
+                        let inner_pieces = inline_pieces(inner);
+                        if inner_pieces
+                            .iter()
+                            .any(|p| matches!(p, InlinePiece::Text { .. }))
+                        {
+                            plain_run = None;
+                            pieces.push(InlinePiece::Syntax(1));
+                            let base = next_run;
+                            for piece in inner_pieces {
+                                pieces.push(match piece {
+                                    InlinePiece::Text {
+                                        len,
+                                        run,
+                                        mut styles,
+                                    } => {
+                                        styles.push(doc::SpanStyle::Link(url.to_string()));
+                                        next_run = next_run.max(base + run + 1);
+                                        InlinePiece::Text {
+                                            len,
+                                            run: base + run,
+                                            styles,
+                                        }
+                                    }
+                                    syntax => syntax,
+                                });
                             }
-                            runs.extend(inner_runs);
+                            pieces.push(InlinePiece::Syntax(url_end + 1 - inner_end));
                             i = url_end + 1;
                             continue;
                         }
@@ -4575,8 +4626,9 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
             }
         }
 
-        // 3. Inline image `![alt](path)` — alt becomes plain text (the
-        // block scanner turns standalone image lines into Image blocks).
+        // 3. Inline image `![alt](path)`: the alt text is kept as plain
+        // text (the block scanner turns standalone image lines into Image
+        // blocks). It starts a new plain run that following text joins.
         if c == b'!' && rest.starts_with("![") {
             if let Some(rel) = rest.find("](") {
                 let inner_start = i + 2;
@@ -4586,8 +4638,10 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
                     let url_end = url_start + rp;
                     let alt = &text[inner_start..inner_end];
                     if !alt.is_empty() {
-                        flush_plain(&mut plain, &mut runs);
-                        plain.push_str(alt);
+                        plain_run = None;
+                        pieces.push(InlinePiece::Syntax(2));
+                        push_plain(alt.len(), &mut pieces, &mut plain_run, &mut next_run);
+                        pieces.push(InlinePiece::Syntax(url_end + 1 - inner_end));
                         i = url_end + 1;
                         continue;
                     }
@@ -4600,18 +4654,23 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
             if let Some(rel) = rest[1..].find('>') {
                 let url = &rest[1..1 + rel];
                 if looks_like_link_target(url) {
-                    flush_plain(&mut plain, &mut runs);
-                    runs.push(doc::TextRun::styled(
-                        url,
-                        vec![doc::SpanStyle::Link(url.to_string())],
-                    ));
+                    plain_run = None;
+                    pieces.push(InlinePiece::Syntax(1));
+                    pieces.push(InlinePiece::Text {
+                        len: url.len(),
+                        run: next_run,
+                        styles: vec![doc::SpanStyle::Link(url.to_string())],
+                    });
+                    next_run += 1;
+                    pieces.push(InlinePiece::Syntax(1));
                     i += rel + 2;
                     continue;
                 }
             }
         }
 
-        // 5. Emphasis markers: longest match first.
+        // 5. Emphasis markers: longest match first. The inner text is
+        // taken verbatim (no nested emphasis, no escapes).
         if c == b'*' || c == b'`' || c == b'~' {
             let found = markers.iter().find_map(|(m, s)| {
                 // `m: &&str`; deref so `starts_with` gets a plain `&str`.
@@ -4622,8 +4681,15 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
                 if let Some(rel) = text[start..].find(marker) {
                     let inner = &text[start..start + rel];
                     if !inner.is_empty() {
-                        flush_plain(&mut plain, &mut runs);
-                        runs.push(doc::TextRun::styled(inner, styles));
+                        plain_run = None;
+                        pieces.push(InlinePiece::Syntax(marker.len()));
+                        pieces.push(InlinePiece::Text {
+                            len: inner.len(),
+                            run: next_run,
+                            styles,
+                        });
+                        next_run += 1;
+                        pieces.push(InlinePiece::Syntax(marker.len()));
                         i = start + rel + marker.len();
                         continue;
                     }
@@ -4632,10 +4698,32 @@ fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
         }
 
         let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
-        plain.push_str(&text[i..i + ch_len]);
+        push_plain(ch_len, &mut pieces, &mut plain_run, &mut next_run);
         i += ch_len;
     }
-    flush_plain(&mut plain, &mut runs);
+    pieces
+}
+
+/// Inline Markdown as export runs: the kept text of `inline_pieces`,
+/// grouped into the runs it names (markers, escapes' `\` and link syntax
+/// dropped).
+fn parse_inline_runs(text: &str) -> Vec<doc::TextRun> {
+    let mut runs: Vec<doc::TextRun> = Vec::new();
+    let mut pos = 0;
+    for piece in inline_pieces(text) {
+        match piece {
+            InlinePiece::Syntax(len) => pos += len,
+            InlinePiece::Text { len, run, styles } => {
+                let chunk = &text[pos..pos + len];
+                pos += len;
+                if run == runs.len() {
+                    runs.push(doc::TextRun::styled(chunk, styles));
+                } else {
+                    runs[run].text.push_str(chunk);
+                }
+            }
+        }
+    }
     runs
 }
 
@@ -5981,6 +6069,44 @@ mod export_model_tests {
         match &blocks[2] {
             sylph_core::document::Block::Heading { level, .. } => assert_eq!(*level, 2),
             b => panic!("expected heading, got {b:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_pieces_tile_the_source_exactly() {
+        // Every source byte is either hidden syntax or kept text, so the
+        // pieces must cover the source with no gap or overlap, never be
+        // empty, and split only on character boundaries.
+        let check = |text: &str| {
+            let mut pos = 0;
+            for piece in inline_pieces(text) {
+                let (InlinePiece::Syntax(len) | InlinePiece::Text { len, .. }) = piece;
+                assert!(len > 0, "empty piece in {text:?}");
+                pos += len;
+                assert!(text.is_char_boundary(pos), "split character in {text:?}");
+            }
+            assert_eq!(pos, text.len(), "pieces do not tile {text:?}");
+        };
+        for line in include_str!("../../../fixtures/kitchen-sink.md").lines() {
+            check(line);
+        }
+        let alphabet: Vec<char> = "*`~[]()<>!\\ab h:/.é_".chars().collect();
+        let mut seed: u64 = 0x5eed_1234;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..20_000 {
+            let len = next() % 25;
+            let mut s: String = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            if next() % 8 == 0 {
+                s.push_str("](https://x.io)");
+            }
+            check(&s);
         }
     }
 
