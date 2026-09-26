@@ -6617,6 +6617,22 @@ mod markdown_wysiwyg_tests {
     }
 
     #[test]
+    fn block_status_lookahead_needs_a_real_table() {
+        use crate::ui::block_status;
+        // A bare `---` passes `is_table_delimiter`, but under a pipe-less
+        // line it is a thematic break: the caret line keeps its own block.
+        let rule = "Intro\n---\nMore";
+        assert_eq!(block_status(rule, 0), (1, 3));
+        // A heading containing a pipe is still a heading (that branch runs
+        // before the table check), so the row below it forms no table.
+        let heading = "# a | b\n--- | ---";
+        assert_eq!(block_status(heading, 0), (1, 2));
+        // The real header case still looks ahead.
+        let table = "intro\na | b\n--- | ---";
+        assert_eq!(block_status(table, table.find("a | b").unwrap()), (2, 2));
+    }
+
+    #[test]
     fn formatting_commands_refuse_while_markdown_is_off() {
         // The refusal policy: with Markdown OFF the guard blocks every
         // formatting command, so content is left byte-identical instead of

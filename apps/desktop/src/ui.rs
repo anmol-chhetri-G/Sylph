@@ -137,22 +137,30 @@ pub(crate) fn block_status(content: &str, cursor: usize) -> (usize, usize) {
     // value counts the same.
     let total = crate::parse_content_blocks(content, 1.0).len().max(1);
 
-    let mut end = content[cursor..]
+    let end = content[cursor..]
         .find('\n')
         .map_or(content.len(), |p| cursor + p);
+    // The parser flushes whatever is pending at end of text, so a partly
+    // parsed caret block still counts as exactly one block.
+    let mut index = crate::parse_content_blocks(&content[..end], 1.0).len();
+
     // One exception to "the prefix ends at the caret's line": a pipe-table
-    // header only becomes a table when its delimiter row follows, so
-    // include that row or the header would count as a paragraph.
+    // header only becomes a table when its delimiter row follows. Parse one
+    // row further, but trust it only if a table really formed — a bare
+    // `---` also passes `is_table_delimiter`, and under a pipe-less line or
+    // a heading it is a thematic break, not a delimiter row.
     if let Some(rest) = content[end..].strip_prefix('\n') {
         let next = rest.split('\n').next().unwrap_or_default();
         if crate::is_table_delimiter(next) {
-            end += 1 + next.len();
+            let ahead = crate::parse_content_blocks(&content[..end + 1 + next.len()], 1.0);
+            if matches!(
+                ahead.last(),
+                Some(sylph_core::document::Block::Table { .. })
+            ) {
+                index = ahead.len();
+            }
         }
     }
-
-    // The parser flushes whatever is pending at end of text, so a partly
-    // parsed caret block still counts as exactly one block.
-    let index = crate::parse_content_blocks(&content[..end], 1.0).len();
     (index.clamp(1, total), total)
 }
 
