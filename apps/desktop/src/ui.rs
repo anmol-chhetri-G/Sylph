@@ -1,11 +1,12 @@
 use crate::{
     heading_level_and_text, heading_metrics_pt, BoldText, CloseOverlay, ContextMenuCopy,
-    ContextMenuCut, ContextMenuPaste, CycleBodyFont, CycleHeading, ExportPdf, InsertPageBreak,
-    InsertTable, InspectorMode, ItalicText, NavigatorTab, NewDocument, OpenCommandPalette,
-    OpenFindBar, OpenModalShowcase, PasteImage, Redo, SaveDoc, SaveState, SetPageMargins,
-    SetPageSize, ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, StrikethroughText,
-    SylphApp, ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar,
-    Undo, WorkspaceOverlay,
+    ContextMenuCut, ContextMenuPaste, CycleBodyFont, CycleHeading, EditingCoverAuthor,
+    EditingCoverSubtitle, EditingCoverTitle, EditingField, ExportPdf, InsertPageBreak, InsertTable,
+    InspectorMode, ItalicText, NavigatorTab, NewDocument, OpenCommandPalette, OpenFindBar,
+    OpenModalShowcase, PasteImage, Redo, SaveDoc, SaveState, SetPageMargins, SetPageSize,
+    ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, StrikethroughText, SylphApp,
+    ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo,
+    WorkspaceOverlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -162,6 +163,22 @@ pub(crate) fn block_status(content: &str, cursor: usize) -> (usize, usize) {
         }
     }
     (index.clamp(1, total), total)
+}
+
+/// 1-based page of the caret within the typed text (Markdown mode): one
+/// more than the page breaks the export parser finds above the caret's
+/// line. A `\newpage` on the caret's own line still belongs to the page it
+/// ends, and one inside a code fence is text — exactly as in export.
+pub(crate) fn caret_text_page(content: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(content.len());
+    while cursor < content.len() && !content.is_char_boundary(cursor) {
+        cursor += 1;
+    }
+    let line_start = content[..cursor].rfind('\n').map_or(0, |p| p + 1);
+    1 + crate::parse_content_blocks(&content[..line_start], 1.0)
+        .iter()
+        .filter(|b| matches!(b, sylph_core::document::Block::PageBreak))
+        .count()
 }
 
 fn icon(glyph: &str, color: Rgba, size: f32) -> Div {
@@ -1999,7 +2016,128 @@ impl SylphApp {
         out
     }
 
-    fn render_blank_editor_page(&mut self, cx: &mut Context<Self>) -> Div {
+    /// Title, subtitle, author and date of the cover page, centred. The text
+    /// fields are click-to-edit (Enter commits, Escape cancels) and show a
+    /// muted prompt while empty; the date is automatic.
+    fn cover_fields(
+        &self,
+        cover: &sylph_core::document::CoverPageData,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                self.cover_field(
+                    EditingField::CoverTitle,
+                    &cover.title,
+                    "Add a title",
+                    28.0,
+                    cx,
+                )
+                .font_weight(gpui::FontWeight(700.0)),
+            )
+            .child(self.cover_field(
+                EditingField::CoverSubtitle,
+                &cover.subtitle,
+                "Add a subtitle",
+                16.0,
+                cx,
+            ))
+            .child(self.cover_field(
+                EditingField::CoverAuthor,
+                &cover.author,
+                "Add an author",
+                12.0,
+                cx,
+            ))
+            .child(label(cover.date.clone(), self.ui_muted(), 11.0 * 4.0 / 3.0))
+    }
+
+    /// One click-to-edit cover field, sized in points like the body text.
+    fn cover_field(
+        &self,
+        field: EditingField,
+        value: &str,
+        prompt: &str,
+        size_pt: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let text = self.ui_text();
+        let base = div()
+            .px(px(8.0))
+            .py(px(2.0))
+            .rounded(px(4.0))
+            .text_size(px(size_pt * 4.0 / 3.0));
+        if self.editing_field == field {
+            return base
+                .border_1()
+                .border_color(self.ui_primary())
+                .text_color(text)
+                .child(format!("{}█", self.field_input));
+        }
+        let (shown, color) = if value.trim().is_empty() {
+            (prompt.to_string(), self.ui_muted())
+        } else {
+            (value.to_string(), text)
+        };
+        let hover = self.ui_panel_low();
+        base.text_color(color)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .child(shown)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    // Finish any other field first, then take focus from the
+                    // body editor so typing lands only in this field.
+                    this.commit_field_edit(cx);
+                    window.focus(&this.focus_handle);
+                    match field {
+                        EditingField::CoverTitle => {
+                            this.editing_cover_title(&EditingCoverTitle, window, cx)
+                        }
+                        EditingField::CoverSubtitle => {
+                            this.editing_cover_subtitle(&EditingCoverSubtitle, window, cx)
+                        }
+                        _ => this.editing_cover_author(&EditingCoverAuthor, window, cx),
+                    }
+                }),
+            )
+    }
+
+    /// The cover as its own page ahead of the body. The exporters end the
+    /// cover with a page break, so it is page 1 of the document; like
+    /// Word's default, it shows no page number.
+    fn render_cover_page(
+        &self,
+        cover: &sylph_core::document::CoverPageData,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (margin_top, margin_right, margin_bottom, margin_left) = self.page_margins_px();
+        div()
+            .w(self.page_width())
+            .h(self.page_height())
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .pt(margin_top)
+            .pr(margin_right)
+            .pb(margin_bottom)
+            .pl(margin_left)
+            .bg(self.ui_page())
+            .text_color(self.ui_text())
+            // The document's own typeface, like the body text below it.
+            .font_family(self.document.body_font.clone())
+            .shadow_md()
+            .child(self.cover_fields(cover, cx))
+    }
+
+    fn render_blank_editor_page(&mut self, page_number: usize, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let text = self.ui_text();
         let muted = self.ui_muted();
@@ -2062,7 +2200,7 @@ impl SylphApp {
 
         page_content = page_content.children(self.rich_block_divs());
 
-        // Page number footer — page 1
+        // Page number footer: the first body page (page 2 after a cover).
         page_content = page_content.child(
             div()
                 .absolute()
@@ -2074,7 +2212,7 @@ impl SylphApp {
                 .font_family(MONO_FONT)
                 .text_size(px(10.0))
                 .text_color(muted)
-                .child("1"),
+                .child(page_number.to_string()),
         );
 
         page_content
@@ -2107,6 +2245,17 @@ impl SylphApp {
                     this.commit_field_edit(cx);
                 }),
             );
+        // No pages here, so the cover becomes a title block atop the flow.
+        let border = self.ui_border();
+        let cover = self.document.cover_page().cloned().map(|cover| {
+            div()
+                .w_full()
+                .pb(px(32.0))
+                .mb(px(24.0))
+                .border_b_1()
+                .border_color(border)
+                .child(self.cover_fields(&cover, cx))
+        });
         div()
             .w_full()
             .min_h(px(560.0))
@@ -2119,6 +2268,7 @@ impl SylphApp {
             .text_color(text)
             .font_family(PROSE_FONT)
             .shadow_md()
+            .children(cover)
             .child(editor)
             .children(self.rich_block_divs())
     }
@@ -2184,6 +2334,9 @@ impl SylphApp {
         // Web layout drops the page metaphor: one continuous flow, no
         // page gaps, no extra pages, no ruler (page geometry is off).
         let web = self.web_layout;
+        // A cover is page 1, as in export, so the body starts on page 2.
+        let cover = self.document.cover_page().cloned();
+        let first_body_page = if cover.is_some() { 2 } else { 1 };
         let mut pages = div()
             .w_full()
             .flex_shrink_0()
@@ -2191,14 +2344,19 @@ impl SylphApp {
             .px(px(16.0))
             .flex()
             .flex_col()
-            .items_center()
-            .child(if web {
-                self.render_web_editor(cx)
-            } else {
-                self.render_blank_editor_page(cx)
-            });
+            .items_center();
+        if let (Some(cover), false) = (&cover, web) {
+            pages = pages
+                .child(self.render_cover_page(cover, cx))
+                .child(div().h(px(32.0)).flex_shrink_0());
+        }
+        pages = pages.child(if web {
+            self.render_web_editor(cx)
+        } else {
+            self.render_blank_editor_page(first_body_page, cx)
+        });
         if !web {
-            for page_number in 2..=page_count {
+            for page_number in (first_body_page + 1)..=page_count {
                 pages = pages
                     .child(page_gap())
                     .child(self.render_blank_page(page_number));
@@ -2716,7 +2874,7 @@ impl SylphApp {
         // Markdown ON counts the blocks export will produce; OFF exports
         // one paragraph per source line, so the line *is* the block.
         let markdown_on = self.markdown_mode;
-        let (position, word_count, save_state) = {
+        let (position, body_page, word_count, save_state) = {
             let editor = self.editor.read(cx);
             let cursor = editor.cursor_offset();
             let (line, column, words) = cursor_status(&editor.content, cursor);
@@ -2726,15 +2884,24 @@ impl SylphApp {
             } else {
                 format!("Ln {line}, Col {column}")
             };
+            // OFF exports no typed page breaks, so the caret stays on the
+            // first body page; inserted breaks all follow the typed text.
+            let body_page = if markdown_on {
+                caret_text_page(&editor.content, cursor)
+            } else {
+                1
+            };
             let save_state = match &self.model_save_error {
                 // Page setup / inserted objects failed to save: a good
                 // text save must not hide that.
                 Some(reason) => SaveState::Failed(reason.clone()),
                 None => editor.save_state.clone(),
             };
-            (position, words, save_state)
+            (position, body_page, words, save_state)
         };
         let page_count = self.page_count(cx);
+        // A cover is page 1, so the body's pages come after it.
+        let caret_page = usize::from(self.document.has_cover_page()) + body_page;
         // The save indicator always shows the real save state in Word/Docs
         // wording (never a storage path). Transient action feedback gets
         // its own slot beside it and clears itself.
@@ -2758,7 +2925,10 @@ impl SylphApp {
             .text_color(muted)
             .child(
                 label(
-                    format!("Page 1 of {}  ·  Section 1  ·  {}", page_count, position),
+                    format!(
+                        "Page {} of {}  ·  Section 1  ·  {}",
+                        caret_page, page_count, position
+                    ),
                     muted,
                     11.0,
                 )

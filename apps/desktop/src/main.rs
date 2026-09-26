@@ -2478,12 +2478,7 @@ impl SylphApp {
     }
 
     fn page_count(&self, cx: &mut Context<Self>) -> usize {
-        1 + self
-            .export_view(cx)
-            .blocks
-            .iter()
-            .filter(|b| matches!(b, doc::Block::PageBreak))
-            .count()
+        export_page_count(&self.export_view(cx))
     }
 
     fn export_document(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
@@ -5499,6 +5494,16 @@ fn data_path(rel: &str) -> PathBuf {
     path
 }
 
+/// Physical pages as the exporters lay the model out: one per page break,
+/// plus the cover page, which they end with a page break of their own.
+fn export_page_count(model: &doc::Document) -> usize {
+    1 + model
+        .blocks
+        .iter()
+        .filter(|b| matches!(b, doc::Block::PageBreak | doc::Block::CoverPage { .. }))
+        .count()
+}
+
 /// Where unreadable saved models are copied before defaults replace them.
 fn recovered_dir() -> PathBuf {
     sylph_storage::data_dir().join("recovered")
@@ -5955,6 +5960,22 @@ mod export_model_tests {
             sylph_core::document::Block::Heading { level, .. } => assert_eq!(*level, 2),
             b => panic!("expected heading, got {b:?}"),
         }
+    }
+
+    #[test]
+    fn page_count_matches_the_exported_pages() {
+        use sylph_core::document::{Block, CoverPageData, Document};
+        assert_eq!(
+            export_page_count(&export_model(&Document::new(), "text", true)),
+            1
+        );
+        // The exporters end a cover with a page break, so it is a page of
+        // its own; a typed `\newpage` and an inserted break add one each.
+        let mut structured = Document::new();
+        structured.set_cover_page(CoverPageData::new());
+        structured.push_block(Block::page_break());
+        let model = export_model(&structured, "a\n\n\\newpage\n\nb", true);
+        assert_eq!(export_page_count(&model), 4);
     }
 
     #[test]
@@ -6784,6 +6805,23 @@ mod markdown_wysiwyg_tests {
         assert_eq!(block_status("", 0), (1, 1));
         // A byte offset inside a multi-byte character must not panic.
         assert_eq!(block_status("a\u{1F642}b", 2), (1, 1));
+    }
+
+    #[test]
+    fn caret_text_page_counts_breaks_above_the_caret_line() {
+        use crate::ui::caret_text_page;
+        let text = "a\n\\newpage\n\nb";
+        assert_eq!(caret_text_page(text, 0), 1);
+        // The break line itself still ends page 1.
+        assert_eq!(caret_text_page(text, text.find("\\newpage").unwrap()), 1);
+        // The blank line after the break is already on page 2.
+        assert_eq!(caret_text_page(text, text.find("\n\nb").unwrap() + 1), 2);
+        assert_eq!(caret_text_page(text, text.len()), 2);
+        // A `\newpage` inside a code fence is text, not a break.
+        let fenced = "```\n\\newpage\n```\nb";
+        assert_eq!(caret_text_page(fenced, fenced.len()), 1);
+        // A byte offset inside a multi-byte character must not panic.
+        assert_eq!(caret_text_page("\u{1F642}", 1), 1);
     }
 
     #[test]
