@@ -2274,6 +2274,8 @@ impl SylphApp {
             .storage
             .get_title(doc_id)
             .unwrap_or_else(|_| "Untitled".to_string());
+        // New and switched-to documents are what the next launch reopens.
+        let _ = self.editor.read(cx).storage.set_last_opened(doc_id);
 
         self.editor.update(cx, |editor, cx| {
             editor.doc_id = doc_id;
@@ -5613,7 +5615,9 @@ fn main() {
                         eprintln!("Storage init failed: {}", e);
                         Storage::default()
                     });
-                    let doc_id = storage.create_document("Untitled").unwrap_or(1);
+                    // Reopen what was open last time instead of adding a new
+                    // empty "Untitled" on every launch.
+                    let doc_id = storage.open_last_or_create().unwrap_or(1);
                     let saved = storage
                         .load_text(doc_id)
                         .unwrap_or(None)

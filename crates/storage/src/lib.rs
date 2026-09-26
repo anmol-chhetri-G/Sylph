@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS crdt_updates (
     document_id INTEGER REFERENCES documents(id),
     update_blob BLOB NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS app_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );";
 
 /// Platform data directory for Sylph (database, exports, images).
@@ -132,6 +136,67 @@ impl Storage {
             None => Ok(None),
         }
     }
+
+    /// Remember which document is open, so the next launch reopens it.
+    pub fn set_last_opened(&self, doc_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_state (key, value) VALUES ('last_document_id', ?1)",
+            params![doc_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The document recorded by `set_last_opened`, if it still exists.
+    pub fn last_opened(&self) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id FROM app_state s
+             JOIN documents d ON d.id = CAST(s.value AS INTEGER)
+             WHERE s.key = 'last_document_id'",
+        )?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The document to show at launch: the one open last time; else (a
+    /// database from before that was recorded) the latest document; else a
+    /// fresh "Untitled". The choice is recorded, so repeated launches reopen
+    /// the same document instead of piling up empty "Untitled" rows.
+    pub fn open_last_or_create(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        let doc_id = match self.last_opened()? {
+            Some(doc_id) => doc_id,
+            None => match self.latest_document()? {
+                Some(doc_id) => doc_id,
+                None => self.create_document("Untitled")?,
+            },
+        };
+        self.set_last_opened(doc_id)?;
+        Ok(doc_id)
+    }
+
+    /// The most recently saved document that still has content, else the
+    /// newest one. Throwaway "Untitled" documents are saved empty when the
+    /// user switches away, so an empty latest save must not win. Ordered by
+    /// `crdt_updates.id` rather than `updated_at`: ids only grow, so the
+    /// order is exact even for saves within the same second. Empty and
+    /// never-saved documents sort last (NULLs are lowest), newest first.
+    fn latest_document(&self) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id FROM documents d
+             ORDER BY (SELECT CASE WHEN length(u.update_blob) > 0 THEN u.id END
+                       FROM crdt_updates u WHERE u.document_id = d.id
+                       ORDER BY u.id DESC LIMIT 1) DESC,
+                      d.id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 impl Default for Storage {
@@ -155,6 +220,58 @@ mod tests {
             N.fetch_add(1, Ordering::SeqCst)
         ));
         Storage::open_in(&dir).unwrap()
+    }
+
+    // ── Launch document ───────────────────────────────────────────
+
+    #[test]
+    fn test_launch_reuses_the_document_instead_of_piling_up() {
+        let storage = temp_storage();
+        let first = storage.open_last_or_create().unwrap();
+        let second = storage.open_last_or_create().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(storage.list_documents().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_launch_prefers_the_last_opened_document() {
+        let storage = temp_storage();
+        let a = storage.create_document("A").unwrap();
+        let b = storage.create_document("B").unwrap();
+        storage.save_text(a, "saved after B was opened").unwrap();
+        storage.set_last_opened(b).unwrap();
+        assert_eq!(storage.open_last_or_create().unwrap(), b);
+    }
+
+    #[test]
+    fn test_launch_without_a_record_opens_the_latest_save() {
+        // A database from before last-opened was recorded: every earlier
+        // launch left an empty "Untitled", and the newest row is one.
+        let storage = temp_storage();
+        let a = storage.create_document("A").unwrap();
+        let b = storage.create_document("B").unwrap();
+        storage.save_text(b, "b").unwrap();
+        storage.save_text(a, "a").unwrap();
+        storage.create_document("Untitled").unwrap();
+        // Switching away saves a throwaway document empty; that later but
+        // empty save must not beat the document with real content.
+        let throwaway = storage.create_document("Untitled").unwrap();
+        storage.save_text(throwaway, "").unwrap();
+        assert_eq!(storage.open_last_or_create().unwrap(), a);
+    }
+
+    #[test]
+    fn test_last_opened_ignores_a_deleted_document() {
+        let storage = temp_storage();
+        let a = storage.create_document("A").unwrap();
+        let b = storage.create_document("B").unwrap();
+        storage.set_last_opened(b).unwrap();
+        storage
+            .conn
+            .execute("DELETE FROM documents WHERE id = ?1", params![b])
+            .unwrap();
+        assert_eq!(storage.last_opened().unwrap(), None);
+        assert_eq!(storage.open_last_or_create().unwrap(), a);
     }
 
     // ── Construction ──────────────────────────────────────────────
