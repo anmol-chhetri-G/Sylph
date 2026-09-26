@@ -35,6 +35,18 @@ pub struct Storage {
     conn: Connection,
 }
 
+/// A document as the documents list shows it. Titles are often still
+/// "Untitled", so the start of the current text comes along for a preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentSummary {
+    pub id: i64,
+    pub title: String,
+    /// Last change in local time, "YYYY-MM-DD HH:MM".
+    pub updated: String,
+    /// The start of the newest save (lossy UTF-8; "" if never saved).
+    pub text_start: String,
+}
+
 impl Storage {
     /// Open the database in the platform data directory.
     pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
@@ -103,6 +115,38 @@ impl Storage {
             .conn
             .prepare("SELECT id, title FROM documents ORDER BY updated_at DESC")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut docs = Vec::new();
+        for row in rows {
+            docs.push(row?);
+        }
+        Ok(docs)
+    }
+
+    /// Every document, most recently updated first, with the start of its
+    /// current text: the same newest row `load_text` returns, so a preview
+    /// never shows text the document no longer has.
+    pub fn list_document_summaries(
+        &self,
+    ) -> Result<Vec<DocumentSummary>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.title,
+                    COALESCE(strftime('%Y-%m-%d %H:%M', d.updated_at, 'localtime'), ''),
+                    (SELECT substr(u.update_blob, 1, 1024) FROM crdt_updates u
+                     WHERE u.document_id = d.id ORDER BY u.id DESC LIMIT 1)
+             FROM documents d
+             ORDER BY d.updated_at DESC, d.id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            // substr of a BLOB counts bytes and may split a character, so
+            // decode lossily rather than failing the whole list.
+            let start: Option<Vec<u8>> = row.get(3)?;
+            Ok(DocumentSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                updated: row.get(2)?,
+                text_start: String::from_utf8_lossy(&start.unwrap_or_default()).into_owned(),
+            })
+        })?;
         let mut docs = Vec::new();
         for row in rows {
             docs.push(row?);
@@ -326,6 +370,40 @@ mod tests {
             .unwrap();
         assert_eq!(storage.last_opened().unwrap(), None);
         assert_eq!(storage.open_last_or_create().unwrap(), a);
+    }
+
+    // ── Documents list ────────────────────────────────────────────
+
+    #[test]
+    fn test_summaries_show_each_documents_current_text() {
+        let storage = temp_storage();
+        let a = storage.create_document("Report").unwrap();
+        let b = storage.create_document("Untitled").unwrap();
+        let never_saved = storage.create_document("Untitled").unwrap();
+        storage.save_text(a, "old draft").unwrap();
+        storage.save_text(a, "Quarterly report\nbody").unwrap();
+        storage.save_text(b, "Notes").unwrap();
+        let docs = storage.list_document_summaries().unwrap();
+        let find = |id| docs.iter().find(|d| d.id == id).unwrap();
+        // The newest save, never an older one.
+        assert_eq!(find(a).text_start, "Quarterly report\nbody");
+        assert_eq!(find(a).title, "Report");
+        assert_eq!(find(b).text_start, "Notes");
+        assert_eq!(find(never_saved).text_start, "");
+        assert_eq!(find(a).updated.len(), "YYYY-MM-DD HH:MM".len());
+    }
+
+    #[test]
+    fn test_summaries_survive_a_split_multibyte_character() {
+        // substr() cuts bytes: 1024 bytes of "é" (2 bytes each) plus one
+        // more lands mid-character. The list must still load.
+        let storage = temp_storage();
+        let id = storage.create_document("Accents").unwrap();
+        storage
+            .save_text(id, &format!("a{}", "é".repeat(600)))
+            .unwrap();
+        let docs = storage.list_document_summaries().unwrap();
+        assert!(docs[0].text_start.starts_with("aé"));
     }
 
     // ── Structured model ──────────────────────────────────────────

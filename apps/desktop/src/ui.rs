@@ -173,6 +173,82 @@ pub(crate) fn page_format_label(size: &sylph_core::document::PageSize) -> String
     format!("{} · {} × {} mm", size.name(), mm(w_pt), mm(h_pt))
 }
 
+/// The two lines a document shows in Recent Files. A real title leads, with
+/// the time and the start of the text below it; an "Untitled" document
+/// leads with the start of its text instead, since that is what identifies
+/// it. With Markdown ON the text goes through the export parser, so
+/// "# Report" reads "Report", as on the canvas; OFF shows it literally.
+pub(crate) fn document_label(
+    title: &str,
+    body: &str,
+    updated: &str,
+    markdown_on: bool,
+) -> (String, String) {
+    let first = first_text(body, markdown_on);
+    let title = title.trim();
+    let untitled = title.is_empty() || title == "Untitled";
+    let name = if !untitled {
+        title.to_string()
+    } else if !first.is_empty() {
+        first.clone()
+    } else {
+        "Untitled".to_string()
+    };
+    let detail = if untitled || first.is_empty() {
+        updated.to_string()
+    } else {
+        format!("{updated} · {first}")
+    };
+    (name, detail)
+}
+
+/// The first text a document shows, whitespace collapsed. Only the start
+/// is read, so a long document costs nothing extra per frame.
+fn first_text(body: &str, markdown_on: bool) -> String {
+    let mut end = body.len().min(1024);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let start = &body[..end];
+    let text = if markdown_on {
+        crate::parse_content_blocks(start, 1.0)
+            .iter()
+            .map(block_plain_text)
+            .find(|t| !t.trim().is_empty())
+            .unwrap_or_default()
+    } else {
+        start
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A block's visible text without Markdown markers (first item or row
+/// only for lists and tables; first line for code).
+fn block_plain_text(block: &sylph_core::document::Block) -> String {
+    use sylph_core::document::Block;
+    let join = |runs: &[sylph_core::document::TextRun]| -> String {
+        runs.iter().map(|r| r.text.as_str()).collect()
+    };
+    match block {
+        Block::Heading { runs, .. } | Block::Paragraph { runs, .. } | Block::Quote { runs, .. } => {
+            join(runs)
+        }
+        Block::List { items } => items.first().map(|i| join(&i.runs)).unwrap_or_default(),
+        Block::CodeBlock { text, .. } => text.lines().next().unwrap_or_default().to_string(),
+        Block::Table { data } => data
+            .rows
+            .first()
+            .map(|row| row.iter().map(|c| c.text()).collect::<Vec<_>>().join(" · "))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// 1-based page of the caret within the typed text (Markdown mode): one
 /// more than the page breaks the export parser finds above the caret's
 /// line. A `\newpage` on the caret's own line still belongs to the page it
@@ -1341,6 +1417,59 @@ impl SylphApp {
         bar
     }
 
+    /// Every document, newest first; click one to open it (the current one
+    /// is saved first). Titles are often still "Untitled", so each row also
+    /// shows when it changed and how its text starts. The open document's
+    /// row reads the live editor text, which is ahead of its last save.
+    fn recent_files(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let text = self.ui_text();
+        let muted = self.ui_muted();
+        let highlight = self.ui_panel_high();
+        let editor = self.editor.read(cx);
+        let mut list = div()
+            .id("recent-files")
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .py(px(4.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        if self.documents.is_empty() {
+            return list.child(label("No documents yet.", muted, 11.0));
+        }
+        for doc in &self.documents {
+            let open = doc.id == editor.doc_id;
+            let body = if open {
+                editor.content.as_str()
+            } else {
+                doc.text_start.as_str()
+            };
+            let (name, detail) = document_label(&doc.title, body, &doc.updated, self.markdown_mode);
+            let row = div()
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(4.0))
+                .flex()
+                .flex_col()
+                .child(label(name, text, 12.0).truncate())
+                .child(label(detail, muted, 10.5).truncate());
+            let id = doc.id;
+            list = list.child(if open {
+                row.bg(highlight)
+            } else {
+                row.cursor_pointer()
+                    .hover(move |s| s.bg(highlight))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.switch_document(id, window, cx)
+                        }),
+                    )
+            });
+        }
+        list
+    }
+
     fn navigator(&self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let muted = self.ui_muted();
@@ -1553,11 +1682,7 @@ impl SylphApp {
             .border_t_1()
             .border_color(border)
             .child(label("RECENT FILES", muted, 11.0).font_weight(gpui::FontWeight(600.0)))
-            .child(
-                div()
-                    .py(px(6.0))
-                    .child(label("No recent files yet.", muted, 11.0)),
-            );
+            .child(self.recent_files(cx));
 
         div()
             .w(px(260.0))
@@ -3510,6 +3635,36 @@ impl Render for SylphApp {
 #[cfg(test)]
 mod chrome_tests {
     use super::*;
+
+    #[test]
+    fn document_label_identifies_untitled_documents_by_their_text() {
+        let when = "2026-09-25 17:17";
+        // "Untitled" leads with the text itself; Markdown ON reads it the
+        // way the canvas shows it (no `#`), OFF literally.
+        assert_eq!(
+            document_label("Untitled", "\n\n# Quarterly  report\nbody", when, true),
+            ("Quarterly report".to_string(), when.to_string())
+        );
+        assert_eq!(
+            document_label("Untitled", "\n\n# Quarterly  report\nbody", when, false),
+            ("# Quarterly report".to_string(), when.to_string())
+        );
+        // A real title leads; the text start moves to the detail line.
+        assert_eq!(
+            document_label("Report", "**Q3** results", when, true),
+            ("Report".to_string(), format!("{when} · Q3 results"))
+        );
+        // Nothing typed yet.
+        assert_eq!(
+            document_label("Untitled", "", when, true),
+            ("Untitled".to_string(), when.to_string())
+        );
+        // Only the start is read, and a cut inside a character is safe.
+        let long = "é".repeat(2000);
+        assert!(document_label("Untitled", &long, when, true)
+            .0
+            .starts_with("éé"));
+    }
 
     #[test]
     fn page_format_label_uses_real_dimensions() {

@@ -1887,7 +1887,8 @@ struct SylphApp {
     context_menu: ContextMenuState,
     doc_title: String,
     editing_title: bool,
-    documents: Vec<(i64, String)>,
+    /// Every document for the Recent Files list, newest first.
+    documents: Vec<sylph_storage::DocumentSummary>,
     dark_mode: bool,
     ai_panel: AiPanelState,
     /// Transient action feedback; set it with `set_status` so it clears
@@ -2300,7 +2301,7 @@ impl SylphApp {
             .editor
             .read(cx)
             .storage
-            .list_documents()
+            .list_document_summaries()
             .unwrap_or_default();
     }
 
@@ -2408,6 +2409,8 @@ impl SylphApp {
             return;
         }
         self.load_document_by_id(doc_id, cx);
+        // The save above moved the old document in the recency order.
+        self.load_documents(cx);
         cx.notify();
     }
 
@@ -3869,7 +3872,8 @@ impl SylphApp {
                                     let docs: Vec<_> = self
                                         .documents
                                         .iter()
-                                        .map(|(id, title)| {
+                                        .map(|doc| {
+                                            let (id, title) = (&doc.id, &doc.title);
                                             let is_active = *id == self.editor.read(cx).doc_id;
                                             let doc_id = *id;
                                             div()
