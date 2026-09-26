@@ -328,14 +328,28 @@ mod tests {
         assert!(result.starts_with("Exported"), "got: {result}");
     }
 
-    /// `word/document.xml` of an exported .docx, read with Python's zipfile.
-    fn docx_document_xml(path: &str) -> String {
+    /// One XML part of an exported .docx, read with Python's zipfile.
+    fn docx_part(path: &str, part: &str) -> String {
         with_python_module("zipfile", |zipfile| {
             let archive = zipfile.call_method1("ZipFile", (path,))?;
-            let xml = archive.call_method1("read", ("word/document.xml",))?;
+            let xml = archive.call_method1("read", (part,))?;
             xml.call_method1("decode", ("utf-8",))?.extract::<String>()
         })
         .expect("readable docx")
+    }
+
+    fn docx_document_xml(path: &str) -> String {
+        docx_part(path, "word/document.xml")
+    }
+
+    /// The `<w:style>` element with `style_id` from a .docx's styles.xml.
+    fn docx_style(path: &str, style_id: &str) -> String {
+        let styles = docx_part(path, "word/styles.xml");
+        let start = styles
+            .find(&format!(r#"w:styleId="{style_id}""#))
+            .unwrap_or_else(|| panic!("no style {style_id}"));
+        let end = start + styles[start..].find("</w:style>").expect("closed style");
+        styles[start..end].to_string()
     }
 
     fn pdf_has(path: &str, needle: &str) -> bool {
@@ -405,6 +419,72 @@ mod tests {
             xml.contains(r#"w:w="16840" w:h="11900" w:orient="landscape""#),
             "{xml}"
         );
+    }
+
+    /// A heading and a paragraph with a bold run, set in `body_font`.
+    fn typography_doc(body_font: &str) -> String {
+        format!(
+            r#"{{"body_font": "{body_font}", "body_font_size": 13.0, "blocks": [
+                {{"Heading": {{"level": 1, "runs": [{{"text": "Title", "styles": []}}]}}}},
+                {{"Paragraph": {{"runs": [
+                    {{"text": "plain ", "styles": []}},
+                    {{"text": "bold", "styles": ["Bold"]}}
+                ], "style": {{"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}}}}
+            ]}}"#
+        )
+    }
+
+    #[test]
+    fn test_rich_docx_uses_the_documents_typography() {
+        // The canvas shows body_font at body_font_size and headings at
+        // 28/22/18/16/14/12 pt; the template's Calibri 11 and theme
+        // heading fonts must not replace them.
+        let r = export_rich_docx(&typography_doc("Noto Serif"), "/tmp/sylph_test_type.docx");
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let normal = docx_style("/tmp/sylph_test_type.docx", "Normal");
+        assert!(normal.contains(r#"w:ascii="Noto Serif""#), "{normal}");
+        assert!(normal.contains(r#"<w:sz w:val="26"/>"#), "13 pt: {normal}");
+        let h1 = docx_style("/tmp/sylph_test_type.docx", "Heading1");
+        assert!(h1.contains(r#"w:ascii="Noto Serif""#), "{h1}");
+        // Word prefers theme fonts over w:ascii, so they must be gone.
+        assert!(!h1.contains("w:asciiTheme"), "{h1}");
+        assert!(h1.contains(r#"<w:sz w:val="56"/>"#), "28 pt: {h1}");
+        assert!(
+            h1.contains(r#"w:before="240" w:after="120""#),
+            "12/6 pt: {h1}"
+        );
+    }
+
+    #[test]
+    fn test_rich_pdf_maps_the_typeface_to_a_core_font() {
+        // fpdf2 embeds only the 14 core fonts: serif faces map to Times,
+        // sans faces stay Helvetica (the page-number footer is always
+        // Helvetica-Oblique, so check the body faces only).
+        let r = export_rich_pdf(&typography_doc("Noto Serif"), "/tmp/sylph_test_serif.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        assert!(pdf_has(
+            "/tmp/sylph_test_serif.pdf",
+            "/BaseFont /Times-Roman"
+        ));
+        assert!(pdf_has(
+            "/tmp/sylph_test_serif.pdf",
+            "/BaseFont /Times-Bold"
+        ));
+        assert!(!pdf_has(
+            "/tmp/sylph_test_serif.pdf",
+            "/BaseFont /Helvetica-Bold"
+        ));
+
+        let r = export_rich_pdf(&typography_doc("Noto Sans"), "/tmp/sylph_test_sans.pdf");
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        assert!(pdf_has(
+            "/tmp/sylph_test_sans.pdf",
+            "/BaseFont /Helvetica-Bold"
+        ));
+        assert!(!pdf_has(
+            "/tmp/sylph_test_sans.pdf",
+            "/BaseFont /Times-Roman"
+        ));
     }
 
     #[test]

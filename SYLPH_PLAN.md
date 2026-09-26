@@ -443,6 +443,12 @@ text rather than dropped):
 - `_..._` is deliberately not emphasis (snake_case must stay plain).
 - PDF core fonts are latin-1: bullet markers render as `·` in PDF while DOCX uses
   `•`; Markdown output uses the standard `- ` prefix.
+- PDF typefaces are core-font stand-ins: fpdf2 embeds only the 14 standard fonts,
+  so the body typeface maps to one of them (serif faces such as Noto/Liberation/
+  DejaVu Serif, Garamond and Georgia → Times; monospace → Courier; everything
+  else → Helvetica). Sizes, the heading scale (28/22/18/16/14/12 pt) and line
+  spacing match the canvas, and DOCX uses the exact typeface name. Embedding TTF
+  fonts in PDF is a separate decision.
 
 Round-trip guarantee: Markdown → parse → Markdown export is byte-identical for
 markdown already in exported (canonical) form — re-exporting export output is a

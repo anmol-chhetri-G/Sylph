@@ -615,6 +615,103 @@ def _apply_page_setup_docx(doc, doc_data: dict):
         section.right_margin = Pt(margins['right'])
 
 
+# Heading (size, space before, space after) in points, mirroring
+# heading_metrics_pt in apps/desktop/src/main.rs, so exports match the canvas.
+_HEADING_METRICS_PT = {
+    1: (28.0, 12.0, 6.0),
+    2: (22.0, 10.0, 6.0),
+    3: (18.0, 8.0, 4.0),
+    4: (16.0, 6.0, 4.0),
+    5: (14.0, 4.0, 4.0),
+    6: (12.0, 4.0, 4.0),
+}
+# The canvas lays heading rows out at 1.4 × their size.
+_HEADING_LINE_FACTOR = 1.4
+# Body type for documents that omit it: sylph-core's Document::new().
+_DEFAULT_BODY_FONT = 'Noto Serif'
+_DEFAULT_BODY_SIZE = 11.0
+_DEFAULT_LINE_SPACING = 1.15
+# Paragraph gap when a block carries no style (ParagraphStyle's default).
+_DEFAULT_SPACE_AFTER_PT = 8.0
+
+
+def _body_type(doc_data: dict):
+    """(font name, size in pt, line spacing) the canvas uses for body text."""
+    name = doc_data.get('body_font') or _DEFAULT_BODY_FONT
+    size = float(doc_data.get('body_font_size') or _DEFAULT_BODY_SIZE)
+    spacing = float(doc_data.get('line_spacing') or _DEFAULT_LINE_SPACING)
+    return name, size, spacing
+
+
+def _heading_metrics(level) -> tuple:
+    return _HEADING_METRICS_PT[min(max(int(level), 1), 6)]
+
+
+def _set_style_font_docx(style, name: str, size_pt: float):
+    """Give a style an explicit font. The template's headings use theme
+    fonts (w:asciiTheme and friends), which Word prefers over w:ascii, so
+    those attributes are removed or the name would be ignored."""
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+
+    style.font.name = name
+    style.font.size = Pt(size_pt)
+    rfonts = style.element.rPr.rFonts
+    for attr in ('w:asciiTheme', 'w:hAnsiTheme', 'w:eastAsiaTheme', 'w:cstheme'):
+        rfonts.attrib.pop(qn(attr), None)
+
+
+def _apply_typography_docx(doc, doc_data: dict):
+    """Body text and headings in the document's typeface at the canvas's
+    sizes, instead of the template's Calibri and theme heading fonts."""
+    from docx.shared import Pt
+
+    name, size, _spacing = _body_type(doc_data)
+    _set_style_font_docx(doc.styles['Normal'], name, size)
+    for level in range(1, 7):
+        heading_size, before, after = _heading_metrics(level)
+        style = doc.styles[f'Heading {level}']
+        _set_style_font_docx(style, name, heading_size)
+        style.font.bold = True
+        style.font.italic = False
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
+
+
+def _pdf_family(font_name: str) -> str:
+    """The core PDF font standing in for the document's typeface. fpdf2 has
+    only the 14 standard fonts unless a TTF is registered, so serif faces
+    map to Times, monospace to Courier and everything else to Helvetica."""
+    name = (font_name or '').lower()
+    if 'mono' in name or 'courier' in name:
+        return 'Courier'
+    serif_faces = ('serif', 'garamond', 'georgia', 'times', 'cambria', 'palatino', 'baskerville')
+    if 'sans' not in name and any(face in name for face in serif_faces):
+        return 'Times'
+    return 'Helvetica'
+
+
+def _pdf_body(pdf):
+    """(family, size pt, line spacing) that rich_pdf set on this PDF."""
+    return (
+        getattr(pdf, 'sylph_family', 'Helvetica'),
+        getattr(pdf, 'sylph_size', _DEFAULT_BODY_SIZE),
+        getattr(pdf, 'sylph_spacing', _DEFAULT_LINE_SPACING),
+    )
+
+
+def _pdf_line_height(size_pt: float, spacing: float) -> float:
+    """Line height in mm for text of `size_pt`: size × spacing, like the canvas."""
+    return size_pt * spacing * _MM_PER_PT
+
+
+def _pdf_font(pdf, style: str = '', delta: float = 0.0):
+    """The document's body family at body size + `delta` (captions -2,
+    table text -1), so secondary text scales with the body."""
+    family, size, _spacing = _pdf_body(pdf)
+    pdf.set_font(family, style, size + delta)
+
+
 def rich_docx(doc_json: str, output_path: str) -> bool:
     """Export a rich document (JSON) to DOCX format.
 
@@ -642,12 +739,7 @@ def rich_docx(doc_json: str, output_path: str) -> bool:
     # python-docx's template is Letter with 1.25" side margins; use the
     # document's own page setup instead.
     _apply_page_setup_docx(doc, doc_data)
-
-    # Set default font
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Calibri'
-    font.size = Pt(11)
+    _apply_typography_docx(doc, doc_data)
 
     for block in doc_data.get('blocks', []):
         _render_block_docx(doc, block)
@@ -933,6 +1025,9 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
     )
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=bottom_mm)
+    # Body type for the block renderers (read back through _pdf_body).
+    body_name, pdf.sylph_size, pdf.sylph_spacing = _body_type(doc_data)
+    pdf.sylph_family = _pdf_family(body_name)
     pdf.add_page()
 
     for block in doc_data.get('blocks', []):
@@ -943,14 +1038,16 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
     return True
 
 
-def _write_pdf_runs(pdf, runs, size: int = 11,
-                    default_font=('Helvetica', ''), default_color=(0, 0, 0)):
+def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0, 0, 0)):
     """Write flowing inline runs to the current PDF line position.
 
-    Plain runs reset to `default_font`/`default_color` (set by the caller
-    for context, e.g. gray italic inside quotes); styled runs override.
-    Links are written as clickable PDF links (blue).
+    Runs use the document's body family and size (see _pdf_body). Plain
+    runs reset to `default_style`/`default_color` (set by the caller for
+    context, e.g. gray italic inside quotes); styled runs override. Links
+    are written as clickable PDF links (blue).
     """
+    family, size, body_spacing = _pdf_body(pdf)
+    line_h = _pdf_line_height(size, spacing or body_spacing)
     for run_data in runs:
         text = run_data.get('text', '')
         if not text:
@@ -961,25 +1058,25 @@ def _write_pdf_runs(pdf, runs, size: int = 11,
             pdf.set_font('Courier', '', size - 1)
             pdf.set_text_color(200, 50, 50)
         elif 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
-            pdf.set_font('Helvetica', 'BI', size)
+            pdf.set_font(family, 'BI', size)
             pdf.set_text_color(0, 0, 0)
         elif 'Bold' in styles:
-            pdf.set_font('Helvetica', 'B', size)
+            pdf.set_font(family, 'B', size)
             pdf.set_text_color(0, 0, 0)
         elif 'Italic' in styles:
-            pdf.set_font('Helvetica', 'I', size)
+            pdf.set_font(family, 'I', size)
             pdf.set_text_color(0, 0, 0)
         else:
-            pdf.set_font(default_font[0], default_font[1], size)
+            pdf.set_font(family, default_style, size)
             pdf.set_text_color(*default_color)
         if url is not None:
             pdf.set_text_color(0, 90, 180)
             # write() keeps runs on the same flowing line; multi_cell()
             # per run would stack each run on its own line.
-            pdf.write(6, _pdf_safe(text), link=url)
+            pdf.write(line_h, _pdf_safe(text), link=url)
             pdf.set_text_color(*default_color)
         else:
-            pdf.write(6, _pdf_safe(text))
+            pdf.write(line_h, _pdf_safe(text))
 
 
 def _render_block_pdf(pdf, block: dict):
@@ -988,23 +1085,28 @@ def _render_block_pdf(pdf, block: dict):
         _render_cover_page_pdf(pdf, block['CoverPage']['data'])
     elif 'Heading' in block:
         h = block['Heading']
-        level = h['level']
-        size = max(24 - (level - 1) * 3, 12)
+        # The canvas's heading scale (H1 28 pt, 12 before / 6 after, …)
+        # in the document's typeface.
+        size, before, after = _heading_metrics(h['level'])
+        family = _pdf_body(pdf)[0]
+        pdf.ln(before * _MM_PER_PT)
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', 'B', size)
+        pdf.set_font(family, 'B', size)
         pdf.set_text_color(0, 0, 0)
         text = ''.join(r['text'] for r in h.get('runs', []))
-        pdf.multi_cell(pdf.epw, size * 0.5, _pdf_safe(text))
-        pdf.ln(2)
+        pdf.multi_cell(pdf.epw, _pdf_line_height(size, _HEADING_LINE_FACTOR), _pdf_safe(text))
+        pdf.ln(after * _MM_PER_PT)
     elif 'Paragraph' in block:
         p = block['Paragraph']
         style_data = p.get('style', {})
-        space_after = style_data.get('space_after', 3)
+        _family, size, spacing = _pdf_body(pdf)
+        spacing = style_data.get('line_spacing', spacing)
+        # space_after is in points, like every length in the model.
+        space_after = style_data.get('space_after', _DEFAULT_SPACE_AFTER_PT)
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', '', 11)
         pdf.set_text_color(0, 0, 0)
-        _write_pdf_runs(pdf, p.get('runs', []))
-        pdf.ln(max(space_after, 2))
+        _write_pdf_runs(pdf, p.get('runs', []), spacing=spacing)
+        pdf.ln(_pdf_line_height(size, spacing) + space_after * _MM_PER_PT)
     elif 'Image' in block:
         img_data = block['Image']['data']
         path = img_data.get('path', '')
@@ -1016,32 +1118,32 @@ def _render_block_pdf(pdf, block: dict):
                 caption = img_data.get('caption')
                 if caption:
                     pdf.set_x(pdf.l_margin)
-                    pdf.set_font('Helvetica', 'I', 9)
+                    _pdf_font(pdf, 'I', -2)
                     pdf.set_text_color(100, 100, 100)
                     pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
                     pdf.ln(3)
                 pdf.ln(3)
             except Exception:
                 pdf.set_x(pdf.l_margin)
-                pdf.set_font('Helvetica', '', 10)
+                _pdf_font(pdf, '', -1)
                 pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
                 pdf.ln(3)
                 caption = img_data.get('caption')
                 if caption:
                     pdf.set_x(pdf.l_margin)
-                    pdf.set_font('Helvetica', 'I', 9)
+                    _pdf_font(pdf, 'I', -2)
                     pdf.set_text_color(100, 100, 100)
                     pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
                     pdf.ln(3)
         else:
             pdf.set_x(pdf.l_margin)
-            pdf.set_font('Helvetica', '', 10)
+            _pdf_font(pdf, '', -1)
             pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
             pdf.ln(3)
             caption = img_data.get('caption')
             if caption:
                 pdf.set_x(pdf.l_margin)
-                pdf.set_font('Helvetica', 'I', 9)
+                _pdf_font(pdf, 'I', -2)
                 pdf.set_text_color(100, 100, 100)
                 pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
                 pdf.ln(3)
@@ -1049,7 +1151,7 @@ def _render_block_pdf(pdf, block: dict):
         _render_table_pdf(pdf, block['Table']['data'])
     elif 'Caption' in block:
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', 'I', 9)
+        _pdf_font(pdf, 'I', -2)
         pdf.set_text_color(100, 100, 100)
         pdf.cell(pdf.epw, 5, _pdf_safe(block['Caption']['text']))
         pdf.ln(3)
@@ -1093,27 +1195,31 @@ def _render_list_pdf(pdf, list_data: dict):
         else:
             counters.pop(level, None)
             # '•' (U+2022) is rejected by latin-1 core fonts; '·' is the
-            # closest latin-1 bullet and renders with Helvetica.
+            # closest latin-1 bullet and renders in every core family.
             marker = '· '
+        _family, size, spacing = _pdf_body(pdf)
         pdf.set_x(pdf.l_margin + 6.0 * (level + 1))
-        pdf.set_font('Helvetica', '', 11)
+        _pdf_font(pdf)
         pdf.set_text_color(0, 0, 0)
-        pdf.write(6, _pdf_safe(marker))
+        pdf.write(_pdf_line_height(size, spacing), _pdf_safe(marker))
         _write_pdf_runs(pdf, item.get('runs', []))
-        pdf.ln(4)
+        # One line per item, as on the canvas: no gap between items.
+        pdf.ln(_pdf_line_height(size, spacing))
+    pdf.ln(_DEFAULT_SPACE_AFTER_PT * _MM_PER_PT)
 
 
 def _render_quote_pdf(pdf, quote_data: dict):
     """Render a blockquote as an indented, gray-italic paragraph."""
+    _family, size, spacing = _pdf_body(pdf)
     level = min(int(quote_data.get('level', 1)), 4)
     pdf.set_x(pdf.l_margin + 6.0 * level)
-    pdf.set_font('Helvetica', 'I', 11)
+    _pdf_font(pdf, 'I')
     pdf.set_text_color(80, 80, 80)
     _write_pdf_runs(
         pdf, quote_data.get('runs', []),
-        default_font=('Helvetica', 'I'), default_color=(80, 80, 80),
+        default_style='I', default_color=(80, 80, 80),
     )
-    pdf.ln(6)
+    pdf.ln(_pdf_line_height(size, spacing) + _DEFAULT_SPACE_AFTER_PT * _MM_PER_PT)
 
 
 def _render_code_block_pdf(pdf, code_data: dict):
@@ -1128,7 +1234,8 @@ def _render_code_block_pdf(pdf, code_data: dict):
 
 
 def _render_cover_page_pdf(pdf, data: dict):
-    """Render a cover page to PDF."""
+    """Render a cover page to PDF: the template's sizes in the document's
+    typeface, like the cover page on the canvas."""
     template = data.get('template', 'Classic')
 
     # Background image
@@ -1144,11 +1251,11 @@ def _render_cover_page_pdf(pdf, data: dict):
     # Title
     if data.get('title'):
         if template == 'Bold':
-            pdf.set_font('Helvetica', 'B', 36)
+            pdf.set_font(_pdf_body(pdf)[0], 'B', 36)
         elif template == 'Modern':
-            pdf.set_font('Helvetica', 'B', 32)
+            pdf.set_font(_pdf_body(pdf)[0], 'B', 32)
         else:
-            pdf.set_font('Helvetica', 'B', 30)
+            pdf.set_font(_pdf_body(pdf)[0], 'B', 30)
         pdf.set_text_color(0, 0, 0)
         pdf.set_x(pdf.l_margin)
         pdf.cell(pdf.epw, 15, _pdf_safe(data['title']), align='C')
@@ -1157,7 +1264,7 @@ def _render_cover_page_pdf(pdf, data: dict):
     # Subtitle
     if data.get('subtitle'):
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', '', 16)
+        pdf.set_font(_pdf_body(pdf)[0], '', 16)
         pdf.set_text_color(100, 100, 100)
         pdf.cell(pdf.epw, 10, _pdf_safe(data['subtitle']), align='C')
         pdf.ln(15)
@@ -1167,7 +1274,7 @@ def _render_cover_page_pdf(pdf, data: dict):
     # Author
     if data.get('author'):
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', '', 14)
+        pdf.set_font(_pdf_body(pdf)[0], '', 14)
         pdf.set_text_color(0, 0, 0)
         pdf.cell(pdf.epw, 10, _pdf_safe(data['author']), align='C')
         pdf.ln(10)
@@ -1175,7 +1282,7 @@ def _render_cover_page_pdf(pdf, data: dict):
     # Date
     if data.get('date'):
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', '', 12)
+        pdf.set_font(_pdf_body(pdf)[0], '', 12)
         pdf.set_text_color(128, 128, 128)
         pdf.cell(pdf.epw, 10, _pdf_safe(data['date']), align='C')
         pdf.ln(10)
@@ -1194,7 +1301,7 @@ def _render_table_pdf(pdf, table_data: dict):
 
     # Captions leave text color gray; tables must not inherit that.
     pdf.set_text_color(0, 0, 0)
-    pdf.set_font('Helvetica', '', 10)
+    _pdf_font(pdf, '', -1)
     for i, row in enumerate(rows):
         pdf.set_x(pdf.l_margin)
         for j, cell in enumerate(row):
@@ -1202,10 +1309,10 @@ def _render_table_pdf(pdf, table_data: dict):
                 text = ''.join(r.get('text', '') for r in cell.get('runs', []))
                 is_header = i == 0
                 if is_header:
-                    pdf.set_font('Helvetica', 'B', 10)
+                    _pdf_font(pdf, 'B', -1)
                     pdf.set_fill_color(230, 230, 230)
                 else:
-                    pdf.set_font('Helvetica', '', 10)
+                    _pdf_font(pdf, '', -1)
                     pdf.set_fill_color(255, 255, 255)
                 # Use explicit width and ensure x position
                 pdf.cell(col_width, 8, _pdf_safe(text[:50]), border=1, fill=is_header)
@@ -1214,7 +1321,7 @@ def _render_table_pdf(pdf, table_data: dict):
     caption = table_data.get('caption')
     if caption:
         pdf.set_x(pdf.l_margin)
-        pdf.set_font('Helvetica', 'I', 9)
+        _pdf_font(pdf, 'I', -2)
         pdf.set_text_color(100, 100, 100)
         pdf.cell(0, 5, _pdf_safe(caption), align='C')
         pdf.ln(3)
