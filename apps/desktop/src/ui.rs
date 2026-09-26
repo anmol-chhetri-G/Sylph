@@ -433,6 +433,24 @@ impl SylphApp {
             .child(icon(glyph, if active { primary } else { text }, 16.0))
     }
 
+    /// Portrait / Landscape: the lit one follows the document, and a click
+    /// sets it (the canvas, the ruler and both exporters follow).
+    fn orientation_buttons(&self, cx: &mut Context<Self>) -> [Div; 2] {
+        let landscape = self.document.landscape;
+        [
+            self.compact_button("▣  Portrait", !landscape)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_orientation(false, cx)),
+                ),
+            self.compact_button("▱  Landscape", landscape)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_orientation(true, cx)),
+                ),
+        ]
+    }
+
     fn compact_button(&self, text: impl Into<String>, active: bool) -> Div {
         let fg = if active {
             self.ui_primary()
@@ -2570,8 +2588,7 @@ impl SylphApp {
                             .gap(px(2.0))
                             .p(px(2.0))
                             .bg(panel)
-                            .child(self.compact_button("▣  Portrait", true))
-                            .child(self.compact_button("▱  Landscape", false)),
+                            .children(self.orientation_buttons(cx)),
                     )
                     .child(label("Margins", muted, 11.0).mt(px(12.0)))
                     .child({
@@ -3173,8 +3190,7 @@ impl SylphApp {
                 div()
                     .flex()
                     .mt(px(8.0))
-                    .child(self.compact_button("▣  Portrait", true))
-                    .child(self.compact_button("▱  Landscape", false)),
+                    .children(self.orientation_buttons(cx)),
             )
             .child(label("Margins", muted, 11.0).mt(px(16.0)))
             .child({
@@ -3434,6 +3450,7 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::ai_submit))
             .on_action(cx.listener(Self::insert_page_break))
             .on_action(cx.listener(Self::set_page_size))
+            .on_action(cx.listener(Self::toggle_orientation))
             .on_action(cx.listener(Self::set_image_caption))
             .on_action(cx.listener(Self::set_table_caption))
             .on_action(cx.listener(Self::set_paragraph_spacing))

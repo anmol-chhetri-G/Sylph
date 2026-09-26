@@ -700,6 +700,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_landscape_swaps_the_page_dimensions() {
+        // The canvas, the ruler and the exporters all size the page from
+        // page_width/page_height, so orientation must swap them.
+        let mut doc = Document::new();
+        assert_eq!((doc.page_width(), doc.page_height()), (595.0, 842.0));
+        doc.set_landscape(true);
+        assert_eq!((doc.page_width(), doc.page_height()), (842.0, 595.0));
+        doc.set_landscape(false);
+        assert_eq!((doc.page_width(), doc.page_height()), (595.0, 842.0));
+    }
+
+    #[test]
     fn test_document_missing_fields_load_as_defaults() {
         // A model saved before a field existed must still load.
         let mut saved = serde_json::to_value(Document {

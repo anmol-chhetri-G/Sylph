@@ -2882,6 +2882,24 @@ impl SylphApp {
         cx.notify();
     }
 
+    /// Portrait or landscape for the whole document: the canvas, the ruler
+    /// and both exporters read `landscape`.
+    fn set_orientation(&mut self, landscape: bool, cx: &mut Context<Self>) {
+        self.document.set_landscape(landscape);
+        let name = if landscape { "Landscape" } else { "Portrait" };
+        self.set_status(format!("Orientation: {name}"), cx);
+        cx.notify();
+    }
+
+    fn toggle_orientation(
+        &mut self,
+        _: &SetOrientation,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_orientation(!self.document.landscape, cx);
+    }
+
     fn set_page_margins(
         &mut self,
         _: &SetPageMargins,
