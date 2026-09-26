@@ -471,7 +471,10 @@ impl Default for PageMargins {
     }
 }
 
+/// `#[serde(default)]`: a saved model that predates a field loads with that
+/// field's default instead of failing (models are persisted per document).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Document {
     pub blocks: Vec<Block>,
     pub title: String,
@@ -695,6 +698,22 @@ impl Default for Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_document_missing_fields_load_as_defaults() {
+        // A model saved before a field existed must still load.
+        let mut saved = serde_json::to_value(Document {
+            page_size: PageSize::Letter,
+            ..Document::new()
+        })
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("landscape");
+        saved.as_object_mut().unwrap().remove("body_font_size");
+        let loaded: Document = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.page_size, PageSize::Letter);
+        assert!(!loaded.landscape);
+        assert_eq!(loaded.body_font_size, Document::new().body_font_size);
+    }
 
     // ── TextRun ─────────────────────────────────────────────────
 

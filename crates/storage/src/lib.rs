@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS crdt_updates (
 CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_models (
+    document_id INTEGER PRIMARY KEY REFERENCES documents(id),
+    model_json TEXT NOT NULL
 );";
 
 /// Platform data directory for Sylph (database, exports, images).
@@ -133,6 +137,37 @@ impl Storage {
     pub fn load_text(&self, doc_id: i64) -> Result<Option<String>, Box<dyn std::error::Error>> {
         match self.load_document(doc_id)? {
             Some(bytes) => Ok(Some(String::from_utf8(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store a document's structured model (page setup, cover page,
+    /// inserted blocks) as JSON, replacing the previous copy.
+    pub fn save_model(
+        &self,
+        doc_id: i64,
+        model_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO document_models (document_id, model_json) VALUES (?1, ?2)",
+            params![doc_id, model_json],
+        )?;
+        self.conn.execute(
+            "UPDATE documents SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![doc_id],
+        )?;
+        Ok(())
+    }
+
+    /// The JSON stored by `save_model`, or `None` for a document that
+    /// never had one (e.g. created before models were saved).
+    pub fn load_model(&self, doc_id: i64) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT model_json FROM document_models WHERE document_id = ?1")?;
+        let mut rows = stmt.query(params![doc_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
         }
     }
@@ -272,6 +307,32 @@ mod tests {
             .unwrap();
         assert_eq!(storage.last_opened().unwrap(), None);
         assert_eq!(storage.open_last_or_create().unwrap(), a);
+    }
+
+    // ── Structured model ──────────────────────────────────────────
+
+    #[test]
+    fn test_model_round_trips_and_replaces() {
+        let storage = temp_storage();
+        let id = storage.create_document("Report").unwrap();
+        assert_eq!(storage.load_model(id).unwrap(), None);
+        storage.save_model(id, r#"{"page_size":"A4"}"#).unwrap();
+        storage.save_model(id, r#"{"page_size":"Letter"}"#).unwrap();
+        // One row per document: the newer model replaces the older one.
+        assert_eq!(
+            storage.load_model(id).unwrap().as_deref(),
+            Some(r#"{"page_size":"Letter"}"#)
+        );
+    }
+
+    #[test]
+    fn test_models_are_kept_per_document() {
+        let storage = temp_storage();
+        let a = storage.create_document("A").unwrap();
+        let b = storage.create_document("B").unwrap();
+        storage.save_model(a, "a-model").unwrap();
+        assert_eq!(storage.load_model(a).unwrap().as_deref(), Some("a-model"));
+        assert_eq!(storage.load_model(b).unwrap(), None);
     }
 
     // ── Construction ──────────────────────────────────────────────

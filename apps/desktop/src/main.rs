@@ -1870,6 +1870,12 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(4
 struct SylphApp {
     editor: Entity<TextInput>,
     document: sylph_core::document::Document,
+    /// The copy of `document` last written to storage; any difference is
+    /// saved by `persist_model_if_changed` after the next notify.
+    persisted_model: sylph_core::document::Document,
+    /// Why the structured model failed to save, if it did. The save
+    /// indicator shows it, so a good text save cannot hide it.
+    model_save_error: Option<String>,
     focus_handle: FocusHandle,
     sidebar_visible: bool,
     /// Canvas layout: `false` = Print (fixed page canvas), `true` = Web
@@ -1900,6 +1906,7 @@ struct SylphApp {
     zoom_percent: u16,
     image_picker_task: Option<Task<()>>,
     _keystroke_subscription: Subscription,
+    _model_observer: Subscription,
 }
 
 actions!(
@@ -2297,10 +2304,37 @@ impl SylphApp {
             .unwrap_or_default();
     }
 
-    /// `false` when the text could not be written. Callers about to replace
-    /// the editor content must then stay put, or the unsaved text is lost.
+    /// Save the structured model (page setup, cover page, inserted blocks)
+    /// whenever it differs from the last saved copy. Registered with
+    /// `observe_self`, so it runs after every notify and no handler can
+    /// forget it. It never notifies itself: a failed save retries on the
+    /// next notify instead of looping.
+    fn persist_model_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.document == self.persisted_model {
+            return;
+        }
+        let result = {
+            let editor = self.editor.read(cx);
+            serde_json::to_string(&self.document)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                .and_then(|json| editor.storage.save_model(editor.doc_id, &json))
+        };
+        match result {
+            Ok(()) => {
+                self.persisted_model = self.document.clone();
+                self.model_save_error = None;
+            }
+            Err(e) => self.model_save_error = Some(e.to_string()),
+        }
+    }
+
+    /// `false` when the text or the structured model could not be written.
+    /// Callers about to replace the editor content must then stay put, or
+    /// the unsaved work is lost.
     fn save_current_document(&mut self, cx: &mut Context<Self>) -> bool {
-        let saved = self.editor.update(cx, |editor, cx| editor.save_now(cx));
+        self.persist_model_if_changed(cx);
+        let saved = self.editor.update(cx, |editor, cx| editor.save_now(cx))
+            && self.model_save_error.is_none();
         if !saved {
             self.set_status("Could not save this document, so it stays open", cx);
         }
@@ -2337,10 +2371,16 @@ impl SylphApp {
             editor.save_state = SaveState::Saved;
             cx.notify();
         });
-        // Structured blocks are not persisted with the legacy text-only storage yet.
-        // Reset the transient block list when changing documents so a page break,
-        // table, or image cannot leak into the next document.
-        self.document = sylph_core::document::Document::new();
+        // Each document keeps its own page setup, cover page and inserted
+        // blocks, so nothing leaks from the previous document.
+        let (model, warning) =
+            load_model_or_default(&self.editor.read(cx).storage, doc_id, &recovered_dir());
+        self.persisted_model = model.clone();
+        self.document = model;
+        self.model_save_error = None;
+        if let Some(warning) = warning {
+            self.set_status(warning, cx);
+        }
         self.doc_title = doc_title;
     }
 
@@ -5459,6 +5499,48 @@ fn data_path(rel: &str) -> PathBuf {
     path
 }
 
+/// Where unreadable saved models are copied before defaults replace them.
+fn recovered_dir() -> PathBuf {
+    sylph_storage::data_dir().join("recovered")
+}
+
+/// The saved structured model (page setup, cover page, inserted blocks)
+/// for `doc_id`, or a fresh one, plus a warning for the status bar when
+/// something could not be read. JSON that no longer parses is copied into
+/// `recovered` first, so the next save cannot silently destroy it.
+fn load_model_or_default(
+    storage: &Storage,
+    doc_id: i64,
+    recovered: &std::path::Path,
+) -> (doc::Document, Option<String>) {
+    let json = match storage.load_model(doc_id) {
+        Ok(Some(json)) => json,
+        Ok(None) => return (doc::Document::new(), None),
+        Err(e) => {
+            let warning = format!("Could not read the page setup: {e}");
+            return (doc::Document::new(), Some(warning));
+        }
+    };
+    match serde_json::from_str(&json) {
+        Ok(model) => (model, None),
+        Err(e) => {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let name = format!("document-{doc_id}-model-{millis}.json");
+            let kept = std::fs::create_dir_all(recovered).is_ok()
+                && std::fs::write(recovered.join(&name), &json).is_ok();
+            let warning = if kept {
+                format!("Page setup could not be read ({e}); a copy was kept as recovered/{name}")
+            } else {
+                format!("Page setup could not be read ({e}) and no copy could be kept")
+            };
+            (doc::Document::new(), Some(warning))
+        }
+    }
+}
+
 /// OFF = what you see is what you export: one paragraph per nonblank
 /// source line, verbatim — no `parse_inline_runs`, so `#`, `**` and
 /// `\newpage` stay literal. Styling matches `flush_para` exactly.
@@ -5696,6 +5778,8 @@ fn main() {
                     let doc_title = storage
                         .get_title(doc_id)
                         .unwrap_or_else(|_| "Untitled".to_string());
+                    let (document, model_warning) =
+                        load_model_or_default(&storage, doc_id, &recovered_dir());
 
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
@@ -5737,9 +5821,16 @@ fn main() {
                                 this.on_field_keystroke(event, _window, cx);
                             },
                         );
+                        // Any notify may follow a model change; this one hook
+                        // saves it, so no handler has to remember to.
+                        let model_observer = cx.observe_self(|this: &mut SylphApp, cx| {
+                            this.persist_model_if_changed(cx)
+                        });
                         SylphApp {
                             editor,
-                            document: sylph_core::document::Document::new(),
+                            persisted_model: document.clone(),
+                            document,
+                            model_save_error: None,
                             focus_handle: cx.focus_handle(),
                             sidebar_visible: true,
                             web_layout: false,
@@ -5765,7 +5856,8 @@ fn main() {
                                 response: String::new(),
                                 history: Vec::new(),
                             },
-                            status_message: None,
+                            // A load warning stays up until the next message.
+                            status_message: model_warning,
                             editing_field: EditingField::None,
                             field_input: String::new(),
                             paragraph_spacing: 8.0,
@@ -5779,6 +5871,7 @@ fn main() {
                             image_picker_task: None,
                             status_clear_task: None,
                             _keystroke_subscription: keystroke_subscription,
+                            _model_observer: model_observer,
                         }
                     })
                 },
@@ -6745,5 +6838,72 @@ mod save_state_tests {
     fn save_state_labels_use_word_docs_wording() {
         assert_eq!(SaveState::Saved.label(), "All changes saved");
         assert_eq!(SaveState::Saving.label(), "Saving…");
+    }
+}
+
+#[cfg(test)]
+mod model_persistence_tests {
+    use super::{doc, load_model_or_default};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use sylph_storage::Storage;
+
+    /// A private database and recovered dir per test: parallel tests never
+    /// share state and the real user data dir stays untouched.
+    fn temp_dir() -> std::path::PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "sylph-model-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    #[test]
+    fn saved_model_loads_back() {
+        let dir = temp_dir();
+        let storage = Storage::open_in(&dir).unwrap();
+        let id = storage.create_document("Report").unwrap();
+        let mut model = doc::Document::new();
+        model.set_page_size(doc::PageSize::Letter);
+        model.push_block(doc::Block::table(2, 2));
+        let json = serde_json::to_string(&model).unwrap();
+        storage.save_model(id, &json).unwrap();
+
+        let (loaded, warning) = load_model_or_default(&storage, id, &dir.join("recovered"));
+        assert_eq!(loaded, model);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn document_without_a_model_gets_defaults_silently() {
+        let dir = temp_dir();
+        let storage = Storage::open_in(&dir).unwrap();
+        let id = storage.create_document("Older document").unwrap();
+        let (loaded, warning) = load_model_or_default(&storage, id, &dir.join("recovered"));
+        assert_eq!(loaded, doc::Document::new());
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn unreadable_model_is_kept_before_defaults_take_over() {
+        let dir = temp_dir();
+        let storage = Storage::open_in(&dir).unwrap();
+        let id = storage.create_document("From a newer Sylph").unwrap();
+        let json = r#"{"blocks":[{"Hologram":{}}]}"#;
+        storage.save_model(id, json).unwrap();
+
+        let recovered = dir.join("recovered");
+        let (loaded, warning) = load_model_or_default(&storage, id, &recovered);
+        assert_eq!(loaded, doc::Document::new());
+        let warning = warning.expect("an unreadable model must be reported");
+        assert!(
+            warning.contains("a copy was kept as recovered/"),
+            "{warning}"
+        );
+        // The original JSON survives byte-for-byte.
+        let kept: Vec<_> = std::fs::read_dir(&recovered).unwrap().collect();
+        assert_eq!(kept.len(), 1);
+        let path = kept[0].as_ref().unwrap().path();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), json);
     }
 }

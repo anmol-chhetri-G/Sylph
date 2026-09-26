@@ -2726,7 +2726,13 @@ impl SylphApp {
             } else {
                 format!("Ln {line}, Col {column}")
             };
-            (position, words, editor.save_state.clone())
+            let save_state = match &self.model_save_error {
+                // Page setup / inserted objects failed to save: a good
+                // text save must not hide that.
+                Some(reason) => SaveState::Failed(reason.clone()),
+                None => editor.save_state.clone(),
+            };
+            (position, words, save_state)
         };
         let page_count = self.page_count(cx);
         // The save indicator always shows the real save state in Word/Docs
