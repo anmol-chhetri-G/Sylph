@@ -1,13 +1,16 @@
-use std::{ops::Range, path::PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use gpui::{
-    actions, anchored, div, fill, hsla, img, point, prelude::*, px, rgb, rgba, size, App,
-    Application, AsyncApp, Bounds, ClipboardEntry, ClipboardItem, Context, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
-    KeyBinding, KeystrokeEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, PathPromptOptions, Point, ScrollWheelEvent, ShapedLine, Style,
-    Subscription, Task, TextRun, TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds,
-    WindowDecorations, WindowOptions,
+    actions, div, fill, hsla, point, prelude::*, px, rgb, rgba, size, App, Application, AsyncApp,
+    Bounds, ClipboardEntry, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeystrokeEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    PathPromptOptions, Point, ScrollWheelEvent, ShapedLine, Style, Subscription, Task, TextRun,
+    TitlebarOptions, UTF16Selection, WeakEntity, Window, WindowBounds, WindowDecorations,
+    WindowOptions,
 };
 
 use sylph_core::{
@@ -43,6 +46,14 @@ actions!(
         DeleteToLineStart,
         DeleteToLineEnd,
         Dedent,
+        SelectWordLeft,
+        SelectWordRight,
+        SelectToLineStart,
+        SelectToLineEnd,
+        MoveToDocStart,
+        MoveToDocEnd,
+        SelectToDocStart,
+        SelectToDocEnd,
     ]
 );
 
@@ -373,6 +384,48 @@ impl TextInput {
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.line_end(self.cursor_offset());
         self.move_to(offset, cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.previous_word_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_to_line_start(
+        &mut self,
+        _: &SelectToLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.line_start(self.cursor_offset()), cx);
+    }
+
+    fn select_to_line_end(&mut self, _: &SelectToLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.line_end(self.cursor_offset()), cx);
+    }
+
+    fn move_to_doc_start(&mut self, _: &MoveToDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn move_to_doc_end(&mut self, _: &MoveToDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    fn select_to_doc_start(
+        &mut self,
+        _: &SelectToDocStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_doc_end(&mut self, _: &SelectToDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
     }
 
     fn vertically_navigate(&mut self, direction: i32, select: bool, cx: &mut Context<Self>) {
@@ -1033,13 +1086,15 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Replace `range` (byte offsets; the selection when `None`) with
+    /// `new_text` as one undoable edit.
     fn replace_text_in_range(
         &mut self,
-        range_utf16: Option<Range<usize>>,
+        range: Option<Range<usize>>,
         new_text: &str,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16.unwrap_or(self.selected_range.clone());
+        let range = range.unwrap_or(self.selected_range.clone());
         let start = snap_to_char_boundary(&self.content, range.start);
         let end = snap_to_char_boundary(&self.content, range.end).max(start);
 
@@ -1771,6 +1826,14 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::select_to_line_start))
+            .on_action(cx.listener(Self::select_to_line_end))
+            .on_action(cx.listener(Self::move_to_doc_start))
+            .on_action(cx.listener(Self::move_to_doc_end))
+            .on_action(cx.listener(Self::select_to_doc_start))
+            .on_action(cx.listener(Self::select_to_doc_end))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
@@ -1798,8 +1861,13 @@ struct FindReplaceState {
     visible: bool,
     query: String,
     replacement: String,
-    matches: Vec<usize>,
+    /// Byte ranges of the query in the document, left to right.
+    matches: Vec<Range<usize>>,
     current_match: usize,
+    /// Typing goes to the Replace field instead of the Find field.
+    replace_focused: bool,
+    /// Exact case instead of the default case-insensitive search.
+    match_case: bool,
 }
 
 struct ContextMenuState {
@@ -1822,7 +1890,6 @@ enum EditingField {
     CoverAuthor,
     ImageCaption(usize),
     TableCaption(usize),
-    ParagraphSpacing,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1843,7 +1910,10 @@ enum InspectorMode {
 enum WorkspaceOverlay {
     None,
     CommandPalette,
-    ModalShowcase,
+    Export,
+    PageSetup,
+    InsertTable,
+    Shortcuts,
 }
 
 /// Where `export_document` writes: same merged model, three renderers.
@@ -1882,7 +1952,6 @@ struct SylphApp {
     /// (continuous full-width flow, no page box or ruler). Focus is not a
     /// field — it is derived from both side panels being hidden.
     web_layout: bool,
-    preview_visible: bool,
     find: FindReplaceState,
     context_menu: ContextMenuState,
     doc_title: String,
@@ -1897,7 +1966,6 @@ struct SylphApp {
     status_clear_task: Option<Task<()>>,
     editing_field: EditingField,
     field_input: String,
-    paragraph_spacing: f32,
     navigator_tab: NavigatorTab,
     inspector_mode: InspectorMode,
     inspector_visible: bool,
@@ -1906,6 +1974,16 @@ struct SylphApp {
     ruler_visible: bool,
     zoom_percent: u16,
     image_picker_task: Option<Task<()>>,
+    /// The pending Save dialog of an export.
+    export_task: Option<Task<()>>,
+    /// Size under the pointer in the Insert Table grid: (rows, columns).
+    table_picker: (usize, usize),
+    /// The open menu-bar menu, if any (index into `SylphApp::menus`).
+    open_menu: Option<usize>,
+    /// Saved versions of the open document, newest first (loaded when the
+    /// history panel opens) and the one selected there.
+    revisions: Vec<sylph_storage::Revision>,
+    selected_revision: Option<i64>,
     _keystroke_subscription: Subscription,
     _model_observer: Subscription,
 }
@@ -1941,7 +2019,6 @@ actions!(
         ExportDocx,
         ExportPdf,
         ExportMarkdown,
-        TogglePreview,
         AddCoverPage,
         PasteImage,
         BoldText,
@@ -1954,7 +2031,6 @@ actions!(
         AiSubmit,
         SetImageCaption,
         SetTableCaption,
-        SetParagraphSpacing,
         EditingCoverTitle,
         EditingCoverSubtitle,
         EditingCoverAuthor,
@@ -1963,7 +2039,8 @@ actions!(
         SetPageMargins,
         OpenCommandPalette,
         CloseOverlay,
-        OpenModalShowcase,
+        OpenExportDialog,
+        OpenPageSetup,
         ShowParagraphInspector,
         ShowImageInspector,
         ShowVersionHistory,
@@ -1973,6 +2050,18 @@ actions!(
         CycleHeading,
         CycleBodyFont,
         SetOrientation,
+        Heading1,
+        Heading2,
+        Heading3,
+        Heading4,
+        Heading5,
+        Heading6,
+        NormalText,
+        FindAndReplace,
+        PrintLayout,
+        WebLayout,
+        FocusMode,
+        ShowShortcuts,
     ]
 );
 
@@ -2029,9 +2118,14 @@ impl SylphApp {
         });
     }
 
-    fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
+        // Tab belongs to the document only while it has the keyboard (in
+        // the find bar it switches fields).
+        if !self.editor.focus_handle(cx).is_focused(window) {
+            return;
+        }
         self.editor.update(cx, |editor, cx| {
-            editor.indent(&Indent, _window, cx);
+            editor.indent(&Indent, window, cx);
         });
     }
 
@@ -2041,41 +2135,90 @@ impl SylphApp {
         });
     }
 
-    fn open_find_bar(&mut self, _: &OpenFindBar, _window: &mut Window, cx: &mut Context<Self>) {
-        self.find.visible = !self.find.visible;
-        if self.find.visible {
-            self.find.query.clear();
-            self.find.replacement.clear();
-            self.find.matches.clear();
-            self.find.current_match = 0;
+    /// Open the find bar (Ctrl+F). Focus leaves the document so typing
+    /// goes to the search; a one-line selection becomes the query, and the
+    /// first match at or after the caret is selected, as in Word and Docs.
+    fn open_find_bar(&mut self, _: &OpenFindBar, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_find_bar(false, window, cx);
+    }
+
+    /// Open the find bar with the Replace field active (Ctrl+H).
+    fn find_and_replace(
+        &mut self,
+        _: &FindAndReplace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_find_bar(true, window, cx);
+    }
+
+    fn show_find_bar(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (selected, caret) = {
+            let editor = self.editor.read(cx);
+            let range = editor.selected_range.clone();
+            (editor.content[range.clone()].to_string(), range.start)
+        };
+        if !selected.is_empty() && !selected.contains('\n') {
+            self.find.query = selected;
         }
+        self.find.visible = true;
+        self.find.replace_focused = replace;
+        window.focus(&self.focus_handle);
+        self.update_matches(cx);
+        self.find.current_match = self
+            .find
+            .matches
+            .iter()
+            .position(|m| m.start >= caret)
+            .unwrap_or(0);
+        self.select_current_match(cx);
         cx.notify();
     }
 
-    fn close_find_bar(&mut self, _: &CloseFindBar, _window: &mut Window, cx: &mut Context<Self>) {
+    fn close_find_bar(&mut self, _: &CloseFindBar, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_find_bar(window, cx);
+    }
+
+    /// Close the find bar and hand the keyboard back to the document, with
+    /// the current match still selected.
+    fn hide_find_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find.visible = false;
+        window.focus(&self.editor.focus_handle(cx));
         cx.notify();
+    }
+
+    /// Matches of the current query in the current text.
+    fn update_matches(&mut self, cx: &mut Context<Self>) {
+        let content = &self.editor.read(cx).content;
+        self.find.matches = find_matches(content, &self.find.query, self.find.match_case);
+        if self.find.current_match >= self.find.matches.len() {
+            self.find.current_match = 0;
+        }
+    }
+
+    /// Select the current match in the document (scrolling it into view).
+    fn select_current_match(&mut self, cx: &mut Context<Self>) {
+        let Some(found) = self.find.matches.get(self.find.current_match).cloned() else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.move_to(found.start, cx);
+            editor.select_to(found.end, cx);
+        });
     }
 
     fn find_navigate(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if self.find.matches.is_empty() {
-            return;
-        }
-        if forward {
-            self.find.current_match = (self.find.current_match + 1) % self.find.matches.len();
-        } else {
-            self.find.current_match = if self.find.current_match == 0 {
-                self.find.matches.len() - 1
+        // The text may have changed since the last search.
+        self.update_matches(cx);
+        let count = self.find.matches.len();
+        if count > 0 {
+            self.find.current_match = if forward {
+                (self.find.current_match + 1) % count
             } else {
-                self.find.current_match - 1
+                (self.find.current_match + count - 1) % count
             };
+            self.select_current_match(cx);
         }
-        let pos = self.find.matches[self.find.current_match];
-        let query_len = self.find.query.len();
-        self.editor.update(cx, |editor, cx| {
-            editor.selected_range = pos..pos + query_len;
-            editor.move_to(pos, cx);
-        });
         cx.notify();
     }
 
@@ -2087,94 +2230,139 @@ impl SylphApp {
         self.find_navigate(false, cx);
     }
 
+    fn toggle_find_case(&mut self, cx: &mut Context<Self>) {
+        self.find.match_case = !self.find.match_case;
+        self.update_matches(cx);
+        self.select_current_match(cx);
+        cx.notify();
+    }
+
+    /// Replace the current match and move on to the next one (Word's
+    /// Replace button).
     fn replace_current(
         &mut self,
         _: &ReplaceCurrent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find.matches.is_empty() || self.find.query.is_empty() {
+        self.update_matches(cx);
+        let Some(found) = self.find.matches.get(self.find.current_match).cloned() else {
             return;
-        }
-        let pos = self.find.matches[self.find.current_match];
-        let query_len = self.find.query.len();
+        };
+        let replacement = self.find.replacement.clone();
         self.editor.update(cx, |editor, cx| {
-            editor.selected_range = pos..pos + query_len;
-            editor.replace_text_in_range(None, &self.find.replacement, cx);
+            editor.replace_text_in_range(Some(found.clone()), &replacement, cx);
         });
         self.update_matches(cx);
+        let after = found.start + replacement.len();
+        self.find.current_match = self
+            .find
+            .matches
+            .iter()
+            .position(|m| m.start >= after)
+            .unwrap_or(0);
+        self.select_current_match(cx);
         cx.notify();
     }
 
+    /// Replace every match as one undoable edit.
     fn replace_all(&mut self, _: &ReplaceAll, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.query.is_empty() {
+        self.update_matches(cx);
+        let (Some(first), Some(last)) = (self.find.matches.first(), self.find.matches.last())
+        else {
+            self.set_status("No matches to replace", cx);
+            return;
+        };
+        let count = self.find.matches.len();
+        // Rewrite only the span that holds matches, so the caret stays put.
+        let span = first.start..last.end;
+        let new_span = {
+            let content = &self.editor.read(cx).content;
+            let shifted: Vec<Range<usize>> = self
+                .find
+                .matches
+                .iter()
+                .map(|m| m.start - span.start..m.end - span.start)
+                .collect();
+            replace_matches(&content[span.clone()], &shifted, &self.find.replacement)
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.replace_text_in_range(Some(span.clone()), &new_span, cx);
+            editor.move_to(span.start, cx);
+        });
+        self.update_matches(cx);
+        let noun = if count == 1 { "match" } else { "matches" };
+        self.set_status(format!("Replaced {count} {noun}"), cx);
+        cx.notify();
+    }
+
+    /// Paste (Ctrl+V) into the active find field. The document handles
+    /// Paste itself while it has focus, so this runs only for the bar.
+    fn paste_into_find(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find.visible || self.editor.focus_handle(cx).is_focused(window) {
             return;
         }
-        let content = self.editor.read(cx).content.clone();
-        let query = self.find.query.clone();
-        let replacement = self.find.replacement.clone();
-        let new_content = content.replace(&query, &replacement);
-        if new_content != content {
-            self.editor.update(cx, |editor, cx| {
-                editor.selected_range = 0..content.len();
-                editor.replace_text_in_range(None, &new_content, cx);
-            });
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let line = text.lines().next().unwrap_or_default().to_string();
+        if self.find.replace_focused {
+            self.find.replacement.push_str(&line);
+        } else {
+            self.find.query.push_str(&line);
+            self.update_matches(cx);
+            self.select_current_match(cx);
         }
-        self.update_matches(cx);
         cx.notify();
     }
 
     fn on_find_keystroke(
         &mut self,
         event: &KeystrokeEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.find.visible {
+        // Only while the bar has the keyboard: back in the document, typing
+        // is document text.
+        if !self.find.visible || self.editor.focus_handle(cx).is_focused(window) {
             return;
         }
-        let key = event.keystroke.key.as_str();
-        if key == "escape" {
-            self.find.visible = false;
-            cx.notify();
-            return;
-        }
-        if key == "enter" {
-            if event.keystroke.modifiers.shift {
-                self.find_prev(&FindPrev, _window, cx);
-            } else {
-                self.find_next(&FindNext, _window, cx);
+        let keystroke = &event.keystroke;
+        let shift = keystroke.modifiers.shift;
+        match keystroke.key.as_str() {
+            "escape" => return self.hide_find_bar(window, cx),
+            "enter" if self.find.replace_focused && !shift => {
+                return self.replace_current(&ReplaceCurrent, window, cx);
             }
+            "enter" => return self.find_navigate(!shift, cx),
+            "tab" => {
+                self.find.replace_focused = !self.find.replace_focused;
+                return cx.notify();
+            }
+            _ => {}
+        }
+        let field = if self.find.replace_focused {
+            &mut self.find.replacement
+        } else {
+            &mut self.find.query
+        };
+        if keystroke.key == "backspace" {
+            field.pop();
+        } else if let Some(ch) = &keystroke.key_char {
+            if keystroke.modifiers.platform || keystroke.modifiers.control {
+                return;
+            }
+            field.push_str(ch);
+        } else {
             return;
         }
-        if key == "backspace" {
-            self.find.query.pop();
+        if !self.find.replace_focused {
+            // Search as you type, from the first match.
+            self.find.current_match = 0;
             self.update_matches(cx);
-            cx.notify();
-            return;
+            self.select_current_match(cx);
         }
-        if let Some(ch) = &event.keystroke.key_char {
-            if !event.keystroke.modifiers.platform && !event.keystroke.modifiers.control {
-                self.find.query.push_str(ch);
-                self.update_matches(cx);
-                cx.notify();
-            }
-        }
-    }
-
-    fn update_matches(&mut self, cx: &mut Context<Self>) {
-        self.find.matches.clear();
-        self.find.current_match = 0;
-        if self.find.query.is_empty() {
-            return;
-        }
-        let content = self.editor.read(cx).content.clone();
-        let query = self.find.query.clone();
-        let mut start = 0;
-        while let Some(pos) = content[start..].find(&query) {
-            self.find.matches.push(start + pos);
-            start += pos + 1;
-        }
+        cx.notify();
     }
 
     fn on_editor_right_click(
@@ -2379,6 +2567,11 @@ impl SylphApp {
         self.persisted_model = model.clone();
         self.document = model;
         self.model_save_error = None;
+        self.revisions.clear();
+        self.selected_revision = None;
+        if matches!(self.inspector_mode, InspectorMode::History) {
+            self.load_revisions(cx);
+        }
         if let Some(warning) = warning {
             self.set_status(warning, cx);
         }
@@ -2438,39 +2631,11 @@ impl SylphApp {
             rgb(0xffffff)
         }
     }
-    fn sidebar_color(&self) -> gpui::Rgba {
-        if self.dark_mode {
-            rgb(0x111c2e)
-        } else {
-            rgb(0xeff4ff)
-        }
-    }
-    fn border_color(&self) -> gpui::Rgba {
-        if self.dark_mode {
-            rgb(0x1e293b)
-        } else {
-            rgb(0xc4c5d7)
-        }
-    }
-    fn editor_bg(&self) -> gpui::Rgba {
-        if self.dark_mode {
-            rgb(0x0b1220)
-        } else {
-            rgb(0xffffff)
-        }
-    }
     fn hover_color(&self) -> gpui::Rgba {
         if self.dark_mode {
             rgb(0x1e293b)
         } else {
             rgb(0xe5eeff)
-        }
-    }
-    fn active_doc_color(&self) -> gpui::Rgba {
-        if self.dark_mode {
-            rgb(0x1e3b73)
-        } else {
-            rgb(0xdce9ff)
         }
     }
 
@@ -2484,33 +2649,41 @@ impl SylphApp {
         export_page_count(&self.export_view(cx))
     }
 
+    /// Export as `format` wherever the user chooses, like Save As in Word
+    /// or Docs: the system's Save dialog opens in the Documents folder with
+    /// a file name from the title. If no dialog can open (no portal), the
+    /// file goes to the Documents folder and the status bar says so.
     fn export_document(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
-        let ext = format.ext();
-        // Keep the file inside the data dir: doc_title is user-editable, so
-        // strip path separators and other unsafe filename characters.
-        let safe_title: String = self
-            .doc_title
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let file_name = format!("{}.{}", safe_title.replace(' ', "_"), ext);
-        let path = data_path(&file_name).to_string_lossy().into_owned();
+        self.overlay = WorkspaceOverlay::None;
+        let file_name = format!("{}.{}", safe_file_stem(&self.doc_title), format.ext());
+        let folder = dirs::document_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(sylph_storage::data_dir);
+        let answer = cx.prompt_for_new_path(&folder, Some(&file_name));
+        self.export_task = Some(cx.spawn(
+            async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
+                let path = match answer.await {
+                    Ok(Ok(Some(path))) => path,
+                    Ok(Ok(None)) => return, // cancelled
+                    _ => folder.join(&file_name),
+                };
+                let _ = this.update(cx, |this, cx| this.export_to_path(format, &path, cx));
+            },
+        ));
+        cx.notify();
+    }
+
+    /// Write the export (the same merged model as the canvas, through the
+    /// Python renderers) to `path` and report the result in the status bar.
+    fn export_to_path(&mut self, format: ExportFormat, path: &Path, cx: &mut Context<Self>) {
+        let out = path.to_string_lossy().into_owned();
         let content = self.editor.read(cx).content.clone();
-        // Neither buffer alone is the document yet: typed text lives in the
-        // editor, cover/tables/images/page breaks live in self.document.
-        // Merge both so export never silently drops content.
         let model = self.export_view(cx);
         let result = match serde_json::to_string(&model) {
             Ok(json) => match format {
-                ExportFormat::Pdf => sylph_py_bridge::export_rich_pdf(&json, &path),
-                ExportFormat::Docx => sylph_py_bridge::export_rich_docx(&json, &path),
-                ExportFormat::Markdown => sylph_py_bridge::export_rich_markdown(&json, &path),
+                ExportFormat::Pdf => sylph_py_bridge::export_rich_pdf(&json, &out),
+                ExportFormat::Docx => sylph_py_bridge::export_rich_docx(&json, &out),
+                ExportFormat::Markdown => sylph_py_bridge::export_rich_markdown(&json, &out),
             },
             Err(e) => match format {
                 ExportFormat::Pdf => {
@@ -2518,18 +2691,23 @@ impl SylphApp {
                     format!("Export failed to serialize document: {e}")
                 }
                 ExportFormat::Docx => {
-                    let fallback = sylph_py_bridge::export_to_docx(&content, &path);
+                    let fallback = sylph_py_bridge::export_to_docx(&content, &out);
                     format!("Export failed to serialize document: {e}. Fallback: {fallback}")
                 }
                 ExportFormat::Markdown => format!("Export failed to serialize document: {e}"),
             },
         };
-        // The status bar shows the file name, never the internal
-        // storage path (Google Docs / Word say "Exported · x").
+        let name = path
+            .file_name()
+            .map_or(out.clone(), |n| n.to_string_lossy().into_owned());
+        let folder = path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let message = if result.starts_with("Exported to ") {
-            format!("Exported · {}", file_name)
+            format!("Exported · {name} (in {folder})")
         } else {
-            result.replace(&sylph_storage::data_dir().display().to_string(), "")
+            result
         };
         self.set_status(message, cx);
     }
@@ -2549,11 +2727,6 @@ impl SylphApp {
         cx: &mut Context<Self>,
     ) {
         self.export_document(ExportFormat::Markdown, cx);
-    }
-
-    fn toggle_preview(&mut self, _: &TogglePreview, _window: &mut Window, cx: &mut Context<Self>) {
-        self.preview_visible = !self.preview_visible;
-        cx.notify();
     }
 
     fn add_cover_page(&mut self, _: &AddCoverPage, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2756,30 +2929,113 @@ impl SylphApp {
     }
 
     fn set_heading(&mut self, level: u8, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(level, cx);
+    }
+
+    /// Make the caret's line (every line of a selection) a heading of
+    /// `level`, or Normal text for 0. Like a paragraph style in Word or
+    /// Docs it applies to whole lines, wherever the caret sits in them, and
+    /// the caret stays on the same character.
+    fn apply_heading_level(&mut self, level: u8, cx: &mut Context<Self>) {
         if !self.require_markdown(cx) {
             return;
         }
-        let prefix = "#".repeat(level as usize);
         self.editor.update(cx, |editor, cx| {
-            let text = editor.content.clone();
             let sel = editor.selected_range.clone();
-            if sel.start < sel.end && sel.end <= text.len() {
-                let selected = &text[sel.clone()];
-                let new_text = format!("{} {}", prefix, selected);
-                editor.replace_text_in_range(Some(sel), &new_text, cx);
+            let cursor = editor.cursor_offset();
+            let start = editor.line_start(sel.start);
+            let end = editor.line_end(sel.end);
+            let block = editor.content[start..end].to_string();
+            let mut new_block = String::with_capacity(block.len() + 8);
+            let mut new_cursor = None;
+            let mut line_start = start;
+            for (i, line) in block.split('\n').enumerate() {
+                if i > 0 {
+                    new_block.push('\n');
+                }
+                let (new_line, marker_before, marker_after) = with_heading_level(line, level);
+                if new_cursor.is_none() && cursor <= line_start + line.len() {
+                    // Same character after the marker; a caret inside the
+                    // old marker lands at the start of the text.
+                    let in_line = cursor.saturating_sub(line_start).max(marker_before);
+                    new_cursor =
+                        Some(start + new_block.len() + in_line - marker_before + marker_after);
+                }
+                new_block.push_str(&new_line);
+                line_start += line.len() + 1;
+            }
+            editor.replace_text_in_range(Some(start..end), &new_block, cx);
+            if sel.is_empty() {
+                editor.move_to(new_cursor.unwrap_or(start + new_block.len()), cx);
             } else {
-                // No selection — insert heading prefix at cursor
-                editor.replace_text_in_range(None, &format!("{} ", prefix), cx);
+                editor.move_to(start, cx);
+                editor.select_to(start + new_block.len(), cx);
             }
         });
+        let label = match level {
+            1..=6 => format!("Heading {level}"),
+            _ => "Normal".to_string(),
+        };
+        self.set_status(format!("Style: {label}"), cx);
         cx.notify();
     }
 
+    fn heading_1(&mut self, _: &Heading1, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(1, cx);
+    }
+
+    fn heading_2(&mut self, _: &Heading2, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(2, cx);
+    }
+
+    fn heading_3(&mut self, _: &Heading3, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(3, cx);
+    }
+
+    fn heading_4(&mut self, _: &Heading4, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(4, cx);
+    }
+
+    fn heading_5(&mut self, _: &Heading5, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(5, cx);
+    }
+
+    fn heading_6(&mut self, _: &Heading6, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(6, cx);
+    }
+
+    fn normal_text(&mut self, _: &NormalText, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(0, cx);
+    }
+
+    /// Open the table size picker (Word's Insert Table grid).
     fn insert_table(&mut self, _: &InsertTable, _window: &mut Window, cx: &mut Context<Self>) {
-        // Insert a 3x3 table
-        let table_block = sylph_core::document::Block::table(3, 3);
-        self.document.push_block(table_block);
-        self.set_status("Table inserted (3×3)", cx);
+        self.table_picker = (0, 0);
+        self.overlay = WorkspaceOverlay::InsertTable;
+        cx.notify();
+    }
+
+    /// Insert a `rows` × `cols` pipe table (the first row is the header) on
+    /// its own lines after the caret's line, and select the first header
+    /// cell so typing names it. It is ordinary Markdown: editable in place
+    /// and exported as a real table.
+    fn insert_markdown_table(&mut self, rows: usize, cols: usize, cx: &mut Context<Self>) {
+        self.overlay = WorkspaceOverlay::None;
+        if !self.require_markdown(cx) {
+            return;
+        }
+        let table = markdown_table(rows, cols);
+        self.editor.update(cx, |editor, cx| {
+            let at = editor.line_end(editor.cursor_offset());
+            let blank_line = editor.line_start(at) == at;
+            let lead = if blank_line { "" } else { "\n\n" };
+            let inserted = format!("{lead}{table}\n");
+            editor.replace_text_in_range(Some(at..at), &inserted, cx);
+            let cell = at + lead.len() + "| ".len();
+            editor.move_to(cell, cx);
+            editor.select_to(cell + "Column 1".len(), cx);
+        });
+        self.set_status(format!("Table inserted ({cols} × {rows})"), cx);
         cx.notify();
     }
 
@@ -2846,20 +3102,6 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn set_paragraph_spacing(
-        &mut self,
-        _: &SetParagraphSpacing,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Ok(val) = self.field_input.parse::<f32>() {
-            self.paragraph_spacing = val.clamp(0.0, 48.0);
-        }
-        self.editing_field = EditingField::None;
-        self.field_input.clear();
-        cx.notify();
-    }
-
     fn insert_page_break(
         &mut self,
         _: &InsertPageBreak,
@@ -2903,39 +3145,118 @@ impl SylphApp {
         self.set_orientation(!self.document.landscape, cx);
     }
 
+    /// Cycle the margin presets (Normal → Narrow → Moderate → Wide).
     fn set_page_margins(
         &mut self,
         _: &SetPageMargins,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Cycle through margin presets: Normal -> Narrow -> Wide -> Normal
-        let m = &self.document.page_margins;
-        let new_margins = if (m.top - 72.0).abs() < 1.0 {
-            // Normal (72pt = 1in) -> Narrow (36pt = 0.5in)
-            sylph_core::document::PageMargins {
-                top: 36.0,
-                bottom: 36.0,
-                left: 36.0,
-                right: 36.0,
-            }
-        } else if (m.top - 36.0).abs() < 1.0 {
-            // Narrow -> Wide (144pt = 2in)
-            sylph_core::document::PageMargins {
-                top: 144.0,
-                bottom: 144.0,
-                left: 144.0,
-                right: 144.0,
-            }
-        } else {
-            // Wide or other -> Normal
-            sylph_core::document::PageMargins::default()
+        let next = match margin_preset_of(&self.document.page_margins) {
+            Some(i) => (i + 1) % MARGIN_PRESETS.len(),
+            None => 0,
         };
-        self.document.set_margins(new_margins);
+        self.apply_margin_preset(next, cx);
+    }
+
+    fn apply_margin_preset(&mut self, index: usize, cx: &mut Context<Self>) {
+        let (name, margins) = &MARGIN_PRESETS[index];
+        self.document.set_margins(margins.clone());
+        self.set_status(format!("Margins: {name}"), cx);
+        cx.notify();
+    }
+
+    /// Print (pages, both panels), Web (continuous flow) or Focus (pages,
+    /// no side panels): the toolbar chips and the View menu both use this.
+    fn set_view_mode(&mut self, web: bool, panels: bool, cx: &mut Context<Self>) {
+        self.web_layout = web;
+        if !web {
+            self.sidebar_visible = panels;
+            self.inspector_visible = panels;
+        }
+        cx.notify();
+    }
+
+    fn print_layout(&mut self, _: &PrintLayout, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(false, true, cx);
+    }
+
+    fn web_layout(&mut self, _: &WebLayout, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(true, true, cx);
+    }
+
+    fn focus_mode(&mut self, _: &FocusMode, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(false, false, cx);
+    }
+
+    fn show_shortcuts(&mut self, _: &ShowShortcuts, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.overlay = WorkspaceOverlay::Shortcuts;
+        cx.notify();
+    }
+
+    /// Load the open document's version history, after saving any pending
+    /// text so the newest version is what is on screen.
+    fn load_revisions(&mut self, cx: &mut Context<Self>) {
+        // Flush a pending autosave (only then: an unconditional save would
+        // add a duplicate row every time the panel opens).
+        self.editor.update(cx, |editor, cx| {
+            if editor.save_state == SaveState::Saving {
+                editor.save_now(cx);
+            }
+        });
+        let editor = self.editor.read(cx);
+        // Saves less than five minutes apart belong to one session.
+        self.revisions = editor
+            .storage
+            .list_revisions(editor.doc_id, 5 * 60)
+            .unwrap_or_default();
+        if !self
+            .revisions
+            .iter()
+            .any(|r| Some(r.id) == self.selected_revision)
+        {
+            self.selected_revision = None;
+        }
+    }
+
+    /// Bring back a saved version's text as one undoable edit (Ctrl+Z takes
+    /// it back). It is saved at once, so it becomes the newest version and
+    /// every older one stays in the history.
+    fn restore_revision(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(revision) = self.revisions.iter().find(|r| r.id == id).cloned() else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            let whole = 0..editor.content.len();
+            editor.replace_text_in_range(Some(whole), &revision.text, cx);
+            editor.move_to(0, cx);
+            editor.save_now(cx);
+        });
+        self.load_revisions(cx);
+        self.selected_revision = None;
         self.set_status(
-            format!("Margins: {:.1}pt", self.document.page_margins.top),
+            format!(
+                "Restored the version from {} (Ctrl+Z undoes it)",
+                revision.saved
+            ),
             cx,
         );
+    }
+
+    /// Page setup back to the defaults: A4, Normal margins, portrait.
+    fn restore_page_defaults(&mut self, cx: &mut Context<Self>) {
+        let defaults = doc::Document::new();
+        self.document.set_page_size(defaults.page_size);
+        self.document.set_margins(defaults.page_margins);
+        self.document.set_landscape(defaults.landscape);
+        self.set_status("Page setup: defaults (A4, Normal margins, portrait)", cx);
+        cx.notify();
+    }
+
+    fn set_paper(&mut self, size: sylph_core::document::PageSize, cx: &mut Context<Self>) {
+        self.document.set_page_size(size);
+        self.set_status(format!("Page size: {}", self.document.page_size.name()), cx);
         cx.notify();
     }
 
@@ -2962,65 +3283,14 @@ impl SylphApp {
     }
 
     fn cycle_heading(&mut self, _: &CycleHeading, _window: &mut Window, cx: &mut Context<Self>) {
-        let level = self.current_heading_level(cx);
-        let new_level = match level {
+        // Normal → H1 → … → H6 → Normal. Style controls never change the
+        // Markdown toggle: apply_heading_level refuses while it is OFF.
+        let next = match self.current_heading_level(cx) {
             0 => 1,
             6 => 0,
-            l => l + 1,
+            level => level + 1,
         };
-        // Style controls never change the Markdown toggle: when it is OFF,
-        // the user asked for literal source, so say so instead of changing
-        // modes behind their back.
-        if !self.require_markdown(cx) {
-            return;
-        }
-
-        // Modify the current line in the editor
-        self.editor.update(cx, |editor, cx| {
-            let cursor = editor.cursor_offset();
-            let content = editor.content.clone();
-            let line_start = content[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let line_end = content[cursor..]
-                .find('\n')
-                .map(|p| cursor + p)
-                .unwrap_or(content.len());
-            let line = &content[line_start..line_end];
-            let trimmed = line.trim_start();
-            let indent = &line[..line.len() - trimmed.len()];
-
-            // Strip the existing heading prefix: `#{1,6} ` — all six
-            // levels, including `# ` with no text (a marker that is not
-            // yet a heading). `#nospace` is not a marker, so it stays.
-            let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-            let stripped = if (1..=6).contains(&hashes) {
-                trimmed[hashes..].strip_prefix(' ').unwrap_or(trimmed)
-            } else {
-                trimmed
-            };
-
-            let new_line = if new_level == 0 {
-                format!("{}{}", indent, stripped)
-            } else {
-                let prefix = "#".repeat(new_level as usize);
-                format!("{}{} {}", indent, prefix, stripped)
-            };
-
-            editor.selected_range = line_start..line_end;
-            editor.replace_text_in_range(Some(line_start..line_end), &new_line, cx);
-        });
-
-        let label = match new_level {
-            0 => "Normal",
-            1 => "Heading 1",
-            2 => "Heading 2",
-            3 => "Heading 3",
-            4 => "Heading 4",
-            5 => "Heading 5",
-            6 => "Heading 6",
-            _ => "Normal",
-        };
-        self.set_status(format!("Style: {}", label), cx);
-        cx.notify();
+        self.apply_heading_level(next, cx);
     }
 
     fn cycle_body_font(&mut self, _: &CycleBodyFont, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3131,7 +3401,7 @@ impl SylphApp {
                 if let Some(sylph_core::document::Block::Image { data }) =
                     self.document.blocks.get_mut(idx)
                 {
-                    data.caption = Some(text);
+                    data.caption = (!text.trim().is_empty()).then_some(text);
                 }
             }
             EditingField::TableCaption(idx) => {
@@ -3140,13 +3410,30 @@ impl SylphApp {
                 if let Some(sylph_core::document::Block::Table { data }) =
                     self.document.blocks.get_mut(idx)
                 {
-                    data.caption = Some(text);
+                    data.caption = (!text.trim().is_empty()).then_some(text);
                 }
             }
-            _ => {}
+            EditingField::None => {}
         }
         self.editing_field = EditingField::None;
         self.field_input.clear();
+        cx.notify();
+    }
+
+    /// Start editing a click-to-edit field (cover text, a caption) with
+    /// `value` as its text. A field already being edited is committed first,
+    /// and focus leaves the body editor so typing lands only in this field.
+    fn begin_field_edit(
+        &mut self,
+        field: EditingField,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_field_edit(cx);
+        window.focus(&self.focus_handle);
+        self.editing_field = field;
+        self.field_input = value;
         cx.notify();
     }
 
@@ -3154,24 +3441,6 @@ impl SylphApp {
         self.editing_field = EditingField::None;
         self.field_input.clear();
         cx.notify();
-    }
-
-    #[allow(dead_code)]
-    fn render_field_input(
-        &self,
-        value: &str,
-        _border: gpui::Rgba,
-        editor_bg: gpui::Rgba,
-    ) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .rounded(px(4.0))
-            .border_1()
-            .border_color(rgb(0x2196f3))
-            .bg(editor_bg)
-            .min_w_48()
-            .child(format!("{}█", value))
     }
 
     fn on_ai_keystroke(
@@ -3243,1244 +3512,6 @@ impl Focusable for SylphApp {
     }
 }
 
-impl SylphApp {
-    #[allow(dead_code)]
-    fn legacy_render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg = self.bg_color();
-        let surface = self.surface_color();
-        let sidebar_bg = self.sidebar_color();
-        let border = self.border_color();
-        let editor_bg = self.editor_bg();
-        let hover = self.hover_color();
-        let active_doc = self.active_doc_color();
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(bg)
-            .track_focus(&self.focus_handle(cx))
-            .key_context("SylphApp")
-            .on_action(cx.listener(Self::save_doc))
-            .on_action(cx.listener(Self::summarize_doc))
-            .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::undo))
-            .on_action(cx.listener(Self::redo))
-            .on_action(cx.listener(Self::move_word_left))
-            .on_action(cx.listener(Self::move_word_right))
-            .on_action(cx.listener(Self::page_up))
-            .on_action(cx.listener(Self::page_down))
-            .on_action(cx.listener(Self::indent))
-            .on_action(cx.listener(Self::dedent))
-            .on_action(cx.listener(Self::open_find_bar))
-            .on_action(cx.listener(Self::close_find_bar))
-            .on_action(cx.listener(Self::find_next))
-            .on_action(cx.listener(Self::find_prev))
-            .on_action(cx.listener(Self::replace_current))
-            .on_action(cx.listener(Self::replace_all))
-            .on_action(cx.listener(Self::context_menu_copy))
-            .on_action(cx.listener(Self::context_menu_cut))
-            .on_action(cx.listener(Self::context_menu_paste))
-            .on_action(cx.listener(Self::context_menu_select_all))
-            .on_action(cx.listener(Self::dismiss_context_menu))
-            .on_action(cx.listener(Self::confirm_title))
-            .on_action(cx.listener(Self::cancel_title))
-            .on_action(cx.listener(Self::new_document))
-            .on_action(cx.listener(Self::toggle_dark_mode))
-            .on_action(cx.listener(Self::export_docx))
-            .on_action(cx.listener(Self::export_pdf))
-            .on_action(cx.listener(Self::toggle_preview))
-            .on_action(cx.listener(Self::add_cover_page))
-            .on_action(cx.listener(Self::paste_image))
-            .on_action(cx.listener(Self::bold_text))
-            .on_action(cx.listener(Self::italic_text))
-            .on_action(cx.listener(Self::strikethrough_text))
-            .on_action(cx.listener(Self::insert_table))
-            .on_action(cx.listener(Self::open_ai_panel))
-            .on_action(cx.listener(Self::close_ai_panel))
-            .on_action(cx.listener(Self::ai_submit))
-            .on_action(cx.listener(Self::insert_page_break))
-            .on_action(cx.listener(Self::set_page_size))
-            .on_action(cx.listener(Self::set_image_caption))
-            .on_action(cx.listener(Self::set_table_caption))
-            .on_action(cx.listener(Self::set_paragraph_spacing))
-            .on_action(cx.listener(Self::editing_cover_title))
-            .on_action(cx.listener(Self::editing_cover_subtitle))
-            .on_action(cx.listener(Self::editing_cover_author))
-            .child(
-                // ── Title Bar ──────────────────────────────────────
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_4()
-                    .py_2()
-                    .bg(surface)
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                img("assets/icons/sylph-logo.png")
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded_full(),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight(600.0))
-                                    .child("Sylph"),
-                            )
-                            .child(
-                                div()
-                                    .w_px()
-                                    .h_4()
-                                    .bg(border),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(self.doc_title.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w_5()
-                                    .h_5()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.toggle_sidebar(&ToggleSidebar, _window, cx);
-                                        }),
-                                    )
-                                    .child(if self.sidebar_visible { "◀" } else { "▶" }),
-                            ),
-                    ),
-            )
-            .child(
-                // ── Ribbon Toolbar ─────────────────────────────────
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_3()
-                    .py_1()
-                    .bg(surface)
-                    .border_b_1()
-                    .border_color(border)
-                    // ── File Group ──
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.new_document(&NewDocument, _window, cx);
-                                        }),
-                                    )
-                                    .child("New"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.save_doc(&SaveDoc, _window, cx);
-                                        }),
-                                    )
-                                    .child("Save"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.export_docx(&ExportDocx, _window, cx);
-                                        }),
-                                    )
-                                    .child("DOCX"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.export_pdf(&ExportPdf, _window, cx);
-                                        }),
-                                    )
-                                    .child("PDF"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.export_markdown(&ExportMarkdown, _window, cx);
-                                        }),
-                                    )
-                                    .child("MD"),
-                            ),
-                    )
-                    // ── Divider ──
-                    .child(div().w_px().h_5().bg(border).mx_1())
-                    // ── Edit Group ──
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.undo(&Undo, _window, cx);
-                                        }),
-                                    )
-                                    .child("Undo"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.redo(&Redo, _window, cx);
-                                        }),
-                                    )
-                                    .child("Redo"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.context_menu_copy(&ContextMenuCopy, _window, cx);
-                                        }),
-                                    )
-                                    .child("Copy"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.context_menu_cut(&ContextMenuCut, _window, cx);
-                                        }),
-                                    )
-                                    .child("Cut"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.context_menu_paste(&ContextMenuPaste, _window, cx);
-                                        }),
-                                    )
-                                    .child("Paste"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.open_find_bar(&OpenFindBar, _window, cx);
-                                        }),
-                                    )
-                                    .child("Find"),
-                            ),
-                    )
-                    // ── Divider ──
-                    .child(div().w_px().h_5().bg(border).mx_1())
-                    // ── Format Group ──
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.bold_text(&BoldText, _window, cx);
-                                        }),
-                                    )
-                                    .child(
-                                        div().font_weight(gpui::FontWeight(700.0)).child("B"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.italic_text(&ItalicText, _window, cx);
-                                        }),
-                                    )
-                                    .child(div().italic().child("I")),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.set_heading(1, _window, cx);
-                                        }),
-                                    )
-                                    .child("H1"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.set_heading(2, _window, cx);
-                                        }),
-                                    )
-                                    .child("H2"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.set_heading(3, _window, cx);
-                                        }),
-                                    )
-                                    .child("H3"),
-                            )
-                            // ── Paragraph Spacing ──
-                            .child(div().w_px().h_5().bg(border).mx_1())
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            if this.editing_field == EditingField::ParagraphSpacing {
-                                                this.commit_field_edit(cx);
-                                            } else {
-                                                this.editing_field = EditingField::ParagraphSpacing;
-                                                this.field_input = format!("{:.1}", this.paragraph_spacing);
-                                                cx.notify();
-                                            }
-                                        }),
-                                    )
-.child(format!("Gap: {:.0}px", self.paragraph_spacing)),
-                            )
-                            // ── Page Setup ──
-                            .child(div().w_px().h_5().bg(border).mx_1())
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.set_page_size(&SetPageSize, _window, cx);
-                                        }),
-                                    )
-                                    .child(self.document.page_size.name().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            // Toggle margins: Normal (1") <-> Narrow (0.5")
-                                            let new_margins = if this.document.page_margins.top > 54.0 {
-                                                sylph_core::document::PageMargins { top: 36.0, bottom: 36.0, left: 36.0, right: 36.0 }
-                                            } else {
-                                                sylph_core::document::PageMargins::default()
-                                            };
-                                            this.document.set_margins(new_margins);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(if self.document.page_margins.top > 54.0 { "Normal" } else { "Narrow" }),
-                            ),
-                    )
-                    // ── Divider ──
-                    .child(div().w_px().h_5().bg(border).mx_1())
-                    // ── Insert Group ──
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.paste_image(&PasteImage, _window, cx);
-                                        }),
-                                    )
-                                    .child("Image"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.insert_table(&InsertTable, _window, cx);
-                                        }),
-                                    )
-                                    .child("Table"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.add_cover_page(&AddCoverPage, _window, cx);
-                                        }),
-                                    )
-                                    .child("Cover"),
-                            ),
-                    )
-                    // ── Divider ──
-                    .child(div().w_px().h_5().bg(border).mx_1())
-                    // ── View Group ──
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.toggle_preview(&TogglePreview, _window, cx);
-                                        }),
-                                    )
-                                    .child("Preview"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.toggle_dark_mode(&ToggleDarkMode, _window, cx);
-                                        }),
-                                    )
-                                    .child("Theme"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(hover))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _window, cx| {
-                                            this.open_ai_panel(&OpenAiPanel, _window, cx);
-                                        }),
-                                    )
-                                    .child("AI"),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .overflow_hidden()
-                    .when(self.sidebar_visible, |this| {
-                        this.child(
-                            div()
-                                .w_48()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .bg(sidebar_bg)
-                                .border_r_1()
-                                .border_color(border)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(border)
-                                        .child("Documents")
-                                        .child(
-                                            div()
-                                                .px_2()
-                                                .py(px(5.))
-                                                .rounded(px(4.0))
-                                                .bg(rgb(0x2196f3))
-                                                .hover(|s| s.bg(rgb(0x1976d2)))
-                                                .text_color(rgb(0xffffff))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _window, cx| {
-                                                        this.new_document(
-                                                            &NewDocument,
-                                                            _window,
-                                                            cx,
-                                                        );
-                                                    }),
-                                                )
-                                                .child("+"),
-                                        ),
-                                )
-                                .child({
-                                    let docs: Vec<_> = self
-                                        .documents
-                                        .iter()
-                                        .map(|doc| {
-                                            let (id, title) = (&doc.id, &doc.title);
-                                            let is_active = *id == self.editor.read(cx).doc_id;
-                                            let doc_id = *id;
-                                            div()
-                                                .px_3()
-                                                .py(px(2.))
-                                                .rounded(px(4.0))
-                                                .when(is_active, |s| s.bg(active_doc))
-                                                .when(!is_active, |s| s.hover(|s| s.bg(hover)))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _window, cx| {
-                                                        this.switch_document(doc_id, _window, cx);
-                                                    }),
-                                                )
-                                                .child(title.clone())
-                                        })
-                                        .collect();
-                                    div().flex_1().overflow_hidden().p_2().children(docs)
-                                }),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .px_4()
-                                    .py_2()
-                                    .border_b_1()
-                                    .border_color(border)
-                                    .child(
-                                        div().flex().items_center().gap_2().child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(px(4.0))
-                                                .when(self.editing_title, |s| {
-                                                    s.border_1().border_color(rgb(0x2196f3))
-                                                })
-                                                .when(!self.editing_title, |s| {
-                                                    s.hover(|s| s.bg(hover))
-                                                })
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _window, cx| {
-                                                        if !this.editing_title {
-                                                            this.editing_title = true;
-                                                            cx.notify();
-                                                        }
-                                                    }),
-                                                )
-                                                .child(format!(
-                                                    "{}{}",
-                                                    self.doc_title,
-                                                    if self.editing_title { "█" } else { "" }
-                                                )),
-                                        ),
-                                    ),
-                            )
-                            .when(self.find.visible, |this| {
-                                this.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .px_4()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(border)
-                                        .bg(surface)
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child("Find:")
-                                                .child(
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .border_1()
-                                                        .border_color(border)
-                                                        .bg(editor_bg)
-                                                        .min_w_48()
-                                                        .child(format!("{}█", self.find.query)),
-                                                )
-                                                .child(format!(
-                                                    "{}/{}",
-                                                    self.find.current_match + 1,
-                                                    self.find.matches.len().max(1)
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child("Replace:")
-                                                .child(
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .border_1()
-                                                        .border_color(border)
-                                                        .bg(editor_bg)
-                                                        .min_w_48()
-                                                        .child(self.find.replacement.clone()),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(rgb(0x2196f3))
-                                                .hover(|s| s.bg(rgb(0x1976d2)))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _window, cx| {
-                                                        this.find_next(&FindNext, _window, cx);
-                                                    }),
-                                                )
-                                                .child("Next"),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(rgb(0xff9800))
-                                                .hover(|s| s.bg(rgb(0xf57c00)))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _window, cx| {
-                                                        this.replace_current(
-                                                            &ReplaceCurrent,
-                                                            _window,
-                                                            cx,
-                                                        );
-                                                    }),
-                                                )
-                                                .child("Replace"),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(rgb(0xf44336))
-                                                .hover(|s| s.bg(rgb(0xd32f2f)))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _window, cx| {
-                                                        this.replace_all(&ReplaceAll, _window, cx);
-                                                    }),
-                                                )
-                                                .child("All"),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
-                                                .hover(|s| s.bg(border))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _window, cx| {
-                                                        this.close_find_bar(
-                                                            &CloseFindBar,
-                                                            _window,
-                                                            cx,
-                                                        );
-                                                    }),
-                                                )
-                                                .child("✕"),
-                                        ),
-                                )
-                            })
-                            .child({
-                                let editor_content = div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .p_8()
-                                    .bg(editor_bg)
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(Self::on_editor_right_click),
-                                    );
-
-                                let editor_content = if let Some(cp) = self.document.cover_page().cloned() {
-                                    let cp_title = cp.title.clone();
-                                    let cp_subtitle = cp.subtitle.clone();
-                                    let cp_author = cp.author.clone();
-                                    let is_editing_title = self.editing_field == EditingField::CoverTitle;
-                                    let is_editing_subtitle = self.editing_field == EditingField::CoverSubtitle;
-                                    let is_editing_author = self.editing_field == EditingField::CoverAuthor;
-                                    let field_val = self.field_input.clone();
-                                    let hover_c = hover;
-
-                                    let cover_card = div()
-                                        .mb_6()
-                                        .p_6()
-                                        .rounded(px(8.0))
-                                        .border_1()
-                                        .border_color(border)
-                                        .bg(rgb(0xf8f9fa))
-                                        .child(
-                                            div()
-                                                .text_2xl()
-                                                .font_weight(gpui::FontWeight(700.0))
-                                                .mb_2()
-                                                .child(if is_editing_title {
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded(px(4.0))
-                                                        .border_1()
-                                                        .border_color(rgb(0x2196f3))
-                                                        .bg(editor_bg)
-                                                        .child(format!("{}█", field_val))
-                                                } else {
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded(px(4.0))
-                                                        .hover(|s| s.bg(hover_c))
-                                                        .cursor_pointer()
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, cx| {
-                                                            this.editing_cover_title(&EditingCoverTitle, _window, cx);
-                                                        }))
-                                                        .child(cp_title)
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_lg()
-                                                .text_color(rgb(0x666666))
-                                                .mb_2()
-                                                .child(if is_editing_subtitle {
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded(px(4.0))
-                                                        .border_1()
-                                                        .border_color(rgb(0x2196f3))
-                                                        .bg(editor_bg)
-                                                        .child(format!("{}█", field_val))
-                                                } else {
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded(px(4.0))
-                                                        .hover(|s| s.bg(hover_c))
-                                                        .cursor_pointer()
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, cx| {
-                                                            this.editing_cover_subtitle(&EditingCoverSubtitle, _window, cx);
-                                                        }))
-                                                        .child(cp_subtitle)
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(rgb(0x888888))
-                                                .child(if is_editing_author {
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded(px(4.0))
-                                                        .border_1()
-                                                        .border_color(rgb(0x2196f3))
-                                                        .bg(editor_bg)
-                                                        .child(format!("{}█", field_val))
-                                                } else {
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded(px(4.0))
-                                                        .hover(|s| s.bg(hover_c))
-                                                        .cursor_pointer()
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, cx| {
-                                                            this.editing_cover_author(&EditingCoverAuthor, _window, cx);
-                                                        }))
-                                                        .child(cp_author)
-                                                }),
-                                        );
-                                    editor_content.child(cover_card)
-                                } else {
-                                    editor_content
-                                };
-
-                                // Render non-text blocks
-                                let mut editor_content = editor_content;
-                                for (idx, block) in self.document.blocks.iter().enumerate() {
-                                    match block {
-                                        sylph_core::document::Block::Image { data } => {
-                                            let path = data.path.clone();
-                                            let caption = data.caption.clone().unwrap_or_default();
-                                            let is_editing = self.editing_field == EditingField::ImageCaption(idx);
-                                            let field_val = self.field_input.clone();
-                                            let hover_c = hover;
-
-                                            let img_block = div()
-                                                .mb_4()
-                                                .flex()
-                                                .flex_col()
-                                                .items_center()
-                                                .child(
-                                                    img(path)
-                                                        .max_w(px(500.0))
-                                                        .max_h(px(400.0))
-                                                        .rounded(px(4.0))
-                                                        .border_1()
-                                                        .border_color(border),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .mt_2()
-                                                        .text_sm()
-                                                        .text_color(rgb(0x666666))
-                                                        .text_center()
-                                                        .child(if is_editing {
-                                                            div()
-                                                                .px_2()
-                                                                .py_1()
-                                                                .rounded(px(4.0))
-                                                                .border_1()
-                                                                .border_color(rgb(0x2196f3))
-                                                                .bg(editor_bg)
-                                                                .min_w_48()
-                                                                .child(format!("{}█", field_val))
-                                                        } else {
-                                                            let caption_clone = caption.clone();
-                                                            div()
-                                                                .px_2()
-                                                                .py_1()
-                                                                .rounded(px(4.0))
-                                                                .hover(|s| s.bg(hover_c))
-                                                                .cursor_pointer()
-                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _window, cx| {
-                                                                    this.editing_field = EditingField::ImageCaption(idx);
-                                                                    this.field_input = caption_clone.clone();
-                                                                    cx.notify();
-                                                                }))
-                                                                .child(if caption.is_empty() { "Add caption...".to_string() } else { caption })
-                                                        }),
-                                                );
-                                            editor_content = editor_content.child(img_block);
-                                        }
-                                        sylph_core::document::Block::Table { data } => {
-                                            let is_editing_caption = self.editing_field == EditingField::TableCaption(idx);
-                                            let caption = data.caption.clone().unwrap_or_default();
-                                            let field_val = self.field_input.clone();
-                                            let hover_c = hover;
-                                            let rows = data.rows.clone();
-
-                                            let mut table_grid = div()
-                                                .mb_4()
-                                                .border_1()
-                                                .border_color(border)
-                                                .rounded(px(4.0))
-                                                .overflow_hidden();
-
-                                            for row in rows.iter() {
-                                                let mut row_el = div().flex().border_b_1().border_color(border);
-                                                for cell in row.iter() {
-                                                    row_el = row_el.child(
-                                                        div()
-                                                            .px_3()
-                                                            .py_2()
-                                                            .border_r_1()
-                                                            .border_color(border)
-                                                            .min_w_24()
-                                                            .text_sm()
-                                                            .child(cell.text()),
-                                                    );
-                                                }
-                                                table_grid = table_grid.child(row_el);
-                                            }
-
-                                            let table_with_caption = table_grid.child(
-                                                div()
-                                                    .mt_2()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x666666))
-                                                    .text_center()
-                                                    .child(if is_editing_caption {
-                                                        div()
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded(px(4.0))
-                                                            .border_1()
-                                                            .border_color(rgb(0x2196f3))
-                                                            .bg(editor_bg)
-                                                            .min_w_48()
-                                                            .child(format!("{}█", field_val))
-                                                    } else {
-                                                        let caption_clone = caption.clone();
-                                                        div()
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded(px(4.0))
-                                                            .hover(|s| s.bg(hover_c))
-                                                            .cursor_pointer()
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _window, cx| {
-                                                                this.editing_field = EditingField::TableCaption(idx);
-                                                                this.field_input = caption_clone.clone();
-                                                                cx.notify();
-                                                            }))
-                                                            .child(if caption.is_empty() { "Add caption...".to_string() } else { caption })
-                                                    }),
-                                            );
-                                            editor_content = editor_content.child(table_with_caption);
-                                        }
-                                        _ => {} // Text blocks handled by TextInput
-                                    }
-                                }
-
-                                // Add the main text editor
-                                editor_content.child(self.editor.clone())
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, cx| {
-                                        this.commit_field_edit(cx);
-                                    }))
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_4()
-                    .py_1()
-                    .bg(surface)
-                    .border_t_1()
-                    .border_color(border)
-                    .child("v0.1.0")
-                    .child(
-                        self.status_message
-                            .clone()
-                            .unwrap_or_else(|| "UTF-8".to_string()),
-                    ),
-            )
-            .when(self.ai_panel.visible, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .h_64()
-                        .border_t_1()
-                        .border_color(border)
-                        .bg(surface)
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px_3()
-                                .py_1()
-                                .border_b_1()
-                                .border_color(border)
-                                .child("AI Assistant")
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py(px(5.))
-                                        .rounded(px(4.0))
-                                        .hover(|s| s.bg(hover))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _window, cx| {
-                                                this.close_ai_panel(&CloseAiPanel, _window, cx);
-                                            }),
-                                        )
-                                        .child("✕"),
-                                ),
-                        )
-                        .child(div().flex_1().overflow_hidden().p_3().children(
-                            self.ai_panel.history.iter().map(|(q, a)| {
-                                div()
-                                    .mb_2()
-                                    .child(div().text_sm().child(format!("Q: {}", q)))
-                                    .child(div().text_sm().child(format!("A: {}", a)))
-                            }),
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .px_3()
-                                .py_2()
-                                .border_t_1()
-                                .border_color(border)
-                                .child(format!("{}█", self.ai_panel.query)),
-                        ),
-                )
-            })
-            .when(self.context_menu.visible, |this| {
-                this.child(
-                    anchored()
-                        .position(self.context_menu.position)
-                        .snap_to_window()
-                        .child(
-                            div()
-                                .bg(editor_bg)
-                                .rounded(px(4.))
-                                .border_1()
-                                .border_color(border)
-                                .shadow_md()
-                                .p_1()
-                                .min_w_32()
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .hover(|s| s.bg(rgb(0x0078d4)))
-                                        .hover(|s| s.text_color(rgb(0xffffff)))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _window, cx| {
-                                                this.context_menu_copy(
-                                                    &ContextMenuCopy,
-                                                    _window,
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                        .child("Copy"),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .hover(|s| s.bg(rgb(0x0078d4)))
-                                        .hover(|s| s.text_color(rgb(0xffffff)))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _window, cx| {
-                                                this.context_menu_cut(&ContextMenuCut, _window, cx);
-                                            }),
-                                        )
-                                        .child("Cut"),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .hover(|s| s.bg(rgb(0x0078d4)))
-                                        .hover(|s| s.text_color(rgb(0xffffff)))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _window, cx| {
-                                                this.context_menu_paste(
-                                                    &ContextMenuPaste,
-                                                    _window,
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                        .child("Paste"),
-                                )
-                                .child(div().h(px(1.0)).mx_1().my_1().bg(rgb(0xdddddd)))
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .hover(|s| s.bg(rgb(0x0078d4)))
-                                        .hover(|s| s.text_color(rgb(0xffffff)))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _window, cx| {
-                                                this.context_menu_select_all(
-                                                    &ContextMenuSelectAll,
-                                                    _window,
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                        .child("Select All"),
-                                ),
-                        ),
-                )
-            })
-    }
-}
-
 // ── Headless export support ─────────────────────────────────────────────
 // The GUI keeps typed text in the editor buffer while cover/tables/images/
 // page breaks live in `self.document`. These helpers merge both into the
@@ -4491,6 +3522,213 @@ use sylph_core::document as doc;
 
 /// Parse one line's leading `#` markers. Byte index equals char count here
 /// because `#` is ASCII; a non-`#` start yields count 0 → None.
+/// "Ctrl+Shift+Z" (⌘ and ⌥ on macOS) for a key binding. Menus and the
+/// shortcut sheet read their labels from the real bindings through this,
+/// so a label can never disagree with what the key does.
+fn shortcut_text(binding: &KeyBinding) -> String {
+    let mac = cfg!(target_os = "macos");
+    binding
+        .keystrokes()
+        .iter()
+        .map(|keystroke| {
+            let m = keystroke.modifiers();
+            let mut parts: Vec<String> = Vec::new();
+            if m.control {
+                parts.push("Ctrl".into());
+            }
+            if m.alt {
+                parts.push(if mac { "⌥" } else { "Alt" }.into());
+            }
+            if m.shift {
+                parts.push("Shift".into());
+            }
+            if m.platform {
+                parts.push(if mac { "⌘" } else { "Super" }.into());
+            }
+            parts.push(match keystroke.key() {
+                "left" => "←".into(),
+                "right" => "→".into(),
+                "up" => "↑".into(),
+                "down" => "↓".into(),
+                "enter" => "Enter".into(),
+                "escape" => "Esc".into(),
+                "pageup" => "Page Up".into(),
+                "pagedown" => "Page Down".into(),
+                key if key.chars().count() == 1 => key.to_uppercase(),
+                key => {
+                    let mut chars = key.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_uppercase().chain(chars).collect()
+                    })
+                }
+            });
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// "Select word left" for an action name like "text_input::SelectWordLeft":
+/// the words of the type name, and a space before a digit ("Heading 1").
+fn action_title(name: &str) -> String {
+    let base = name.rsplit("::").next().unwrap_or(name);
+    let mut out = String::new();
+    for (i, c) in base.chars().enumerate() {
+        if i > 0 && (c.is_uppercase() || (c.is_ascii_digit() && !out.ends_with(' '))) {
+            out.push(' ');
+        }
+        out.push(if i == 0 { c } else { c.to_ascii_lowercase() });
+    }
+    out
+}
+
+/// Word's margin presets, in points: Normal 1" all round, Narrow 0.5",
+/// Moderate 1" top/bottom and 0.75" sides, Wide 1" top/bottom and 2" sides.
+const MARGIN_PRESETS: [(&str, doc::PageMargins); 4] = [
+    (
+        "Normal",
+        doc::PageMargins {
+            top: 72.0,
+            bottom: 72.0,
+            left: 72.0,
+            right: 72.0,
+        },
+    ),
+    (
+        "Narrow",
+        doc::PageMargins {
+            top: 36.0,
+            bottom: 36.0,
+            left: 36.0,
+            right: 36.0,
+        },
+    ),
+    (
+        "Moderate",
+        doc::PageMargins {
+            top: 72.0,
+            bottom: 72.0,
+            left: 54.0,
+            right: 54.0,
+        },
+    ),
+    (
+        "Wide",
+        doc::PageMargins {
+            top: 72.0,
+            bottom: 72.0,
+            left: 144.0,
+            right: 144.0,
+        },
+    ),
+];
+
+/// Which preset `margins` is, if any (within half a point).
+fn margin_preset_of(margins: &doc::PageMargins) -> Option<usize> {
+    let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+    MARGIN_PRESETS.iter().position(|(_, m)| {
+        close(m.top, margins.top)
+            && close(m.bottom, margins.bottom)
+            && close(m.left, margins.left)
+            && close(m.right, margins.right)
+    })
+}
+
+/// A file name for `title`: characters that are unsafe in file names become
+/// `_`, spaces become `_`, and an empty title becomes "Untitled".
+fn safe_file_stem(title: &str) -> String {
+    let stem: String = title
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = stem.trim_matches('.').to_string();
+    if stem.is_empty() {
+        "Untitled".to_string()
+    } else {
+        stem
+    }
+}
+
+/// A pipe table: a header row of "Column N" cells and `rows - 1` empty body
+/// rows, which the export parser reads as a real table.
+fn markdown_table(rows: usize, cols: usize) -> String {
+    let cols = cols.max(1);
+    let row = |cells: Vec<String>| format!("| {} |", cells.join(" | "));
+    let mut lines = vec![
+        row((1..=cols).map(|c| format!("Column {c}")).collect()),
+        row(vec!["---".to_string(); cols]),
+    ];
+    for _ in 1..rows.max(1) {
+        lines.push(row(vec![" ".to_string(); cols]));
+    }
+    lines.join("\n")
+}
+
+/// Byte ranges of `query` in `text`, left to right and never overlapping.
+/// Case-insensitive for ASCII letters unless `match_case`; lowering ASCII
+/// keeps every byte offset, and other characters must match exactly.
+fn find_matches(text: &str, query: &str, match_case: bool) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let ranges = |haystack: &str, needle: &str| -> Vec<Range<usize>> {
+        haystack
+            .match_indices(needle)
+            .map(|(at, found)| at..at + found.len())
+            .collect()
+    };
+    if match_case {
+        ranges(text, query)
+    } else {
+        ranges(&text.to_ascii_lowercase(), &query.to_ascii_lowercase())
+    }
+}
+
+/// `text` with every range in `matches` (sorted, non-overlapping) replaced.
+fn replace_matches(text: &str, matches: &[Range<usize>], replacement: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for found in matches {
+        out.push_str(&text[at..found.start]);
+        out.push_str(replacement);
+        at = found.end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// `line` with its heading marker set to `level` (0 = Normal text): an
+/// existing `#`…`######` marker (with its space) is replaced and the
+/// indentation kept; `#word` is text, not a marker. Returns the new line and
+/// the marker's byte length before and after (indentation included), so a
+/// caller can keep the caret on the same character.
+fn with_heading_level(line: &str, level: u8) -> (String, usize, usize) {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    let text = match trimmed[hashes..].strip_prefix(' ') {
+        Some(rest) if (1..=6).contains(&hashes) => rest,
+        _ if (1..=6).contains(&hashes) && hashes == trimmed.len() => "",
+        _ => trimmed,
+    };
+    let marker = if level == 0 {
+        String::new()
+    } else {
+        format!("{} ", "#".repeat(level.min(6) as usize))
+    };
+    let new_line = format!("{indent}{marker}{text}");
+    let before = line.len() - text.len();
+    let after = new_line.len() - text.len();
+    (new_line, before, after)
+}
+
 fn heading_level_and_text(line: &str) -> Option<(u8, &str)> {
     let hashes = line.chars().take_while(|&c| c == '#').count();
     if (1..=6).contains(&hashes) {
@@ -5957,55 +5195,100 @@ fn try_headless_export(args: &[String]) -> Option<i32> {
     }
 }
 
+/// `secondary` is Ctrl on Linux and Windows and Cmd on macOS. A bare
+/// `cmd` means the Super key outside macOS, where Ctrl+C/V/X/A/S
+/// therefore did nothing; macOS-only conventions keep `cmd`/`alt`.
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        // ── Core editing ──
+        KeyBinding::new("backspace", Backspace, None),
+        KeyBinding::new("delete", Delete, None),
+        KeyBinding::new("ctrl-backspace", DeleteWordLeft, None),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, None),
+        KeyBinding::new("ctrl-delete", DeleteWordRight, None),
+        KeyBinding::new("alt-delete", DeleteWordRight, None),
+        KeyBinding::new("ctrl-shift-backspace", DeleteToLineStart, None),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, None),
+        KeyBinding::new("ctrl-shift-delete", DeleteToLineEnd, None),
+        KeyBinding::new("cmd-delete", DeleteToLineEnd, None),
+        KeyBinding::new("enter", Enter, None),
+        KeyBinding::new("secondary-enter", InsertPageBreak, None),
+        KeyBinding::new("tab", Indent, None),
+        KeyBinding::new("shift-tab", Dedent, None),
+        // ── Navigation and selection ──
+        KeyBinding::new("left", Left, None),
+        KeyBinding::new("right", Right, None),
+        KeyBinding::new("up", Up, None),
+        KeyBinding::new("down", Down, None),
+        KeyBinding::new("shift-left", SelectLeft, None),
+        KeyBinding::new("shift-right", SelectRight, None),
+        KeyBinding::new("shift-up", SelectUp, None),
+        KeyBinding::new("shift-down", SelectDown, None),
+        KeyBinding::new("ctrl-left", MoveWordLeft, None),
+        KeyBinding::new("alt-left", MoveWordLeft, None),
+        KeyBinding::new("ctrl-right", MoveWordRight, None),
+        KeyBinding::new("alt-right", MoveWordRight, None),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, None),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, None),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, None),
+        KeyBinding::new("alt-shift-right", SelectWordRight, None),
+        KeyBinding::new("home", Home, None),
+        KeyBinding::new("cmd-left", Home, None),
+        KeyBinding::new("end", End, None),
+        KeyBinding::new("cmd-right", End, None),
+        KeyBinding::new("shift-home", SelectToLineStart, None),
+        KeyBinding::new("cmd-shift-left", SelectToLineStart, None),
+        KeyBinding::new("shift-end", SelectToLineEnd, None),
+        KeyBinding::new("cmd-shift-right", SelectToLineEnd, None),
+        KeyBinding::new("ctrl-home", MoveToDocStart, None),
+        KeyBinding::new("cmd-up", MoveToDocStart, None),
+        KeyBinding::new("ctrl-end", MoveToDocEnd, None),
+        KeyBinding::new("cmd-down", MoveToDocEnd, None),
+        KeyBinding::new("ctrl-shift-home", SelectToDocStart, None),
+        KeyBinding::new("cmd-shift-up", SelectToDocStart, None),
+        KeyBinding::new("ctrl-shift-end", SelectToDocEnd, None),
+        KeyBinding::new("cmd-shift-down", SelectToDocEnd, None),
+        KeyBinding::new("secondary-a", SelectAll, None),
+        KeyBinding::new("pageup", PageUp, None),
+        KeyBinding::new("pagedown", PageDown, None),
+        // ── Clipboard ──
+        KeyBinding::new("secondary-v", Paste, None),
+        KeyBinding::new("secondary-c", Copy, None),
+        KeyBinding::new("secondary-x", Cut, None),
+        // ── File ──
+        KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-n", NewDocument, None),
+        // ── Undo/Redo ──
+        KeyBinding::new("secondary-z", Undo, None),
+        KeyBinding::new("secondary-shift-z", Redo, None),
+        KeyBinding::new("ctrl-y", Redo, None),
+        // ── Formatting (the Word/Docs shortcuts) ──
+        KeyBinding::new("secondary-b", BoldText, None),
+        KeyBinding::new("secondary-i", ItalicText, None),
+        KeyBinding::new("secondary-shift-x", StrikethroughText, None),
+        KeyBinding::new("secondary-alt-0", NormalText, None),
+        KeyBinding::new("secondary-alt-1", Heading1, None),
+        KeyBinding::new("secondary-alt-2", Heading2, None),
+        KeyBinding::new("secondary-alt-3", Heading3, None),
+        KeyBinding::new("secondary-alt-4", Heading4, None),
+        KeyBinding::new("secondary-alt-5", Heading5, None),
+        KeyBinding::new("secondary-alt-6", Heading6, None),
+        // ── Find ──
+        KeyBinding::new("secondary-f", OpenFindBar, None),
+        KeyBinding::new("secondary-h", FindAndReplace, None),
+        // ── Workspace chrome ──
+        KeyBinding::new("secondary-k", OpenCommandPalette, None),
+        KeyBinding::new("escape", CloseOverlay, None),
+    ]
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(code) = try_headless_export(&args) {
         std::process::exit(code);
     }
     Application::new().run(|cx: &mut App| {
-        cx.bind_keys([
-            // ── Core Editing (always active) ──
-            KeyBinding::new("backspace", Backspace, None),
-            KeyBinding::new("delete", Delete, None),
-            KeyBinding::new("ctrl-backspace", DeleteWordLeft, None),
-            KeyBinding::new("ctrl-delete", DeleteWordRight, None),
-            KeyBinding::new("cmd-backspace", DeleteToLineStart, None),
-            KeyBinding::new("cmd-delete", DeleteToLineEnd, None),
-            KeyBinding::new("enter", Enter, None),
-            KeyBinding::new("ctrl-enter", InsertPageBreak, None),
-            KeyBinding::new("cmd-enter", InsertPageBreak, None),
-            KeyBinding::new("tab", Indent, None),
-            KeyBinding::new("shift-tab", Dedent, None),
-            // ── Navigation ──
-            KeyBinding::new("left", Left, None),
-            KeyBinding::new("right", Right, None),
-            KeyBinding::new("up", Up, None),
-            KeyBinding::new("down", Down, None),
-            KeyBinding::new("shift-left", SelectLeft, None),
-            KeyBinding::new("shift-right", SelectRight, None),
-            KeyBinding::new("shift-up", SelectUp, None),
-            KeyBinding::new("shift-down", SelectDown, None),
-            KeyBinding::new("cmd-a", SelectAll, None),
-            KeyBinding::new("home", Home, None),
-            KeyBinding::new("end", End, None),
-            KeyBinding::new("pageup", PageUp, None),
-            KeyBinding::new("pagedown", PageDown, None),
-            // ── Clipboard ──
-            KeyBinding::new("cmd-v", Paste, None),
-            KeyBinding::new("cmd-c", Copy, None),
-            KeyBinding::new("cmd-x", Cut, None),
-            // ── File ──
-            KeyBinding::new("cmd-s", Save, None),
-            // ── Undo/Redo ──
-            KeyBinding::new("cmd-z", Undo, None),
-            KeyBinding::new("cmd-shift-z", Redo, None),
-            KeyBinding::new("ctrl-z", Undo, None),
-            KeyBinding::new("ctrl-y", Redo, None),
-            // ── Workspace chrome ──
-            KeyBinding::new("ctrl-k", OpenCommandPalette, None),
-            KeyBinding::new("cmd-k", OpenCommandPalette, None),
-            KeyBinding::new("escape", CloseOverlay, None),
-        ]);
+        cx.bind_keys(key_bindings());
 
         let bounds = Bounds::centered(None, size(px(1600.0), px(1280.0)), cx);
         let window = cx
@@ -6092,13 +5375,14 @@ fn main() {
                             focus_handle: cx.focus_handle(),
                             sidebar_visible: true,
                             web_layout: false,
-                            preview_visible: false,
                             find: FindReplaceState {
                                 visible: false,
                                 query: String::new(),
                                 replacement: String::new(),
                                 matches: Vec::new(),
                                 current_match: 0,
+                                replace_focused: false,
+                                match_case: false,
                             },
                             context_menu: ContextMenuState {
                                 visible: false,
@@ -6118,7 +5402,6 @@ fn main() {
                             status_message: model_warning,
                             editing_field: EditingField::None,
                             field_input: String::new(),
-                            paragraph_spacing: 8.0,
                             navigator_tab: NavigatorTab::Outline,
                             inspector_mode: InspectorMode::Paragraph,
                             inspector_visible: true,
@@ -6127,6 +5410,11 @@ fn main() {
                             ruler_visible: true,
                             zoom_percent: 100,
                             image_picker_task: None,
+                            export_task: None,
+                            table_picker: (0, 0),
+                            open_menu: None,
+                            revisions: Vec::new(),
+                            selected_revision: None,
                             status_clear_task: None,
                             _keystroke_subscription: keystroke_subscription,
                             _model_observer: model_observer,
@@ -7374,5 +6662,191 @@ mod model_persistence_tests {
         assert_eq!(kept.len(), 1);
         let path = kept[0].as_ref().unwrap().path();
         assert_eq!(std::fs::read_to_string(path).unwrap(), json);
+    }
+}
+
+#[cfg(test)]
+mod editing_shortcut_tests {
+    use super::*;
+    use gpui::Action;
+
+    #[test]
+    fn core_shortcuts_are_on_ctrl_on_linux_and_cmd_on_macos() {
+        // A bare `cmd` binding means Super outside macOS, which left
+        // Ctrl+C/V/X/A/S dead on Linux. Every core shortcut must sit on the
+        // platform's primary modifier.
+        let bindings = key_bindings();
+        let bound = |action: &dyn Action, key: &str| {
+            bindings.iter().any(|b| {
+                b.action().name() == action.name()
+                    && b.keystrokes().len() == 1
+                    && b.keystrokes()[0].key() == key
+                    && b.keystrokes()[0].modifiers().secondary()
+            })
+        };
+        let core: [(&dyn Action, &str); 13] = [
+            (&Copy, "c"),
+            (&Paste, "v"),
+            (&Cut, "x"),
+            (&SelectAll, "a"),
+            (&Save, "s"),
+            (&Undo, "z"),
+            (&NewDocument, "n"),
+            (&BoldText, "b"),
+            (&ItalicText, "i"),
+            (&OpenFindBar, "f"),
+            (&FindAndReplace, "h"),
+            (&OpenCommandPalette, "k"),
+            (&InsertPageBreak, "enter"),
+        ];
+        for (action, key) in core {
+            assert!(
+                bound(action, key),
+                "{} is not on Ctrl/Cmd+{key}",
+                action.name()
+            );
+        }
+    }
+
+    #[test]
+    fn heading_level_replaces_the_marker_and_keeps_the_text() {
+        // (new line, marker bytes before, marker bytes after)
+        assert_eq!(with_heading_level("hello", 1), ("# hello".into(), 0, 2));
+        assert_eq!(with_heading_level("## hello", 1), ("# hello".into(), 3, 2));
+        assert_eq!(with_heading_level("# hello", 0), ("hello".into(), 2, 0));
+        // Indentation is kept and counted as part of the marker.
+        assert_eq!(with_heading_level("  ### x", 2), ("  ## x".into(), 6, 5));
+        // `#tag` is text, and seven hashes are not a heading marker.
+        assert_eq!(with_heading_level("#tag", 1), ("# #tag".into(), 0, 2));
+        assert_eq!(
+            with_heading_level("####### seven", 1),
+            ("# ####### seven".into(), 0, 2)
+        );
+        // A bare marker being typed is replaced, not nested.
+        assert_eq!(with_heading_level("##", 1), ("# ".into(), 2, 2));
+        assert_eq!(with_heading_level("", 2), ("## ".into(), 0, 3));
+    }
+}
+
+#[cfg(test)]
+mod find_replace_tests {
+    use super::*;
+
+    #[test]
+    fn find_ignores_case_by_default_and_never_overlaps() {
+        let text = "Cat cat CAT concat";
+        assert_eq!(
+            find_matches(text, "cat", false),
+            vec![0..3, 4..7, 8..11, 15..18]
+        );
+        assert_eq!(find_matches(text, "cat", true), vec![4..7, 15..18]);
+        // Non-overlapping, like Word and Docs: "aa" in "aaaa" is two hits.
+        assert_eq!(find_matches("aaaa", "aa", false), vec![0..2, 2..4]);
+        assert!(find_matches(text, "", false).is_empty());
+    }
+
+    #[test]
+    fn find_is_safe_with_multibyte_text() {
+        // The old search stepped one byte past each hit, which lands inside
+        // a two-byte character and panicked.
+        assert_eq!(find_matches("éé", "é", false), vec![0..2, 2..4]);
+        assert_eq!(find_matches("naïve NAÏVE", "naïve", false), vec![0..6]);
+        // Non-ASCII letters match exactly (case folding them would move
+        // byte offsets).
+        assert_eq!(find_matches("Émile émile", "émile", false), vec![7..13]);
+    }
+
+    #[test]
+    fn replace_all_rewrites_every_match_once() {
+        let text = "Cat cat CAT";
+        let matches = find_matches(text, "cat", false);
+        assert_eq!(replace_matches(text, &matches, "dog"), "dog dog dog");
+        // A replacement containing the query is not searched again.
+        assert_eq!(replace_matches(text, &matches, "cats"), "cats cats cats");
+        assert_eq!(replace_matches("keep", &[], "x"), "keep");
+    }
+}
+
+#[cfg(test)]
+mod dialog_logic_tests {
+    use super::*;
+
+    #[test]
+    fn export_file_names_are_safe() {
+        assert_eq!(safe_file_stem("Quarterly Report"), "Quarterly_Report");
+        // Path separators and traversal can't escape the chosen folder.
+        assert_eq!(safe_file_stem("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(safe_file_stem("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(safe_file_stem("   "), "Untitled");
+        assert_eq!(safe_file_stem("..."), "Untitled");
+        assert_eq!(safe_file_stem("Café résumé"), "Café_résumé");
+    }
+
+    #[test]
+    fn margin_presets_are_recognised_exactly() {
+        assert_eq!(margin_preset_of(&doc::PageMargins::default()), Some(0));
+        for (i, (_, m)) in MARGIN_PRESETS.iter().enumerate() {
+            assert_eq!(margin_preset_of(m), Some(i));
+        }
+        let custom = doc::PageMargins {
+            top: 50.0,
+            ..doc::PageMargins::default()
+        };
+        assert_eq!(margin_preset_of(&custom), None);
+    }
+
+    #[test]
+    fn inserted_tables_parse_as_real_tables() {
+        for (rows, cols) in [(1, 1), (3, 2), (4, 5)] {
+            let blocks = parse_content_blocks(&markdown_table(rows, cols), 1.15);
+            assert_eq!(blocks.len(), 1, "{rows}x{cols}");
+            let doc::Block::Table { data } = &blocks[0] else {
+                panic!("{rows}x{cols} is not a table: {:?}", blocks[0]);
+            };
+            assert_eq!(data.rows.len(), rows, "{rows}x{cols} rows");
+            assert!(
+                data.rows.iter().all(|r| r.len() == cols),
+                "{rows}x{cols} cols"
+            );
+            assert_eq!(data.rows[0][0].text(), "Column 1");
+        }
+    }
+}
+
+#[cfg(test)]
+mod menu_label_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn shortcut_labels_read_the_real_bindings() {
+        let label = |keys: &str| shortcut_text(&KeyBinding::new(keys, Redo, None));
+        assert_eq!(label("secondary-shift-z"), "Ctrl+Shift+Z");
+        assert_eq!(label("secondary-alt-1"), "Ctrl+Alt+1");
+        assert_eq!(label("secondary-enter"), "Ctrl+Enter");
+        assert_eq!(label("ctrl-shift-left"), "Ctrl+Shift+←");
+        assert_eq!(label("shift-end"), "Shift+End");
+        assert_eq!(label("pagedown"), "Page Down");
+    }
+
+    #[test]
+    fn action_titles_read_like_menu_items() {
+        assert_eq!(
+            action_title("text_input::SelectWordLeft"),
+            "Select word left"
+        );
+        assert_eq!(action_title("app::Heading1"), "Heading 1");
+        assert_eq!(action_title("app::OpenFindBar"), "Open find bar");
+        assert_eq!(action_title("Paste"), "Paste");
+    }
+
+    #[test]
+    fn every_menu_command_has_a_shortcut_label_or_none_at_all() {
+        // Menus read labels through shortcut_text; every bound command's
+        // label must name at least a key.
+        for binding in key_bindings() {
+            let text = shortcut_text(&binding);
+            assert!(!text.is_empty() && !text.ends_with('+'), "{text:?}");
+        }
     }
 }

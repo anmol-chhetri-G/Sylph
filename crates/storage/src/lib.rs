@@ -35,6 +35,16 @@ pub struct Storage {
     conn: Connection,
 }
 
+/// One saved version of a document's text (version history).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Revision {
+    /// The save it comes from (a `crdt_updates` row).
+    pub id: i64,
+    /// When it was saved, local time, "YYYY-MM-DD HH:MM".
+    pub saved: String,
+    pub text: String,
+}
+
 /// A document as the documents list shows it. Titles are often still
 /// "Untitled", so the start of the current text comes along for a preview.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +162,50 @@ impl Storage {
             docs.push(row?);
         }
         Ok(docs)
+    }
+
+    /// The document's saved versions, newest first, one per editing
+    /// session. Autosave writes a row after every pause in typing, so saves
+    /// closer together than `session_gap_secs` fold into the last of them
+    /// (the text as that session ended), the way Google Docs groups its
+    /// history. Consecutive versions with identical text show once.
+    pub fn list_revisions(
+        &self,
+        doc_id: i64,
+        session_gap_secs: i64,
+    ) -> Result<Vec<Revision>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0)
+             FROM crdt_updates WHERE document_id = ?1 ORDER BY id",
+        )?;
+        let saves: Vec<(i64, i64)> = stmt
+            .query_map(params![doc_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let session_ends = saves.iter().enumerate().filter(|(i, (_, at))| {
+            saves
+                .get(i + 1)
+                .is_none_or(|(_, next)| next - at > session_gap_secs)
+        });
+        let mut revisions: Vec<Revision> = Vec::new();
+        for (_, (id, _)) in session_ends.rev() {
+            let (saved, blob): (String, Vec<u8>) = self.conn.query_row(
+                "SELECT COALESCE(strftime('%Y-%m-%d %H:%M', created_at, 'localtime'), ''),
+                        update_blob
+                 FROM crdt_updates WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let text = String::from_utf8_lossy(&blob).into_owned();
+            if revisions.last().is_some_and(|newer| newer.text == text) {
+                continue;
+            }
+            revisions.push(Revision {
+                id: *id,
+                saved,
+                text,
+            });
+        }
+        Ok(revisions)
     }
 
     pub fn save_text(&self, doc_id: i64, text: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -370,6 +424,60 @@ mod tests {
             .unwrap();
         assert_eq!(storage.last_opened().unwrap(), None);
         assert_eq!(storage.open_last_or_create().unwrap(), a);
+    }
+
+    // ── Version history ───────────────────────────────────────────
+
+    /// A save of `text` at `at` ("YYYY-MM-DD HH:MM:SS", UTC).
+    fn save_at(storage: &Storage, doc_id: i64, text: &str, at: &str) {
+        storage
+            .conn
+            .execute(
+                "INSERT INTO crdt_updates (document_id, update_blob, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![doc_id, text.as_bytes(), at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_revisions_fold_autosaves_into_sessions() {
+        let storage = temp_storage();
+        let id = storage.create_document("Essay").unwrap();
+        // Morning session: three autosaves a few seconds apart.
+        save_at(&storage, id, "Draft", "2026-09-25 09:00:00");
+        save_at(&storage, id, "Draft one", "2026-09-25 09:00:04");
+        save_at(&storage, id, "Draft one.", "2026-09-25 09:00:09");
+        // Afternoon session.
+        save_at(&storage, id, "Draft one. More", "2026-09-25 15:30:00");
+        save_at(&storage, id, "Draft one. More text", "2026-09-25 15:30:03");
+
+        let revisions = storage.list_revisions(id, 300).unwrap();
+        let texts: Vec<&str> = revisions.iter().map(|r| r.text.as_str()).collect();
+        // Newest first; each session is represented by how it ended.
+        assert_eq!(texts, ["Draft one. More text", "Draft one."]);
+        assert_eq!(revisions[1].saved.len(), "YYYY-MM-DD HH:MM".len());
+    }
+
+    #[test]
+    fn test_revisions_show_identical_text_once() {
+        // Switching documents saves unchanged text again.
+        let storage = temp_storage();
+        let id = storage.create_document("Notes").unwrap();
+        save_at(&storage, id, "same", "2026-09-25 09:00:00");
+        save_at(&storage, id, "same", "2026-09-25 12:00:00");
+        save_at(&storage, id, "changed", "2026-09-25 18:00:00");
+        let texts: Vec<String> = storage
+            .list_revisions(id, 300)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert_eq!(texts, ["changed", "same"]);
+        assert!(storage
+            .list_revisions(storage.create_document("Empty").unwrap(), 300)
+            .unwrap()
+            .is_empty());
     }
 
     // ── Documents list ────────────────────────────────────────────

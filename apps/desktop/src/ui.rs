@@ -1,21 +1,31 @@
 use crate::{
-    heading_level_and_text, heading_metrics_pt, BoldText, CloseOverlay, ContextMenuCopy,
-    ContextMenuCut, ContextMenuPaste, CycleBodyFont, CycleHeading, EditingCoverAuthor,
-    EditingCoverSubtitle, EditingCoverTitle, EditingField, ExportPdf, InsertPageBreak, InsertTable,
-    InspectorMode, ItalicText, NavigatorTab, NewDocument, OpenCommandPalette, OpenFindBar,
-    OpenModalShowcase, PasteImage, Redo, SaveDoc, SaveState, SetPageMargins, SetPageSize,
-    ShowImageInspector, ShowParagraphInspector, ShowVersionHistory, StrikethroughText, SylphApp,
-    ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo,
-    WorkspaceOverlay,
+    heading_level_and_text, heading_metrics_pt, AddCoverPage, BoldText, CloseOverlay,
+    ContextMenuCopy, ContextMenuCut, ContextMenuPaste, ContextMenuSelectAll, CycleBodyFont,
+    CycleHeading, EditingField, ExportFormat, FindAndReplace, FocusMode, Heading1, Heading2,
+    Heading3, Heading4, Heading5, Heading6, InsertPageBreak, InsertTable, InspectorMode,
+    ItalicText, NavigatorTab, NewDocument, NormalText, OpenCommandPalette, OpenExportDialog,
+    OpenFindBar, OpenPageSetup, PasteImage, PrintLayout, Redo, ReplaceAll, ReplaceCurrent, SaveDoc,
+    SaveState, ShowImageInspector, ShowParagraphInspector, ShowShortcuts, ShowVersionHistory,
+    StrikethroughText, SylphApp, ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler,
+    ToggleSidebar, Undo, WebLayout, WorkspaceOverlay,
 };
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels, Rgba, Stateful, Window,
+    anchored, deferred, div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels,
+    Rgba, Stateful, Window,
 };
 
 const UI_FONT: &str = "Hanken Grotesk";
 const PROSE_FONT: &str = "EB Garamond";
 pub(crate) const MONO_FONT: &str = "JetBrains Mono";
+
+/// One entry of a menu-bar menu.
+pub(crate) enum MenuEntry {
+    /// A command: its label, the action it runs (the one its shortcut runs)
+    /// and, for a toggle, whether it is on.
+    Item(&'static str, Box<dyn gpui::Action>, Option<bool>),
+    Separator,
+}
 
 /// Hover tooltip for toolbar buttons: a small dark chip with the action's
 /// name (and honest notes on controls that are present but not wired yet).
@@ -296,19 +306,29 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn close_overlay(&mut self, _: &CloseOverlay, _window: &mut Window, cx: &mut Context<Self>) {
+    fn close_overlay(&mut self, _: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = WorkspaceOverlay::None;
-        self.find.visible = false;
+        self.context_menu.visible = false;
+        self.open_menu = None;
+        if self.find.visible {
+            // Hand the keyboard back to the document.
+            self.hide_find_bar(window, cx);
+        }
         cx.notify();
     }
 
-    fn open_modal_showcase(
+    fn open_export_dialog(
         &mut self,
-        _: &OpenModalShowcase,
+        _: &OpenExportDialog,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.overlay = WorkspaceOverlay::ModalShowcase;
+        self.overlay = WorkspaceOverlay::Export;
+        cx.notify();
+    }
+
+    fn open_page_setup(&mut self, _: &OpenPageSetup, _window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = WorkspaceOverlay::PageSetup;
         cx.notify();
     }
 
@@ -342,6 +362,7 @@ impl SylphApp {
     ) {
         self.inspector_mode = InspectorMode::History;
         self.inspector_visible = true;
+        self.load_revisions(cx);
         cx.notify();
     }
 
@@ -636,33 +657,262 @@ impl SylphApp {
             )
     }
 
-    fn menu_bar(&self, cx: &mut Context<Self>) -> Div {
+    /// The File/Edit/View/Insert/Format/Help menus. Every entry runs the same
+    /// action its keyboard shortcut runs, and toggles show whether they are on.
+    fn menus(&self, cx: &mut Context<Self>) -> Vec<(&'static str, Vec<MenuEntry>)> {
+        use MenuEntry::{Item, Separator};
+        let (print, web, focus) = view_mode_active(
+            self.web_layout,
+            self.sidebar_visible,
+            self.inspector_visible,
+        );
+        let level = self.current_heading_level(cx);
+        vec![
+            (
+                "File",
+                vec![
+                    Item("New document", Box::new(NewDocument), None),
+                    Separator,
+                    Item("Export…", Box::new(OpenExportDialog), None),
+                    Item("Page setup…", Box::new(OpenPageSetup), None),
+                    Separator,
+                    Item("Save now", Box::new(SaveDoc), None),
+                ],
+            ),
+            (
+                "Edit",
+                vec![
+                    Item("Undo", Box::new(Undo), None),
+                    Item("Redo", Box::new(Redo), None),
+                    Separator,
+                    Item("Cut", Box::new(ContextMenuCut), None),
+                    Item("Copy", Box::new(ContextMenuCopy), None),
+                    Item("Paste", Box::new(ContextMenuPaste), None),
+                    Item("Select all", Box::new(ContextMenuSelectAll), None),
+                    Separator,
+                    Item("Find", Box::new(OpenFindBar), None),
+                    Item("Find and replace", Box::new(FindAndReplace), None),
+                ],
+            ),
+            (
+                "View",
+                vec![
+                    Item("Print layout", Box::new(PrintLayout), Some(print)),
+                    Item("Web layout", Box::new(WebLayout), Some(web)),
+                    Item("Focus mode", Box::new(FocusMode), Some(focus)),
+                    Separator,
+                    Item(
+                        "Markdown mode",
+                        Box::new(ToggleMarkdownMode),
+                        Some(self.markdown_mode),
+                    ),
+                    Item("Ruler", Box::new(ToggleRuler), Some(self.ruler_visible)),
+                    Item("Dark mode", Box::new(ToggleDarkMode), Some(self.dark_mode)),
+                    Separator,
+                    Item(
+                        "Sidebar",
+                        Box::new(ToggleSidebar),
+                        Some(self.sidebar_visible),
+                    ),
+                    Item(
+                        "Inspector",
+                        Box::new(ToggleInspector),
+                        Some(self.inspector_visible),
+                    ),
+                    Item("Version history", Box::new(ShowVersionHistory), None),
+                ],
+            ),
+            (
+                "Insert",
+                vec![
+                    Item("Table…", Box::new(InsertTable), None),
+                    Item("Image…", Box::new(PasteImage), None),
+                    Item("Page break", Box::new(InsertPageBreak), None),
+                    Separator,
+                    Item(
+                        "Cover page",
+                        Box::new(AddCoverPage),
+                        Some(self.document.has_cover_page()),
+                    ),
+                ],
+            ),
+            (
+                "Format",
+                vec![
+                    Item("Bold", Box::new(BoldText), None),
+                    Item("Italic", Box::new(ItalicText), None),
+                    Item("Strikethrough", Box::new(StrikethroughText), None),
+                    Separator,
+                    Item("Normal text", Box::new(NormalText), Some(level == 0)),
+                    Item("Heading 1", Box::new(Heading1), Some(level == 1)),
+                    Item("Heading 2", Box::new(Heading2), Some(level == 2)),
+                    Item("Heading 3", Box::new(Heading3), Some(level == 3)),
+                    Item("Heading 4", Box::new(Heading4), Some(level == 4)),
+                    Item("Heading 5", Box::new(Heading5), Some(level == 5)),
+                    Item("Heading 6", Box::new(Heading6), Some(level == 6)),
+                    Separator,
+                    Item("Next body font", Box::new(CycleBodyFont), None),
+                ],
+            ),
+            (
+                "Help",
+                vec![Item("Keyboard shortcuts", Box::new(ShowShortcuts), None)],
+            ),
+        ]
+    }
+
+    /// One open menu under its title. Clicks inside never reach the root
+    /// (which closes menus on any other press); an item closes the menu and
+    /// dispatches its action, so it goes wherever its shortcut would.
+    fn menu_dropdown(
+        &self,
+        entries: Vec<MenuEntry>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (text, muted, primary, border, hover) = (
+            self.ui_text(),
+            self.ui_muted(),
+            self.ui_primary(),
+            self.ui_border(),
+            self.ui_panel_low(),
+        );
+        let mut list = div()
+            .absolute()
+            .top(px(28.0))
+            .left(px(0.0))
+            .min_w(px(280.0))
+            .p(px(4.0))
+            .flex()
+            .flex_col()
+            .bg(self.surface_color())
+            .border_1()
+            .border_color(border)
+            .rounded(px(6.0))
+            .shadow_lg()
+            .font_family(UI_FONT)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        for entry in entries {
+            list = list.child(match entry {
+                MenuEntry::Separator => div().h(px(1.0)).my(px(4.0)).bg(border),
+                MenuEntry::Item(name, action, checked) => {
+                    let keys = window
+                        .highest_precedence_binding_for_action(action.as_ref())
+                        .map(|binding| crate::shortcut_text(&binding))
+                        .unwrap_or_default();
+                    div()
+                        .h(px(28.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(move |row| row.bg(hover))
+                        .child(
+                            label(if checked == Some(true) { "✓" } else { "" }, primary, 12.0)
+                                .w(px(14.0)),
+                        )
+                        .child(label(name, text, 12.0).flex_1())
+                        .child(label(keys, muted, 11.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.open_menu = None;
+                                window.dispatch_action(action.boxed_clone(), cx);
+                                cx.notify();
+                            }),
+                        )
+                }
+            });
+        }
+        deferred(list).with_priority(2)
+    }
+
+    /// Help → Keyboard shortcuts: every binding that uses a modifier, one row
+    /// per command, generated from the real key bindings so it cannot be
+    /// wrong. (macOS-only conventions are hidden on other systems.)
+    fn shortcuts_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let (text, muted, border) = (self.ui_text(), self.ui_muted(), self.ui_border());
+        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+        for binding in crate::key_bindings() {
+            let m = *binding.keystrokes()[0].modifiers();
+            if !(m.control || m.alt || m.shift || m.platform) {
+                continue;
+            }
+            if m.platform && !cfg!(target_os = "macos") {
+                continue;
+            }
+            let title = crate::action_title(binding.action().name());
+            let keys = crate::shortcut_text(&binding);
+            match rows.iter_mut().find(|(t, _)| *t == title) {
+                Some((_, all)) => all.push(keys),
+                None => rows.push((title, vec![keys])),
+            }
+        }
+        let mut list = div()
+            .id("shortcut-list")
+            .max_h(px(460.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for (title, keys) in rows {
+            list = list.child(
+                div()
+                    .py(px(5.0))
+                    .flex()
+                    .justify_between()
+                    .gap(px(16.0))
+                    .border_b_1()
+                    .border_color(border)
+                    .child(label(title, text, 12.0))
+                    .child(label(keys.join("  or  "), muted, 11.0).font_family(MONO_FONT)),
+            );
+        }
+        self.modal("Keyboard shortcuts", 560.0, div().child(list), cx)
+    }
+
+    fn menu_bar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let menu_fg = self.ui_text();
         let mut nav = div().flex().items_center().gap(px(2.0));
-        for (index, item) in ["File", "Edit", "View", "Insert", "Format", "Tools", "Help"]
-            .iter()
-            .enumerate()
-        {
+        for (index, (name, entries)) in self.menus(cx).into_iter().enumerate() {
+            let open = self.open_menu == Some(index);
             nav = nav.child(
                 div()
+                    .id(("menu", index))
+                    .relative()
                     .px(px(8.0))
                     .py(px(2.0))
                     .rounded(px(2.0))
                     .font_family(UI_FONT)
                     .text_size(px(13.0))
-                    .font_weight(if index == 0 {
-                        gpui::FontWeight(700.0)
-                    } else {
-                        gpui::FontWeight(400.0)
-                    })
-                    .text_color(if index == 0 {
-                        self.ui_primary()
-                    } else {
-                        menu_fg
-                    })
-                    .when(index == 0, |s| s.bg(self.ui_panel_high()))
+                    .text_color(if open { self.ui_primary() } else { menu_fg })
+                    .cursor_pointer()
+                    .when(open, |s| s.bg(self.ui_panel_high()))
                     .hover(|s| s.bg(self.hover_color()))
-                    .child((*item).to_string()),
+                    .child(name)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_menu = if this.open_menu == Some(index) {
+                                None
+                            } else {
+                                Some(index)
+                            };
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    // Once a menu is open, pointing at another title opens it.
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered && this.open_menu.is_some() && this.open_menu != Some(index) {
+                            this.open_menu = Some(index);
+                            cx.notify();
+                        }
+                    }))
+                    .when(open, |title| {
+                        title.child(self.menu_dropdown(entries, window, cx))
+                    }),
             );
         }
 
@@ -679,52 +929,22 @@ impl SylphApp {
             .child(nav)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .hover(|s| s.bg(self.hover_color()))
-                            .cursor_pointer()
-                            .child(icon("⌯", menu_fg, 16.0))
-                            .child(label("Share", menu_fg, 12.0)),
+                    .px(px(14.0))
+                    .py(px(4.0))
+                    .rounded_full()
+                    .bg(self.ui_primary())
+                    .text_color(rgb(0xffffff))
+                    .font_family(UI_FONT)
+                    .font_weight(gpui::FontWeight(600.0))
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.open_export_dialog(&OpenExportDialog, window, cx);
+                        }),
                     )
-                    .child(
-                        div()
-                            .px(px(14.0))
-                            .py(px(4.0))
-                            .rounded_full()
-                            .bg(self.ui_primary())
-                            .text_color(rgb(0xffffff))
-                            .font_family(UI_FONT)
-                            .font_weight(gpui::FontWeight(600.0))
-                            .text_size(px(12.0))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_modal_showcase(&OpenModalShowcase, window, cx);
-                                }),
-                            )
-                            .child("Export"),
-                    )
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(self.ui_primary())
-                            .text_color(rgb(0xffffff))
-                            .child(icon("●", rgb(0xffffff), 9.0)),
-                    ),
+                    .child("Export"),
             )
     }
 
@@ -887,23 +1107,10 @@ impl SylphApp {
             modes = modes.child(
                 with_tip(self.compact_button(name, active), id, tip).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _window, cx| {
-                        match name {
-                            "Print" => {
-                                this.web_layout = false;
-                                this.sidebar_visible = true;
-                                this.inspector_visible = true;
-                            }
-                            "Web" => {
-                                this.web_layout = true;
-                            }
-                            _ => {
-                                this.web_layout = false;
-                                this.sidebar_visible = false;
-                                this.inspector_visible = false;
-                            }
-                        }
-                        cx.notify();
+                    cx.listener(move |this, _, _window, cx| match name {
+                        "Print" => this.set_view_mode(false, true, cx),
+                        "Web" => this.set_view_mode(true, true, cx),
+                        _ => this.set_view_mode(false, false, cx),
                     }),
                 ),
             );
@@ -977,23 +1184,16 @@ impl SylphApp {
                 this.show_paragraph_inspector(&ShowParagraphInspector, window, cx);
             }),
         );
-        let history = item("◷", "Version Galley", false).on_mouse_down(
+        let history = item("◷", "Version history", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 this.show_version_history(&ShowVersionHistory, window, cx);
             }),
         );
-        let print = item("▤", "Print Simulation", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.preview_visible = !this.preview_visible;
-                cx.notify();
-            }),
-        );
         let setup = item("⚙", "Page Setup & Margins", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
-                this.open_modal_showcase(&OpenModalShowcase, window, cx);
+                this.open_page_setup(&OpenPageSetup, window, cx);
             }),
         );
 
@@ -1042,7 +1242,6 @@ impl SylphApp {
                     .child(outline)
                     .child(inspector)
                     .child(history)
-                    .child(print)
                     .child(setup),
             )
             .child(
@@ -1325,19 +1524,6 @@ impl SylphApp {
                 cx.listener(|this, _, window, cx| {
                     this.show_image_inspector(&ShowImageInspector, window, cx);
                     this.paste_image(&PasteImage, window, cx);
-                }),
-            ),
-        );
-        inserts = inserts.child(
-            with_tip(
-                self.tool_button("▦", false),
-                "insert-showcase",
-                "Examples gallery",
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.open_modal_showcase(&OpenModalShowcase, window, cx);
                 }),
             ),
         );
@@ -1760,373 +1946,27 @@ impl SylphApp {
             .child(ticks)
     }
 
-    #[allow(dead_code)]
-    fn render_sample_table(&self) -> Div {
-        let border = self.ui_border();
-        let text = self.ui_text();
-        let muted = self.ui_muted();
-        let positive = rgb(0x059669);
-        let negative = rgb(0xe11d48);
-        let mut table = div()
-            .w_full()
-            .border_1()
-            .border_color(border)
-            .rounded(px(2.0))
-            .overflow_hidden();
-        let header = div()
-            .flex()
-            .bg(self.ui_panel_high())
-            .child(
-                label("Region", muted, 12.0)
-                    .w(px(180.0))
-                    .px(px(10.0))
-                    .py(px(8.0)),
-            )
-            .child(
-                label("Target (M$)", muted, 12.0)
-                    .w(px(120.0))
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .text_right(),
-            )
-            .child(
-                label("Actual (M$)", muted, 12.0)
-                    .w(px(120.0))
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .text_right(),
-            )
-            .child(
-                label("Delta (%)", muted, 12.0)
-                    .flex_1()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .text_right(),
-            );
-        table = table.child(header);
-        for (region, target, actual, delta, color) in [
-            ("North America", "$42.0", "$48.2", "+14.7%", positive),
-            ("EMEA Central", "$31.5", "$34.1", "+8.2%", positive),
-            ("Asia-Pacific", "$22.0", "$21.8", "-0.9%", negative),
-        ] {
-            table = table.child(
-                div()
-                    .flex()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        label(region, text, 12.0)
-                            .w(px(180.0))
-                            .px(px(10.0))
-                            .py(px(8.0)),
-                    )
-                    .child(
-                        label(target, muted, 12.0)
-                            .w(px(120.0))
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .text_right()
-                            .font_family(MONO_FONT),
-                    )
-                    .child(
-                        label(actual, text, 12.0)
-                            .w(px(120.0))
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .text_right()
-                            .font_family(MONO_FONT),
-                    )
-                    .child(
-                        label(delta, color, 12.0)
-                            .flex_1()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .text_right()
-                            .font_family(MONO_FONT),
-                    ),
-            );
-        }
-        table
-    }
-
-    #[allow(dead_code)]
-    fn render_sample_figure(&self, cx: &mut Context<Self>) -> Div {
-        let border = self.ui_border();
-        let muted = self.ui_muted();
-        let figure = div()
-            .h(px(144.0))
-            .w_full()
-            .relative()
-            .flex()
-            .items_end()
-            .justify_center()
-            .gap(px(22.0))
-            .px(px(32.0))
-            .pb(px(16.0))
-            .bg(self.ui_panel_low())
-            .border_1()
-            .border_color(border)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.show_image_inspector(&ShowImageInspector, window, cx);
-                }),
-            );
-        let bars = [
-            ("NA", 82.0),
-            ("EMEA", 62.0),
-            ("APAC", 46.0),
-            ("LATAM", 32.0),
-        ];
-        let mut graphic = figure;
-        for (name, height) in bars {
-            graphic = graphic.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .w(px(36.0))
-                            .h(px(height))
-                            .bg(self.ui_primary())
-                            .rounded(px(2.0)),
-                    )
-                    .child(label(name, muted, 9.0)),
-            );
-        }
-        div().my(px(16.0)).child(graphic).child(
-            label(
-                "Figure 1: Revenue breakdown by geographic segment and latency percentile.",
-                muted,
-                11.0,
-            )
-            .font_family(PROSE_FONT)
-            .italic()
-            .text_center(),
-        )
-    }
-
-    #[allow(dead_code)]
-    /// DEAD: the live canvas is `render_blank_editor_page` (see
-    /// `center_canvas`). Kept only as the legacy showcase layout — do not
-    /// rewire it without porting the page-setup sync first.
-    fn render_page(&mut self, cx: &mut Context<Self>) -> Div {
-        let border = self.ui_border();
-        let text = self.ui_text();
-        let muted = self.ui_muted();
-        let page = self.ui_page();
-        let page_header = div()
-            .flex_shrink_0()
-            .mb(px(22.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .font_family(UI_FONT)
-                    .text_size(px(10.0))
-                    .text_color(muted)
-                    .child("SECTION I · CORPORATE EDITORIAL")
-                    .child(label("DOC REF: SYL-2024-Q3", muted, 10.0).font_family(MONO_FONT)),
-            )
-            .child(
-                label(self.doc_title.clone(), text, 34.0)
-                    .font_family(PROSE_FONT)
-                    .font_weight(gpui::FontWeight(600.0))
-                    .line_height(px(40.0)),
-            )
-            .child(
-                label(
-                    "Fiscal Year 2024 — Q3 Executive Summary & Regional Performance",
-                    muted,
-                    13.0,
-                )
-                .font_family(UI_FONT)
-                .mt(px(4.0)),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(1.0))
-                    .mt(px(16.0))
-                    .bg(self.ui_panel_high()),
-            );
-
-        // The editor grows with its content (no fixed clip: the caret can
-        // never float in an empty page), and the canvas body size follows
-        // the toolbar's font-size control — 11pt default = 14.67px at
-        // 96dpi, so what the toolbar says is what the page shows.
-        let body_px = self.document.body_font_size * (4.0 / 3.0);
-        let content_height = self.editor.read(cx).content_height;
-        let editor_height = px(430.0).max(content_height + px(24.0));
-        let editor = div()
-            .w_full()
-            .h(editor_height)
-            .flex_shrink_0()
-            .mb(px(10.0))
-            .overflow_hidden()
-            .font_family(PROSE_FONT)
-            .text_size(px(body_px))
-            .line_height(px((body_px * 1.6).max(24.0)))
-            .text_color(text)
-            .child(self.editor.clone())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.commit_field_edit(cx);
-                }),
-            );
-
-        let mut page_content = div()
-            .w(px(816.0))
-            .min_h(px(1056.0))
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .relative()
-            .p(px(96.0))
-            .bg(page)
-            .text_color(text)
-            .font_family(PROSE_FONT)
-            .shadow_md()
-            .child(
-                div()
-                    .absolute()
-                    .top(px(96.0))
-                    .left(px(96.0))
-                    .right(px(96.0))
-                    .bottom(px(96.0))
-                    .border_1()
-                    .border_color(border),
-            )
-            .child(page_header)
-            .child(editor)
-            .child(self.render_sample_table())
-            .child(self.render_sample_figure(cx))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(96.0))
-                    .right(px(96.0))
-                    .bottom(px(48.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .font_family(UI_FONT)
-                    .text_size(px(10.0))
-                    .text_color(muted)
-                    .child("Sylph Editorial Proof — Confidential")
-                    .child(label("1", muted, 10.0).font_family(MONO_FONT)),
-            );
-
-        if !self.document.blocks.is_empty() {
-            for block in &self.document.blocks {
-                match block {
-                    sylph_core::document::Block::PageBreak => {}
-                    sylph_core::document::Block::Image { data } => {
-                        page_content = page_content.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .child(img(data.path.clone()).max_w(px(480.0)).max_h(px(300.0)))
-                                .child(
-                                    label(
-                                        data.caption.clone().unwrap_or_else(|| "Figure 1".into()),
-                                        muted,
-                                        11.0,
-                                    )
-                                    .italic(),
-                                ),
-                        );
-                    }
-                    sylph_core::document::Block::Table { data } => {
-                        let mut table = div().w_full().border_1().border_color(border);
-                        for row in &data.rows {
-                            let mut row_div = div().flex().border_b_1().border_color(border);
-                            for cell in row {
-                                row_div = row_div.child(
-                                    label(cell.text(), text, 12.0)
-                                        .flex_1()
-                                        .px(px(8.0))
-                                        .py(px(6.0)),
-                                );
-                            }
-                            table = table.child(row_div);
-                        }
-                        page_content = page_content.child(table);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        page_content
-    }
-
-    #[allow(dead_code)]
-    fn render_second_page(&self) -> Div {
-        let text = self.ui_text();
-        let muted = self.ui_muted();
-        div()
-            .w(px(816.0))
-            .h(px(600.0))
-            .flex_shrink_0()
-            .relative()
-            .p(px(96.0))
-            .bg(self.ui_page())
-            .text_color(text)
-            .font_family(PROSE_FONT)
-            .shadow_md()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .font_family(UI_FONT)
-                    .text_size(px(9.0))
-                    .text_color(muted)
-                    .child("Sylph Document Engine · Performance galley")
-                    .child("Quarterly Report — 2"),
-            )
-            .child(
-                label("2.2 Operational Costs & Infrastructure Fleet", text, 22.0)
-                    .font_family(PROSE_FONT)
-                    .font_weight(gpui::FontWeight(600.0))
-                    .mt(px(28.0)),
-            )
-            .child(
-                div()
-                    .mt(px(18.0))
-                    .font_family(PROSE_FONT)
-                    .text_size(px(14.0))
-                    .line_height(px(24.0))
-                    .text_color(text)
-                    .child("Transitioning from on-demand compute allocations to reserved container nodes reduced volatile spike pricing during peak trading intervals. The primary driver of efficiency was the localized deployment of cache nodes directly within Frankfurt Internet Exchange, which bypassed commercial cloud transit overhead for roughly 62% of transaction payloads."),
-            )
-            .child(
-                div()
-                    .mt(px(16.0))
-                    .font_family(PROSE_FONT)
-                    .text_size(px(14.0))
-                    .line_height(px(24.0))
-                    .text_color(text)
-                    .child("Furthermore, memory footprint analysis revealed that deterministic deallocation strategies prevented the typical micro-stalls associated with large-scale document editing sessions in concurrent team workflows..."),
-            )
-    }
-
     /// Structured rich blocks (images, tables) rendered under the editor —
     /// shared by the Print page and the Web flow so both show exactly the
     /// same document content.
-    fn rich_block_divs(&self) -> Vec<Div> {
+    fn rich_block_divs(&self, cx: &mut Context<Self>) -> Vec<Div> {
         let border = self.ui_border();
         let text = self.ui_text();
-        let muted = self.ui_muted();
         let mut out = Vec::new();
-        for block in &self.document.blocks {
+        for (idx, block) in self.document.blocks.iter().enumerate() {
+            // Captions are click-to-edit; an empty one shows a muted prompt
+            // (never exported) instead of an invented "Figure 1".
+            let caption = |field: EditingField, value: &Option<String>, cx: &mut Context<Self>| {
+                self.edit_field(
+                    field,
+                    value.as_deref().unwrap_or_default(),
+                    "Add a caption",
+                    9.0,
+                    cx,
+                )
+                .italic()
+            };
             match block {
-                sylph_core::document::Block::PageBreak => {}
                 sylph_core::document::Block::Image { data } => {
                     out.push(
                         div()
@@ -2135,18 +1975,11 @@ impl SylphApp {
                             .flex_col()
                             .items_center()
                             .child(img(data.path.clone()).max_w(px(480.0)).max_h(px(300.0)))
-                            .child(
-                                label(
-                                    data.caption.clone().unwrap_or_else(|| "Figure 1".into()),
-                                    muted,
-                                    11.0,
-                                )
-                                .italic(),
-                            ),
+                            .child(caption(EditingField::ImageCaption(idx), &data.caption, cx)),
                     );
                 }
                 sylph_core::document::Block::Table { data } => {
-                    let mut table = div().w_full().mt(px(16.0)).border_1().border_color(border);
+                    let mut table = div().w_full().border_1().border_color(border);
                     for row in &data.rows {
                         let mut row_div = div().flex().border_b_1().border_color(border);
                         for cell in row {
@@ -2159,7 +1992,16 @@ impl SylphApp {
                         }
                         table = table.child(row_div);
                     }
-                    out.push(table);
+                    out.push(
+                        div()
+                            .w_full()
+                            .mt(px(16.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(table)
+                            .child(caption(EditingField::TableCaption(idx), &data.caption, cx)),
+                    );
                 }
                 _ => {}
             }
@@ -2182,7 +2024,7 @@ impl SylphApp {
             .items_center()
             .gap(px(12.0))
             .child(
-                self.cover_field(
+                self.edit_field(
                     EditingField::CoverTitle,
                     &cover.title,
                     "Add a title",
@@ -2191,14 +2033,14 @@ impl SylphApp {
                 )
                 .font_weight(gpui::FontWeight(700.0)),
             )
-            .child(self.cover_field(
+            .child(self.edit_field(
                 EditingField::CoverSubtitle,
                 &cover.subtitle,
                 "Add a subtitle",
                 16.0,
                 cx,
             ))
-            .child(self.cover_field(
+            .child(self.edit_field(
                 EditingField::CoverAuthor,
                 &cover.author,
                 "Add an author",
@@ -2208,8 +2050,10 @@ impl SylphApp {
             .child(label(cover.date.clone(), self.ui_muted(), 11.0 * 4.0 / 3.0))
     }
 
-    /// One click-to-edit cover field, sized in points like the body text.
-    fn cover_field(
+    /// One click-to-edit field (cover text, a caption), sized in points
+    /// like the body text. While empty it shows a muted prompt, which is
+    /// never exported.
+    fn edit_field(
         &self,
         field: EditingField,
         value: &str,
@@ -2235,6 +2079,7 @@ impl SylphApp {
         } else {
             (value.to_string(), text)
         };
+        let value = value.to_string();
         let hover = self.ui_panel_low();
         base.text_color(color)
             .cursor_pointer()
@@ -2243,19 +2088,7 @@ impl SylphApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    // Finish any other field first, then take focus from the
-                    // body editor so typing lands only in this field.
-                    this.commit_field_edit(cx);
-                    window.focus(&this.focus_handle);
-                    match field {
-                        EditingField::CoverTitle => {
-                            this.editing_cover_title(&EditingCoverTitle, window, cx)
-                        }
-                        EditingField::CoverSubtitle => {
-                            this.editing_cover_subtitle(&EditingCoverSubtitle, window, cx)
-                        }
-                        _ => this.editing_cover_author(&EditingCoverAuthor, window, cx),
-                    }
+                    this.begin_field_edit(field.clone(), value.clone(), window, cx)
                 }),
             )
     }
@@ -2320,7 +2153,8 @@ impl SylphApp {
                 cx.listener(|this, _, _, cx| {
                     this.commit_field_edit(cx);
                 }),
-            );
+            )
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_editor_right_click));
 
         let mut page_content = div()
             .w(page_w)
@@ -2349,7 +2183,7 @@ impl SylphApp {
             )
             .child(editor);
 
-        page_content = page_content.children(self.rich_block_divs());
+        page_content = page_content.children(self.rich_block_divs(cx));
 
         // Page number footer: the first body page (page 2 after a cover).
         page_content = page_content.child(
@@ -2395,7 +2229,8 @@ impl SylphApp {
                 cx.listener(|this, _, _, cx| {
                     this.commit_field_edit(cx);
                 }),
-            );
+            )
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_editor_right_click));
         // No pages here, so the cover becomes a title block atop the flow.
         let border = self.ui_border();
         let cover = self.document.cover_page().cloned().map(|cover| {
@@ -2421,7 +2256,7 @@ impl SylphApp {
             .shadow_md()
             .children(cover)
             .child(editor)
-            .children(self.rich_block_divs())
+            .children(self.rich_block_divs(cx))
     }
 
     fn render_blank_page(&self, page_number: usize) -> Div {
@@ -2551,14 +2386,7 @@ impl SylphApp {
                         .items_center()
                         .justify_between()
                         .bg(panel)
-                        .child(label(value, text, 12.0).font_family(MONO_FONT))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(icon("⌃", muted, 10.0))
-                                .child(icon("⌄", muted, 10.0)),
-                        ),
+                        .child(label(value, text, 12.0).font_family(MONO_FONT)),
                 )
         };
         let current_ls = self.document.line_spacing;
@@ -2594,21 +2422,6 @@ impl SylphApp {
                         }),
                     )
                     .child(*v)
-            }));
-        let align = div()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .p(px(2.0))
-            .bg(panel)
-            .children(["≡", "≣", "≡", "▤"].iter().enumerate().map(|(i, glyph)| {
-                div()
-                    .flex_1()
-                    .py(px(8.0))
-                    .text_center()
-                    .text_color(if i == 0 { primary } else { muted })
-                    .when(i == 0, |s| s.bg(self.surface_color()))
-                    .child(icon(glyph, if i == 0 { primary } else { muted }, 16.0))
             }));
         div()
             .w(px(300.0))
@@ -2660,20 +2473,6 @@ impl SylphApp {
                     .child(line_spacing)
                     .child(div().h(px(1.0)).my(px(16.0)).bg(border))
                     .child(
-                        label("ALIGNMENT & INDENTS", muted, 11.0)
-                            .font_weight(gpui::FontWeight(600.0)),
-                    )
-                    .child(align)
-                    .child(
-                        div()
-                            .mt(px(8.0))
-                            .flex()
-                            .gap(px(4.0))
-                            .child(stepper("First Line", "0.00 cm"))
-                            .child(stepper("Hanging", "0.00 cm")),
-                    )
-                    .child(div().h(px(1.0)).my(px(16.0)).bg(border))
-                    .child(
                         div()
                             .flex()
                             .items_center()
@@ -2682,7 +2481,16 @@ impl SylphApp {
                                 label("Page Setup", muted, 11.0)
                                     .font_weight(gpui::FontWeight(600.0)),
                             )
-                            .child(label("Defaults", primary, 10.0)),
+                            .child(
+                                label("Defaults", primary, 10.0)
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.restore_page_defaults(cx)
+                                        }),
+                                    ),
+                            ),
                     )
                     .child(label("Standard Format", muted, 11.0).mt(px(10.0)))
                     .child(
@@ -2698,10 +2506,11 @@ impl SylphApp {
                                     .font_weight(gpui::FontWeight(600.0)),
                             )
                             .child(icon("⌄", muted, 14.0))
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, window, cx| {
-                                    this.set_page_size(&SetPageSize, window, cx)
+                                    this.open_page_setup(&OpenPageSetup, window, cx)
                                 }),
                             ),
                     )
@@ -2736,15 +2545,8 @@ impl SylphApp {
                         )
                     })
                     .child(
-                        label(
-                            "Presets (click to cycle: Narrow → Normal → Wide)",
-                            muted,
-                            10.0,
-                        )
-                        .mt(px(4.0)),
-                    )
-                    .child(
                         div()
+                            .mt(px(4.0))
                             .h(px(44.0))
                             .px(px(10.0))
                             .flex()
@@ -2759,35 +2561,18 @@ impl SylphApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, window, cx| {
-                                    this.set_page_margins(&SetPageMargins, window, cx);
+                                    this.open_page_setup(&OpenPageSetup, window, cx)
                                 }),
                             )
-                            .child(label("Margins", text, 11.0))
+                            .child(label(
+                                match crate::margin_preset_of(&self.document.page_margins) {
+                                    Some(i) => format!("{} margins", crate::MARGIN_PRESETS[i].0),
+                                    None => "Custom margins".to_string(),
+                                },
+                                text,
+                                11.0,
+                            ))
                             .child(icon("⌄", muted, 12.0)),
-                    )
-                    .child(label("Pagination Style", muted, 11.0).mt(px(12.0)))
-                    .child(
-                        div()
-                            .h(px(44.0))
-                            .px(px(10.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .bg(panel)
-                            .child(label("#  Bottom center, from page 1", text, 11.0))
-                            .child(icon("⌄", muted, 14.0)),
-                    )
-                    .child(
-                        div()
-                            .mt(px(16.0))
-                            .p(px(10.0))
-                            .bg(panel)
-                            .font_family(MONO_FONT)
-                            .text_size(px(10.0))
-                            .text_color(muted)
-                            .child("Color Profile             FOGRA39 (CMYK)")
-                            .child("Grid Baseline            12pt Regular")
-                            .child("Hyphenation              Active (En-US)"),
                     ),
             )
     }
@@ -2868,87 +2653,97 @@ impl SylphApp {
             )
     }
 
+    /// Version history: one entry per editing session, newest first, from
+    /// the document's own saves. Select a version to restore it; restoring
+    /// is one undoable edit and becomes the newest version, so no version is
+    /// ever lost.
     fn history_inspector(&self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let panel = self.ui_panel_low();
         let text = self.ui_text();
         let muted = self.ui_muted();
         let primary = self.ui_primary();
-        let mut timeline = div().p(px(16.0)).relative();
-        timeline = timeline.child(
-            div()
-                .absolute()
-                .left(px(31.0))
-                .top(px(22.0))
-                .bottom(px(20.0))
-                .w(px(1.0))
-                .bg(border),
-        );
-        for (index, (title, meta)) in [
-            ("Auto-save", "Just now · 1,284 words"),
-            ("Final draft for review", "2h ago · 1,279 words"),
-            ("Auto-save", "Yesterday 18:04 · 1,102 words"),
-            ("First full draft", "Mon 09:12 · 860 words"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let selected = index == 1;
-            timeline = timeline.child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(12.0))
-                    .relative()
-                    .mb(px(18.0))
-                    .child(
-                        div()
-                            .w(px(30.0))
-                            .flex_shrink_0()
-                            .flex()
-                            .justify_center()
-                            .pt(px(6.0))
-                            .child(
-                                div()
-                                    .w(px(if selected { 10.0 } else { 8.0 }))
-                                    .h(px(if selected { 10.0 } else { 8.0 }))
-                                    .rounded_full()
-                                    .bg(if index == 0 { primary } else { border })
-                                    .border_2()
-                                    .border_color(if selected { primary } else { border }),
-                            ),
+        let live = &self.editor.read(cx).content;
+        let mut list = div()
+            .id("history-list")
+            .flex_1()
+            .overflow_y_scroll()
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        if self.revisions.is_empty() {
+            list = list.child(label(
+                "No saved versions yet. Sylph saves as you type, and each editing session becomes a version here.",
+                muted,
+                12.0,
+            ));
+        }
+        for revision in &self.revisions {
+            let current = revision.text == *live;
+            let selected = self.selected_revision == Some(revision.id);
+            let id = revision.id;
+            let preview = first_text(&revision.text, self.markdown_mode);
+            let mut row = div()
+                .p(px(10.0))
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if selected { primary } else { border })
+                .when(selected, |r| r.bg(panel))
+                .cursor_pointer()
+                .hover(move |r| r.bg(panel))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.selected_revision = (this.selected_revision != Some(id)).then_some(id);
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .child(
+                            label(revision.saved.clone(), text, 12.0)
+                                .font_weight(gpui::FontWeight(600.0)),
+                        )
+                        .when(current, |r| r.child(label("Current", primary, 11.0))),
+                )
+                .child(label(
+                    format!("{} words", count_words(&revision.text)),
+                    muted,
+                    11.0,
+                ))
+                .child(
+                    label(
+                        if preview.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            preview
+                        },
+                        muted,
+                        11.0,
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .p(px(10.0))
-                            .when(selected, |s| {
-                                s.bg(self.ui_panel_high())
-                                    .border_l_3()
-                                    .border_color(primary)
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(label(*title, text, 13.0).font_weight(gpui::FontWeight(
-                                        if selected { 600.0 } else { 500.0 },
-                                    )))
-                                    .when(index == 0, |s| {
-                                        s.child(label("Current", rgb(0x059669), 10.0))
-                                    }),
-                            )
-                            .child(
-                                label(*meta, if selected { primary } else { muted }, 11.0)
-                                    .font_family(MONO_FONT)
-                                    .mt(px(4.0)),
+                    .truncate(),
+                );
+            if selected && !current {
+                row = row.child(
+                    div().mt(px(6.0)).child(
+                        self.compact_button("Restore this version", true)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.restore_revision(id, cx)),
                             ),
                     ),
-            );
+                );
+            }
+            list = list.child(row);
         }
         div()
-            .w(px(360.0))
+            .w(px(300.0))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -2956,6 +2751,7 @@ impl SylphApp {
             .bg(self.surface_color())
             .border_l_1()
             .border_color(border)
+            .font_family(UI_FONT)
             .child(
                 div()
                     .h(px(52.0))
@@ -2963,7 +2759,7 @@ impl SylphApp {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .bg(self.surface_color())
+                    .bg(panel)
                     .border_b_1()
                     .border_color(border)
                     .child(
@@ -2973,36 +2769,23 @@ impl SylphApp {
                             .gap(px(8.0))
                             .child(icon("◷", primary, 18.0))
                             .child(
-                                label("Version History", text, 14.0)
-                                    .font_weight(gpui::FontWeight(600.0)),
+                                label("Version history", text, 13.0)
+                                    .font_weight(gpui::FontWeight(700.0)),
                             ),
                     )
                     .child(self.inspector_close_button(cx)),
             )
+            .child(list)
             .child(
                 div()
-                    .h(px(44.0))
-                    .px(px(16.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(panel)
-                    .border_b_1()
-                    .border_color(border)
-                    .child(label("◯  Compare versions", text, 12.0))
-                    .child(label("Auto-saves every 2s", muted, 11.0)),
-            )
-            .child(div().flex_1().overflow_hidden().child(timeline))
-            .child(
-                div()
-                    .p(px(16.0))
-                    .flex()
-                    .gap(px(8.0))
-                    .bg(panel)
+                    .p(px(12.0))
                     .border_t_1()
                     .border_color(border)
-                    .child(self.compact_button("Compare with current", false).flex_1())
-                    .child(self.compact_button("Restore this version", true).flex_1()),
+                    .child(label(
+                        "Restoring brings back the text. Page setup and inserted objects keep their current state.",
+                        muted,
+                        10.5,
+                    )),
             )
     }
 
@@ -3012,6 +2795,237 @@ impl SylphApp {
             InspectorMode::Image => self.image_inspector(cx),
             InspectorMode::History => self.history_inspector(cx),
         }
+    }
+
+    /// The right-click menu at the pointer: clipboard, select all, Bold and
+    /// Italic, and Find. Items act on mouse-down (the root closes the menu on
+    /// the same press), and the menu stays inside the window near its edges.
+    fn context_menu_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let modifier = if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl+"
+        };
+        let text = self.ui_text();
+        let muted = self.ui_muted();
+        let hover = self.ui_panel_low();
+        let border = self.ui_border();
+        let row = |name: &'static str, key: &str| {
+            div()
+                .h(px(28.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(24.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(move |r| r.bg(hover))
+                .child(label(name, text, 12.0))
+                .child(label(format!("{modifier}{key}"), muted, 11.0))
+        };
+        let separator = || div().h(px(1.0)).my(px(4.0)).bg(border);
+        let menu = div()
+            .w(px(220.0))
+            .p(px(4.0))
+            .flex()
+            .flex_col()
+            .bg(self.surface_color())
+            .border_1()
+            .border_color(border)
+            .rounded(px(6.0))
+            .shadow_lg()
+            .font_family(UI_FONT)
+            .child(row("Cut", "X").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_cut(&ContextMenuCut, window, cx)
+                }),
+            ))
+            .child(row("Copy", "C").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_copy(&ContextMenuCopy, window, cx)
+                }),
+            ))
+            .child(row("Paste", "V").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_paste(&ContextMenuPaste, window, cx)
+                }),
+            ))
+            .child(row("Select all", "A").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu_select_all(&ContextMenuSelectAll, window, cx)
+                }),
+            ))
+            .child(separator())
+            .child(row("Bold", "B").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu.visible = false;
+                    this.bold_text(&BoldText, window, cx);
+                }),
+            ))
+            .child(row("Italic", "I").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu.visible = false;
+                    this.italic_text(&ItalicText, window, cx);
+                }),
+            ))
+            .child(separator())
+            .child(row("Find…", "F").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.context_menu.visible = false;
+                    this.open_find_bar(&OpenFindBar, window, cx);
+                }),
+            ));
+        deferred(
+            anchored()
+                .position(self.context_menu.position)
+                .snap_to_window_with_margin(px(8.0))
+                .child(menu),
+        )
+        .with_priority(1)
+    }
+
+    /// Find & replace, floating over the canvas like Docs: the query with a
+    /// match count and previous/next, a match-case toggle, and the
+    /// replacement with Replace / Replace all. Click a field (or press Tab)
+    /// to type in it; Enter finds the next match (replaces, in the Replace
+    /// field), Shift+Enter the previous; Escape closes.
+    fn find_bar(&self, cx: &mut Context<Self>) -> Div {
+        let text = self.ui_text();
+        let muted = self.ui_muted();
+        let primary = self.ui_primary();
+        let border = self.ui_border();
+        let hover = self.ui_panel_low();
+        let count = self.find.matches.len();
+        let status = if self.find.query.is_empty() {
+            String::new()
+        } else if count == 0 {
+            "No results".to_string()
+        } else {
+            format!("{} of {count}", self.find.current_match + 1)
+        };
+        let field = |value: &str, prompt: &str, active: bool, replace: bool| {
+            let (shown, color) = if value.is_empty() {
+                (prompt.to_string(), muted)
+            } else {
+                (value.to_string(), text)
+            };
+            div()
+                .id(if replace {
+                    "find-replacement"
+                } else {
+                    "find-query"
+                })
+                .flex_1()
+                .min_w(px(0.0))
+                .h(px(28.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(if active { primary } else { border })
+                .cursor_text()
+                .child(label(shown, color, 12.0).truncate())
+                .when(active, |f| f.child(label("▏", primary, 12.0)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.find.replace_focused = replace;
+                        window.focus(&this.focus_handle);
+                        cx.notify();
+                    }),
+                )
+        };
+        let button = |glyph: &str, tip: &'static str, id: &'static str, on: bool| {
+            with_tip(self.compact_button(glyph, on), id, tip).hover(move |b| b.bg(hover))
+        };
+        let replace_button = |name: &'static str, id: &'static str| {
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(move |b| b.bg(hover))
+                .child(label(name, text, 12.0))
+        };
+        div()
+            .absolute()
+            .top(px(12.0))
+            .right(px(20.0))
+            .w(px(440.0))
+            .p(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .bg(self.surface_color())
+            .border_1()
+            .border_color(border)
+            .rounded(px(6.0))
+            .shadow_lg()
+            .font_family(UI_FONT)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(field(
+                        &self.find.query,
+                        "Find",
+                        !self.find.replace_focused,
+                        false,
+                    ))
+                    .child(label(status, muted, 11.0).w(px(64.0)).flex_shrink_0())
+                    .child(
+                        button("↑", "Previous match (Shift+Enter)", "find-prev", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.find_navigate(false, cx))),
+                    )
+                    .child(
+                        button("↓", "Next match (Enter)", "find-next", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.find_navigate(true, cx))),
+                    )
+                    .child(
+                        button("Aa", "Match case", "find-case", self.find.match_case)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_find_case(cx))),
+                    )
+                    .child(button("✕", "Close (Esc)", "find-close", false).on_click(
+                        cx.listener(|this, _, window, cx| this.hide_find_bar(window, cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(field(
+                        &self.find.replacement,
+                        "Replace with",
+                        self.find.replace_focused,
+                        true,
+                    ))
+                    .child(
+                        replace_button("Replace", "find-replace-one").on_click(cx.listener(
+                            |this, _, window, cx| this.replace_current(&ReplaceCurrent, window, cx),
+                        )),
+                    )
+                    .child(replace_button("Replace all", "find-replace-all").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.replace_all(&ReplaceAll, window, cx)
+                        }),
+                    )),
+            )
     }
 
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
@@ -3199,7 +3213,7 @@ impl SylphApp {
                 "Table" => row.on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
-                        this.open_modal_showcase(&OpenModalShowcase, window, cx);
+                        this.insert_table(&InsertTable, window, cx);
                     }),
                 ),
                 "Image" => row.on_mouse_down(
@@ -3278,248 +3292,253 @@ impl SylphApp {
             )
     }
 
-    fn modal_showcase(&self, cx: &mut Context<Self>) -> Div {
-        let panel = self.surface_color();
+    /// A centred dialog over the dimmed workspace. Clicking outside it (or
+    /// Escape) closes it; clicks inside stay inside.
+    fn modal(&self, title: &str, width: f32, body: Div, cx: &mut Context<Self>) -> Div {
         let text = self.ui_text();
         let muted = self.ui_muted();
-        let primary = self.ui_primary();
-        let border = self.ui_border();
-        let setup = div()
-            .w(px(360.0))
-            .h(px(680.0))
-            .bg(panel)
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border)
-            .p(px(24.0))
-            .child(label("Page Setup & Margins", text, 16.0).font_weight(gpui::FontWeight(600.0)))
-            .child(label("Physical format", muted, 11.0).mt(px(28.0)))
-            .child(
-                div()
-                    .h(px(44.0))
-                    .mt(px(8.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(self.ui_panel_low())
-                    .child(label(
-                        page_format_label(&self.document.page_size),
-                        text,
-                        13.0,
-                    ))
-                    .child(icon("⌄", muted, 14.0)),
-            )
-            .child(label("Orientation", muted, 11.0).mt(px(16.0)))
-            .child(
-                div()
-                    .flex()
-                    .mt(px(8.0))
-                    .children(self.orientation_buttons(cx)),
-            )
-            .child(label("Margins", muted, 11.0).mt(px(16.0)))
-            .child({
-                let m = &self.document.page_margins;
-                let cm = 2.54 / 72.0;
-                let mt = format!("Top     {:.2} cm", m.top * cm);
-                let mb = format!("Bottom  {:.2} cm", m.bottom * cm);
-                let ml = format!("Left    {:.2} cm", m.left * cm);
-                let mr = format!("Right   {:.2} cm", m.right * cm);
-                div()
-                    .grid()
-                    .grid_cols(2)
-                    .gap(px(4.0))
-                    .children([mt, mb, ml, mr].iter().map(|v| {
-                        div()
-                            .p(px(12.0))
-                            .bg(self.ui_panel_low())
-                            .font_family(MONO_FONT)
-                            .text_size(px(11.0))
-                            .child(v.clone())
-                    }))
-            })
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(20.0))
-                    .left(px(24.0))
-                    .right(px(24.0))
-                    .flex()
-                    .justify_between()
-                    .child(self.compact_button("Cancel", false).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.close_overlay(&CloseOverlay, window, cx)
-                        }),
-                    ))
-                    .child(self.compact_button("Apply", true).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.close_overlay(&CloseOverlay, window, cx)
-                        }),
-                    )),
-            );
-
-        let table = div()
-            .w(px(526.0))
-            .h(px(680.0))
-            .bg(panel)
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border)
-            .p(px(24.0))
-            .child(label("▦  Insert Table", text, 16.0).font_weight(gpui::FontWeight(600.0)))
-            .child(
-                label(
-                    "3 × 4 Table                 Highlight grid to set dimensions",
-                    muted,
-                    12.0,
-                )
-                .mt(px(34.0)),
-            )
-            .child(
-                div()
-                    .h(px(268.0))
-                    .mt(px(24.0))
-                    .p(px(16.0))
-                    .grid()
-                    .grid_cols(10)
-                    .gap(px(2.0))
-                    .bg(self.ui_panel_low())
-                    .children((0..60).map(|i| {
-                        div()
-                            .h(px(22.0))
-                            .bg(if i / 10 < 4 && i % 10 < 3 {
-                                self.ui_panel_high()
-                            } else {
-                                self.surface_color()
-                            })
-                            .border_1()
-                            .border_color(border)
-                    })),
-            )
-            .child(label("TABLE STYLE PRESET", muted, 11.0).mt(px(22.0)))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .mt(px(8.0))
-                    .child(self.compact_button("Grid", false).flex_1())
-                    .child(self.compact_button("Striped", true).flex_1())
-                    .child(self.compact_button("Header-only", false).flex_1()),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(20.0))
-                    .left(px(24.0))
-                    .right(px(24.0))
-                    .flex()
-                    .justify_end()
-                    .gap(px(12.0))
-                    .child(self.compact_button("Cancel", false).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.close_overlay(&CloseOverlay, window, cx)
-                        }),
-                    ))
-                    .child(self.compact_button("Insert", true).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.insert_table(&InsertTable, window, cx);
-                            this.overlay = WorkspaceOverlay::None;
-                        }),
-                    )),
-            );
-
-        let export = div()
-            .w(px(360.0))
-            .h(px(680.0))
-            .bg(panel)
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border)
-            .p(px(24.0))
-            .child(label("⇩  Export Document", text, 16.0).font_weight(gpui::FontWeight(600.0)))
-            .child(label("SELECT FORMAT", muted, 11.0).mt(px(34.0)))
-            .child(
-                div()
-                    .mt(px(8.0))
-                    .p(px(14.0))
-                    .bg(self.ui_panel_low())
-                    .border_1()
-                    .border_color(primary)
-                    .child(label("PDF Document", text, 14.0))
-                    .child(
-                        label("Print-ready, embedded fonts & vector graphics", muted, 11.0)
-                            .mt(px(22.0)),
-                    ),
-            )
-            .child(
-                div()
-                    .mt(px(8.0))
-                    .p(px(14.0))
-                    .border_1()
-                    .border_color(border)
-                    .child(label("Markdown (.md)", text, 14.0))
-                    .child(label("Plain text with CommonMark syntax", muted, 11.0).mt(px(22.0))),
-            )
-            .child(
-                div()
-                    .mt(px(16.0))
-                    .p(px(12.0))
-                    .bg(self.ui_panel_low())
-                    .child(label("☑  Include table of contents", text, 12.0))
-                    .child(label("☑  Embed fonts and SVG assets", text, 12.0).mt(px(8.0))),
-            )
-            .child(label("Destination", muted, 11.0).mt(px(16.0)))
-            .child(
-                div()
-                    .p(px(12.0))
-                    .bg(self.ui_panel_low())
-                    .font_family(MONO_FONT)
-                    .text_size(px(11.0))
-                    .child("~/Documents/Quarterly_Report_2024.pdf"),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(20.0))
-                    .left(px(24.0))
-                    .right(px(24.0))
-                    .flex()
-                    .justify_end()
-                    .child(self.compact_button("Export PDF", true).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.export_pdf(&ExportPdf, window, cx);
-                            this.overlay = WorkspaceOverlay::None;
-                        }),
-                    )),
-            );
-
+        let hover = self.ui_panel_low();
         div()
             .absolute()
             .inset_0()
             .flex()
-            .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(20.0))
-            .bg(rgba(0x0b1c3088))
+            .bg(rgba(0x0b1c3066))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_overlay(&CloseOverlay, window, cx)),
+            )
+            .child(
+                div()
+                    .w(px(width))
+                    .p(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .bg(self.surface_color())
+                    .border_1()
+                    .border_color(self.ui_border())
+                    .rounded(px(8.0))
+                    .shadow_lg()
+                    .font_family(UI_FONT)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                label(title.to_string(), text, 16.0)
+                                    .font_weight(gpui::FontWeight(600.0)),
+                            )
+                            .child(
+                                div()
+                                    .px(px(6.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .hover(move |b| b.bg(hover))
+                                    .child(label("✕", muted, 14.0))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.close_overlay(&CloseOverlay, window, cx)
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(body),
+            )
+    }
+
+    /// A choice card: a title and one line of detail, highlighted when chosen.
+    fn choice(&self, name: &str, detail: &str, chosen: bool) -> Div {
+        let (text, muted, primary, hover) = (
+            self.ui_text(),
+            self.ui_muted(),
+            self.ui_primary(),
+            self.ui_panel_low(),
+        );
+        div()
+            .flex_1()
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if chosen { primary } else { self.ui_border() })
+            .when(chosen, |c| c.bg(hover))
+            .cursor_pointer()
+            .hover(move |c| c.bg(hover))
+            .child(
+                label(name.to_string(), if chosen { primary } else { text }, 13.0)
+                    .font_weight(gpui::FontWeight(600.0)),
+            )
+            .child(label(detail.to_string(), muted, 11.0))
+    }
+
+    /// Export: pick a format, then choose where to save it (Save As).
+    fn export_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let muted = self.ui_muted();
+        let formats = [
+            (
+                ExportFormat::Pdf,
+                "PDF",
+                "Print-ready pages with the document's page setup.",
+            ),
+            (
+                ExportFormat::Docx,
+                "Word document (.docx)",
+                "Editable in Word, LibreOffice and Google Docs.",
+            ),
+            (
+                ExportFormat::Markdown,
+                "Markdown (.md)",
+                "Plain text with Markdown formatting.",
+            ),
+        ];
+        let mut body = div().flex().flex_col().gap(px(8.0)).child(label(
+            "Choose a format; you pick where to save it next.",
+            muted,
+            12.0,
+        ));
+        for (format, name, detail) in formats {
+            body = body.child(self.choice(name, detail, false).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.export_document(format, cx)),
+            ));
+        }
+        self.modal("Export", 440.0, body, cx)
+    }
+
+    /// Page setup: paper, orientation and Word's margin presets. Every choice
+    /// applies at once; the canvas, the ruler and the exports follow it.
+    fn page_setup_dialog(&self, cx: &mut Context<Self>) -> Div {
+        use sylph_core::document::PageSize;
+        let muted = self.ui_muted();
+        let heading =
+            |name: &str| label(name.to_string(), muted, 11.0).font_weight(gpui::FontWeight(600.0));
+        let mut paper = div().flex().gap(px(8.0));
+        for size in [PageSize::A4, PageSize::Letter] {
+            let chosen = self.document.page_size == size;
+            let label_text = page_format_label(&size);
+            let (name, dims) = label_text.split_once(" · ").unwrap_or((size.name(), ""));
+            paper = paper.child(self.choice(name, dims, chosen).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.set_paper(size.clone(), cx)),
+            ));
+        }
+        let current = crate::margin_preset_of(&self.document.page_margins);
+        let cm = |pt: f32| pt / 72.0 * 2.54;
+        let mut margins = div().flex().gap(px(8.0));
+        for (index, (name, m)) in crate::MARGIN_PRESETS.iter().enumerate() {
+            let detail = if m.left == m.top {
+                format!("{:.2} cm all round", cm(m.top))
+            } else {
+                format!("{:.2} cm, sides {:.2} cm", cm(m.top), cm(m.left))
+            };
+            margins = margins.child(
+                self.choice(name, &detail, current == Some(index))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.apply_margin_preset(index, cx)),
+                    ),
+            );
+        }
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(heading("PAPER"))
+            .child(paper)
+            .child(heading("ORIENTATION"))
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap(px(20.0))
-                    .child(setup)
-                    .child(table)
-                    .child(export),
+                    .gap(px(4.0))
+                    .children(self.orientation_buttons(cx)),
             )
-            .child(label("Sylph Professional Document Workspace · Architectural Composition Layer · Esc to dismiss all", rgb(0xeaf1ff), 12.0))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                this.close_overlay(&CloseOverlay, window, cx);
-            }))
+            .child(heading("MARGINS"))
+            .child(margins)
+            .when(current.is_none(), |b| {
+                b.child(label(
+                    "The current margins are custom (not one of the presets).",
+                    muted,
+                    11.0,
+                ))
+            })
+            .child(div().flex().justify_end().child(
+                self.compact_button("Done", true).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_overlay(&CloseOverlay, window, cx)
+                    }),
+                ),
+            ));
+        self.modal("Page setup", 600.0, body, cx)
+    }
+
+    /// Insert Table: point at a size in the grid, click to insert an editable
+    /// Markdown table after the caret's line.
+    fn table_dialog(&self, cx: &mut Context<Self>) -> Div {
+        const SIZE: usize = 8;
+        let (rows, cols) = self.table_picker;
+        let (muted, primary, border, text) = (
+            self.ui_muted(),
+            self.ui_primary(),
+            self.ui_border(),
+            self.ui_text(),
+        );
+        let lit_bg = self.ui_panel_high();
+        let mut grid = div().flex().flex_col().gap(px(3.0));
+        for r in 0..SIZE {
+            let mut line = div().flex().gap(px(3.0));
+            for c in 0..SIZE {
+                let lit = r < rows && c < cols;
+                line = line.child(
+                    div()
+                        .id(("table-cell", r * SIZE + c))
+                        .size(px(20.0))
+                        .rounded(px(2.0))
+                        .border_1()
+                        .border_color(if lit { primary } else { border })
+                        .when(lit, |cell| cell.bg(lit_bg))
+                        .cursor_pointer()
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.table_picker = (r + 1, c + 1);
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.insert_markdown_table(r + 1, c + 1, cx)
+                            }),
+                        ),
+                );
+            }
+            grid = grid.child(line);
+        }
+        let size_text = if rows == 0 {
+            "Point at a size".to_string()
+        } else {
+            format!("{cols} × {rows} table")
+        };
+        let body = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(10.0))
+            .child(grid)
+            .child(label(size_text, text, 13.0))
+            .child(label(
+                "Inserted as a Markdown table after the caret's line.",
+                muted,
+                11.0,
+            ));
+        self.modal("Insert table", 300.0, body, cx)
     }
 }
 
@@ -3564,7 +3583,7 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::toggle_dark_mode))
             .on_action(cx.listener(Self::export_docx))
             .on_action(cx.listener(Self::export_pdf))
-            .on_action(cx.listener(Self::toggle_preview))
+            .on_action(cx.listener(Self::export_markdown))
             .on_action(cx.listener(Self::add_cover_page))
             .on_action(cx.listener(Self::paste_image))
             .on_action(cx.listener(Self::bold_text))
@@ -3578,13 +3597,17 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::toggle_orientation))
             .on_action(cx.listener(Self::set_image_caption))
             .on_action(cx.listener(Self::set_table_caption))
-            .on_action(cx.listener(Self::set_paragraph_spacing))
             .on_action(cx.listener(Self::editing_cover_title))
             .on_action(cx.listener(Self::editing_cover_subtitle))
             .on_action(cx.listener(Self::editing_cover_author))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::close_overlay))
-            .on_action(cx.listener(Self::open_modal_showcase))
+            .on_action(cx.listener(Self::open_export_dialog))
+            .on_action(cx.listener(Self::open_page_setup))
+            .on_action(cx.listener(Self::print_layout))
+            .on_action(cx.listener(Self::web_layout))
+            .on_action(cx.listener(Self::focus_mode))
+            .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::show_paragraph_inspector))
             .on_action(cx.listener(Self::show_image_inspector))
             .on_action(cx.listener(Self::show_version_history))
@@ -3592,9 +3615,19 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::toggle_ruler))
             .on_action(cx.listener(Self::set_page_margins))
             .on_action(cx.listener(Self::cycle_heading))
+            .on_action(cx.listener(Self::find_and_replace))
+            .on_action(cx.listener(Self::paste_into_find))
+            .on_action(cx.listener(Self::heading_1))
+            .on_action(cx.listener(Self::heading_2))
+            .on_action(cx.listener(Self::heading_3))
+            .on_action(cx.listener(Self::heading_4))
+            .on_action(cx.listener(Self::heading_5))
+            .on_action(cx.listener(Self::heading_6))
+            .on_action(cx.listener(Self::normal_text))
+            .on_action(cx.listener(Self::strikethrough_text))
             .on_action(cx.listener(Self::cycle_body_font))
             .child(self.title_bar(window))
-            .child(self.menu_bar(cx))
+            .child(self.menu_bar(window, cx))
             .child(self.utility_bar(cx))
             .child(self.format_bar(cx))
             .child(
@@ -3613,7 +3646,18 @@ impl Render for SylphApp {
                     } else {
                         div().w(px(0.0))
                     })
-                    .child(self.center_canvas(cx))
+                    .child(
+                        // The find bar floats over the canvas's top-right
+                        // corner without scrolling with the pages.
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .relative()
+                            .flex()
+                            .child(self.center_canvas(cx))
+                            .when(self.find.visible, |area| area.child(self.find_bar(cx))),
+                    )
                     .child(if self.inspector_visible {
                         self.inspector(cx)
                     } else {
@@ -3622,11 +3666,34 @@ impl Render for SylphApp {
             )
             .child(self.status_bar(cx));
 
+        // Menu items act on mouse-down, before this closes the menu.
+        root = root.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.context_menu.visible || this.open_menu.is_some() {
+                    this.context_menu.visible = false;
+                    this.open_menu = None;
+                    cx.notify();
+                }
+            }),
+        );
+        root = root.when(self.context_menu.visible, |this| {
+            this.child(self.context_menu_view(cx))
+        });
         root = root.when(self.overlay == WorkspaceOverlay::CommandPalette, |this| {
             this.child(self.command_palette(cx))
         });
-        root = root.when(self.overlay == WorkspaceOverlay::ModalShowcase, |this| {
-            this.child(self.modal_showcase(cx))
+        root = root.when(self.overlay == WorkspaceOverlay::Export, |this| {
+            this.child(self.export_dialog(cx))
+        });
+        root = root.when(self.overlay == WorkspaceOverlay::PageSetup, |this| {
+            this.child(self.page_setup_dialog(cx))
+        });
+        root = root.when(self.overlay == WorkspaceOverlay::InsertTable, |this| {
+            this.child(self.table_dialog(cx))
+        });
+        root = root.when(self.overlay == WorkspaceOverlay::Shortcuts, |this| {
+            this.child(self.shortcuts_dialog(cx))
         });
         root
     }
