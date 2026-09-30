@@ -29,7 +29,41 @@ editing.
 | 1.9 Derived stats per edit | partial | page count, caret status and outline cached by `content_rev`; canvas layout still per frame |
 | 1.11–1.13 Splitting main.rs/ui.rs | started | this session's helpers live in `save_state`, `export_job`, `fonts`, `memo`, `md_edit`, `palette`, `title` modules |
 | 5.3 DOCX complex script (early part) | partial | DOCX declares Word 2013+ (no Compatibility Mode); styles carry a Devanagari `w:cs` font and `ne-NP`; fonts are not embedded |
+| Paragraph styles (author request) | done | Normal + Heading 1–6 each have line spacing and font; Style/Font/Line spacing dropdowns act on the caret's style; canvas, PDF and DOCX follow them |
+| Export quality (author request) | done | PDF: no mid-word breaks at font changes, real bullets, strikethrough, task boxes; DOCX: headings bold and black, Word 2013+ mode; three more bundled fonts (Source Serif 4, Lora, Inter) |
+| Style size and paragraph spacing (author request) | done | size box, Space before/after act on the caret's style; canvas spaces Normal paragraphs where the export does |
 | everything else | open | |
+
+## Next: formatting on a paragraph or a selection (proposed, needs the author's go-ahead)
+
+Word and Docs resolve formatting in three layers, each overriding the one
+before: **style** (Normal, Heading 1…) → **paragraph formatting** (this
+paragraph's spacing, alignment, indent) → **character formatting** (the
+selected words' size, font, colour, bold). Layer 1 is done. Layers 2 and 3
+cannot be stored in the Markdown text buffer (Markdown has no "14 pt" and
+no per-paragraph spacing), and the canvas draws each line at one size
+(GPUI `shape_line` takes one font size per line). They need the plan's
+kernel and layout work, in this order:
+
+1. **Block model (plan 2.x).** The document becomes a list of blocks with
+   stable ids: `Paragraph { id, style, props: ParagraphProps, runs }`,
+   where `ParagraphProps` holds optional overrides (spacing before/after,
+   line spacing, alignment, indent) and each `Run { text, marks }` holds
+   optional character marks (bold, italic, size, font, colour, link).
+   Resolution is `style → props → marks`, as in Word. Edits are
+   transactions on blocks (insert text, split, merge, set marks on a
+   range), so undo and later collaboration work on the same operations.
+2. **Markdown stays an import/export and a typing shortcut** (`# ` makes a
+   Heading 1, `**` toggles bold), not the storage format. Existing
+   documents convert once on load, losslessly for what Markdown can say.
+3. **Canvas with mixed runs (plan 4.x).** Lines are laid out from runs of
+   different sizes and fonts (shape each run, place them on a shared
+   baseline, line height from the tallest run), replacing the one-size
+   row layout.
+4. **Controls.** With a selection, the size/font/colour controls set
+   character marks on it; with only a caret, the Spacing dropdown gets a
+   "This paragraph only" section next to "every Normal paragraph", plus
+   "Update Normal to match" as Word has.
 
 Manual checks still owed by the author are listed in each task's VR boxes.
 For `--release` runs from `target/`, link the trusted folders once:

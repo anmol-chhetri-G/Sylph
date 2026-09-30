@@ -41,7 +41,10 @@ static instances of the Google Fonts releases.
 | Family | Used for | Styles |
 | --- | --- | --- |
 | EB Garamond | the page (default body font) | Regular, Italic, Bold, Bold Italic |
+| Source Serif 4 | body font choice | Regular, Italic, Bold, Bold Italic |
+| Lora | body font choice | Regular, Italic, Bold, Bold Italic |
 | Hanken Grotesk | the interface | Regular, SemiBold |
+| Inter | body font choice | Regular, Italic, Bold, Bold Italic |
 | JetBrains Mono | code and line numbers | Regular, Bold |
 | Noto Sans Devanagari | Devanagari text (script fallback) | Regular, Bold |
 | Noto Serif Devanagari | Devanagari text | Regular, Bold |

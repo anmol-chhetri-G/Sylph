@@ -759,6 +759,136 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_exports_follow_the_heading_styles() {
+        // Heading 1 has its own font and spacing; Heading 2 keeps the
+        // defaults (body font, automatic spacing).
+        let doc = r#"{"body_font": "EB Garamond", "line_spacing": 1.15,
+            "heading_styles": [
+                {"line_spacing": 2.0, "font": "Hanken Grotesk", "size": 32.0,
+                 "space_before": 20.0, "space_after": 3.0},
+                {"line_spacing": null, "font": null}, {}, {}, {}, {}
+            ],
+            "blocks": [
+                {"Heading": {"level": 1, "runs": [{"text": "Styled", "styles": []}]}},
+                {"Heading": {"level": 2, "runs": [{"text": "Plain", "styles": []}]}},
+                {"Paragraph": {"runs": [{"text": "Body", "styles": []}],
+                  "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}
+            ]}"#;
+        let r = export_rich_docx(doc, &tmp("styles.docx"));
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let styles = docx_part(&tmp("styles.docx"), "word/styles.xml");
+        let style_xml = |id: &str| {
+            let start = styles
+                .find(&format!(r#"w:styleId="{id}""#))
+                .expect("style present");
+            let end = styles[start..].find("</w:style>").unwrap() + start;
+            styles[start..end].to_string()
+        };
+        let h1 = style_xml("Heading1");
+        assert!(h1.contains(r#"w:ascii="Hanken Grotesk""#), "{h1}");
+        // Word writes a multiple of single spacing in 240ths, sizes in
+        // half-points and paragraph spacing in twentieths of a point.
+        assert!(h1.contains(r#"w:line="480""#), "{h1}");
+        assert!(h1.contains(r#"<w:sz w:val="64"/>"#), "{h1}");
+        assert!(h1.contains(r#"w:before="400""#), "{h1}");
+        assert!(h1.contains(r#"w:after="60""#), "{h1}");
+        let h2 = style_xml("Heading2");
+        assert!(h2.contains(r#"w:ascii="EB Garamond""#), "{h2}");
+        assert!(!h2.contains(r#"w:line="480""#), "{h2}");
+        // Heading 2 keeps the default scale: 22 pt.
+        assert!(h2.contains(r#"<w:sz w:val="44"/>"#), "{h2}");
+
+        let r = export_rich_pdf(doc, &tmp("styles.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        if let Some(fonts) = pdf_fonts(&tmp("styles.pdf")) {
+            assert!(fonts.contains("+HankenGroteskSemiBold "), "{fonts}");
+            assert!(fonts.contains("+EBGaramondBold "), "{fonts}");
+            assert!(fonts.contains("+EBGaramond "), "{fonts}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_every_bundled_body_font_is_embedded_as_itself() {
+        for (font, embedded) in [
+            ("Source Serif 4", "+SourceSerif4 "),
+            ("Lora", "+Lora "),
+            ("Inter", "+Inter "),
+            ("Hanken Grotesk", "+HankenGrotesk "),
+            ("JetBrains Mono", "+JetBrainsMono "),
+        ] {
+            let path = tmp(&format!("{}.pdf", font.replace(' ', "")));
+            let r = export_rich_pdf(&typography_doc(font), &path);
+            assert!(r.starts_with("Exported"), "{font}: {r}");
+            let Some(fonts) = pdf_fonts(&path) else {
+                return no_pdftotext();
+            };
+            assert!(fonts.contains(embedded), "{font}: {fonts}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_pdf_never_breaks_a_word_where_the_font_changes() {
+        // Writing each run on its own let fpdf2 split a styled word that
+        // started near the line end ("sam|e"). Shift an italic word along
+        // the line so some copy lands on every position of a line end.
+        let paragraphs: Vec<String> = (0..40)
+            .map(|n| {
+                format!(
+                    r#"{{"Paragraph": {{"runs": [
+                        {{"text": "{}lead ", "styles": []}},
+                        {{"text": "Straddling", "styles": ["Italic"]}},
+                        {{"text": " tail words follow here.", "styles": []}}],
+                      "style": {{"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}}}}"#,
+                    "word ".repeat(12) + &"i".repeat(n)
+                )
+            })
+            .collect();
+        let doc = format!(r#"{{"blocks": [{}]}}"#, paragraphs.join(","));
+        let r = export_rich_pdf(&doc, &tmp("wrap_words.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        let Some(text) = pdf_text(&tmp("wrap_words.pdf")) else {
+            return no_pdftotext();
+        };
+        assert_eq!(
+            text.matches("Straddling").count(),
+            40,
+            "a word was split: {text}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_docx_headings_keep_their_style_bold_and_colour() {
+        // Every plain run carried an explicit "not bold", which overrode
+        // the Heading styles, and headings kept the template's theme blue.
+        let r = export_rich_docx(&typography_doc("EB Garamond"), &tmp("bold.docx"));
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let body = docx_part(&tmp("bold.docx"), "word/document.xml");
+        assert!(!body.contains(r#"<w:b w:val="0"/>"#), "{body}");
+        assert!(!body.contains(r#"<w:i w:val="0"/>"#), "{body}");
+        let styles = docx_part(&tmp("bold.docx"), "word/styles.xml");
+        let start = styles.find(r#"w:styleId="Heading1""#).unwrap();
+        let h1 = &styles[start..start + styles[start..].find("</w:style>").unwrap()];
+        assert!(h1.contains(r#"<w:color w:val="000000"/>"#), "{h1}");
+        assert!(h1.contains("<w:b/>"), "{h1}");
+    }
+
     /// The fonts a PDF's pages use, via poppler's `pdffonts` (every
     /// registered font is written to the file, used or not).
     fn pdf_fonts(path: &str) -> Option<String> {

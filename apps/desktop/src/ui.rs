@@ -1,13 +1,13 @@
+use crate::style_controls::Picker;
 use crate::{
-    heading_metrics_pt, AddCoverPage, BoldText, CloseOverlay, ContextMenuCopy, ContextMenuCut,
-    ContextMenuPaste, ContextMenuSelectAll, CycleBodyFont, CycleHeading, EditingField,
-    ExportFormat, FindAndReplace, FocusMode, Heading1, Heading2, Heading3, Heading4, Heading5,
-    Heading6, InsertPageBreak, InsertTable, InspectorMode, ItalicText, NavigatorTab, NewDocument,
-    NormalText, OpenCommandPalette, OpenExportDialog, OpenFindBar, OpenPageSetup, PasteImage,
-    PrintLayout, Redo, ReplaceAll, ReplaceCurrent, SaveDoc, SaveState, ShowImageInspector,
-    ShowParagraphInspector, ShowShortcuts, ShowVersionHistory, StrikethroughText, SylphApp,
-    ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo,
-    WebLayout, WorkspaceOverlay,
+    AddCoverPage, BoldText, CloseOverlay, ContextMenuCopy, ContextMenuCut, ContextMenuPaste,
+    ContextMenuSelectAll, CycleBodyFont, EditingField, ExportFormat, FindAndReplace, FocusMode,
+    Heading1, Heading2, Heading3, Heading4, Heading5, Heading6, InsertPageBreak, InsertTable,
+    InspectorMode, ItalicText, NavigatorTab, NewDocument, NormalText, OpenCommandPalette,
+    OpenExportDialog, OpenFindBar, OpenPageSetup, PasteImage, PrintLayout, Redo, ReplaceAll,
+    ReplaceCurrent, SaveDoc, SaveState, ShowImageInspector, ShowParagraphInspector, ShowShortcuts,
+    ShowVersionHistory, StrikethroughText, SylphApp, ToggleDarkMode, ToggleInspector,
+    ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo, WebLayout, WorkspaceOverlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -62,19 +62,6 @@ pub(crate) fn view_mode_active(web: bool, sidebar: bool, inspector: bool) -> (bo
         (false, false, true)
     } else {
         (true, false, false)
-    }
-}
-
-/// Spacing (points) shown for the block at the cursor: headings carry the
-/// spec's space-before/after; everything else is the paragraph default the
-/// export renderer applies (0 before / 8 after).
-pub(crate) fn spacing_pt_for(heading_level: u8) -> (f32, f32) {
-    if heading_level == 0 {
-        let d = sylph_core::document::ParagraphStyle::default();
-        (d.space_before, d.space_after)
-    } else {
-        let (_, before, after) = heading_metrics_pt(heading_level);
-        (before, after)
     }
 }
 
@@ -275,7 +262,7 @@ pub(crate) fn caret_text_page(content: &str, cursor: usize) -> usize {
         .count()
 }
 
-fn icon(glyph: &str, color: Rgba, size: f32) -> Div {
+pub(crate) fn icon(glyph: &str, color: Rgba, size: f32) -> Div {
     div()
         .font_family("Noto Sans")
         .text_size(px(size))
@@ -287,7 +274,7 @@ fn divider(color: Rgba) -> Div {
     div().w(px(1.0)).h(px(16.0)).bg(color)
 }
 
-fn label(text: impl Into<String>, color: Rgba, size: f32) -> Div {
+pub(crate) fn label(text: impl Into<String>, color: Rgba, size: f32) -> Div {
     div()
         .font_family(UI_FONT)
         .text_size(px(size))
@@ -411,7 +398,7 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn ui_primary(&self) -> Rgba {
+    pub(crate) fn ui_primary(&self) -> Rgba {
         if self.dark_mode {
             rgb(0x3b82f6)
         } else {
@@ -419,7 +406,7 @@ impl SylphApp {
         }
     }
 
-    fn ui_text(&self) -> Rgba {
+    pub(crate) fn ui_text(&self) -> Rgba {
         if self.dark_mode {
             rgb(0xf8fafc)
         } else {
@@ -427,7 +414,7 @@ impl SylphApp {
         }
     }
 
-    fn ui_muted(&self) -> Rgba {
+    pub(crate) fn ui_muted(&self) -> Rgba {
         if self.dark_mode {
             rgb(0x94a3b8)
         } else {
@@ -475,7 +462,7 @@ impl SylphApp {
         }
     }
 
-    fn ui_panel_low(&self) -> Rgba {
+    pub(crate) fn ui_panel_low(&self) -> Rgba {
         if self.dark_mode {
             rgb(0x111c2e)
         } else {
@@ -491,7 +478,7 @@ impl SylphApp {
         }
     }
 
-    fn ui_border(&self) -> Rgba {
+    pub(crate) fn ui_border(&self) -> Rgba {
         if self.dark_mode {
             rgb(0x1e293b)
         } else {
@@ -1323,85 +1310,43 @@ impl SylphApp {
             .border_b_1()
             .border_color(border);
 
-        let heading_label = match self.current_heading_level(cx) {
-            0 => "Normal",
-            1 => "Heading 1",
-            2 => "Heading 2",
-            3 => "Heading 3",
-            4 => "Heading 4",
-            5 => "Heading 5",
-            6 => "Heading 6",
-            _ => "Normal",
-        };
+        let caret_style = self.caret_style(cx);
         let markdown_on = self.markdown_mode;
-        let font_size_display = self.document.body_font_size.round() as i32;
+        let font_size_display = self.document.resolved_style(caret_style).size.round() as i32;
         let controls = div()
             .flex()
             .items_center()
             .gap(px(4.0))
             .child(
-                div()
-                    .h(px(28.0))
-                    .w(px(140.0))
-                    .px(px(8.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(self.surface_color())
-                    .border_1()
-                    .border_color(border)
-                    .rounded(px(2.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(self.hover_color()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.cycle_heading(&CycleHeading, window, cx);
-                        }),
-                    )
-                    .child(label(
-                        heading_label,
-                        if markdown_on { text } else { muted },
-                        12.0,
-                    ))
-                    .child(icon("⌄", muted, 12.0))
-                    .id("heading-style")
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| {
-                            ToolbarTip(if markdown_on {
-                                "Block style — click to cycle Normal → H1 … H6"
-                            } else {
-                                "Styles need Markdown mode (toggle in the toolbar)"
-                            })
+                self.picker_field(
+                    Picker::Style,
+                    140.0,
+                    crate::style_controls::style_name(caret_style),
+                    None,
+                    markdown_on,
+                    cx,
+                )
+                .id("heading-style")
+                .tooltip(move |_, cx| {
+                    cx.new(|_| {
+                        ToolbarTip(if markdown_on {
+                            "Paragraph style"
+                        } else {
+                            "Styles need Markdown mode (toggle in the toolbar)"
                         })
-                        .into()
-                    }),
+                    })
+                    .into()
+                }),
             )
-            .child(
-                div()
-                    .h(px(28.0))
-                    .w(px(150.0))
-                    .px(px(8.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(self.surface_color())
-                    .border_1()
-                    .border_color(border)
-                    .rounded(px(2.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(self.hover_color()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.cycle_body_font(&CycleBodyFont, window, cx);
-                        }),
-                    )
-                    .child(label(self.document.body_font.clone(), text, 12.0))
-                    .child(icon("⌄", muted, 12.0))
+            .child({
+                let font = self.document.style_font(caret_style).to_string();
+                self.picker_field(Picker::Font, 150.0, font.clone(), Some(font), true, cx)
                     .id("body-font")
-                    .tooltip(|_, cx| cx.new(|_| ToolbarTip("Body font — click to cycle")).into()),
-            )
+                    .tooltip(|_, cx| {
+                        cx.new(|_| ToolbarTip("Font of every paragraph in this style"))
+                            .into()
+                    })
+            })
             .child(
                 div()
                     .h(px(28.0))
@@ -1510,34 +1455,24 @@ impl SylphApp {
             ));
         }
         align = align.child(
-            div()
-                .h(px(28.0))
-                .px(px(8.0))
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .border_1()
-                .border_color(border)
-                .rounded(px(2.0))
-                .cursor_pointer()
-                .hover(|s| s.bg(self.hover_color()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.cycle_line_spacing(window, cx);
-                    }),
-                )
-                .child(label(
-                    format!("{:.2}", self.document.line_spacing),
-                    text,
-                    12.0,
-                ))
-                .child(icon("↕", muted, 12.0))
-                .id("line-spacing")
-                .tooltip(|_, cx| {
-                    cx.new(|_| ToolbarTip("Line spacing — click to cycle"))
-                        .into()
-                }),
+            self.picker_field(
+                Picker::LineSpacing,
+                72.0,
+                format!(
+                    "↕ {}",
+                    crate::style_controls::spacing_label(
+                        self.document.style_line_spacing(caret_style)
+                    )
+                ),
+                None,
+                true,
+                cx,
+            )
+            .id("line-spacing")
+            .tooltip(|_, cx| {
+                cx.new(|_| ToolbarTip("Line spacing of every paragraph in this style"))
+                    .into()
+            }),
         );
 
         let mut inserts = div().flex().items_center().gap(px(2.0));
@@ -2420,10 +2355,13 @@ impl SylphApp {
                         .child(label(value, text, 12.0).font_family(MONO_FONT)),
                 )
         };
-        let current_ls = self.document.line_spacing;
+        let current_ls = self
+            .document
+            .style_line_spacing(self.current_heading_level(cx));
         // Real spacing for the block at the cursor (heading metrics or the
         // paragraph default the export applies) — not placeholder numbers.
-        let (before_pt, after_pt) = spacing_pt_for(self.current_heading_level(cx));
+        let resolved = self.document.resolved_style(self.current_heading_level(cx));
+        let (before_pt, after_pt) = (resolved.space_before, resolved.space_after);
         let line_spacing = div()
             .flex()
             .items_center()
@@ -2448,8 +2386,8 @@ impl SylphApp {
                     })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.set_line_spacing_value(val, window, cx);
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_style_spacing(Some(val), cx);
                         }),
                     )
                     .child(*v)
@@ -3681,9 +3619,13 @@ impl Render for SylphApp {
         root = root.on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                if this.context_menu.visible || this.open_menu.is_some() {
+                if this.context_menu.visible
+                    || this.open_menu.is_some()
+                    || this.open_picker.is_some()
+                {
                     this.context_menu.visible = false;
                     this.open_menu = None;
+                    this.open_picker = None;
                     cx.notify();
                 }
             }),
@@ -3795,10 +3737,15 @@ mod chrome_tests {
         // Headings show the spec's points; Normal shows the paragraph
         // default the export renderer applies (0 before / 8 after) —
         // never hardcoded placeholder numbers.
-        assert_eq!(spacing_pt_for(0), (0.0, 8.0));
-        assert_eq!(spacing_pt_for(1), (12.0, 6.0));
-        assert_eq!(spacing_pt_for(3), (8.0, 4.0));
-        assert_eq!(spacing_pt_for(6), (4.0, 4.0));
+        let doc = sylph_core::document::Document::new();
+        let spacing = |level| {
+            let style = doc.resolved_style(level);
+            (style.space_before, style.space_after)
+        };
+        assert_eq!(spacing(0), (0.0, 8.0));
+        assert_eq!(spacing(1), (12.0, 6.0));
+        assert_eq!(spacing(3), (8.0, 4.0));
+        assert_eq!(spacing(6), (4.0, 4.0));
     }
 
     #[test]

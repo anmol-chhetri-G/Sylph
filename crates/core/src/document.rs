@@ -481,6 +481,64 @@ pub struct Document {
     /// emphasis) rather than literal lines. Saved per document because it
     /// changes what the export produces.
     pub markdown: bool,
+    /// The Heading 1–6 styles (index 0 is Heading 1). Normal text uses
+    /// `line_spacing`, `body_font`, `body_font_size` and the two below.
+    pub heading_styles: [HeadingStyle; 6],
+    /// Normal style: space above and below each paragraph, in points.
+    pub space_before: f32,
+    pub space_after: f32,
+}
+
+/// The Heading 1–6 defaults, in points: (size, space before, space after).
+/// H1 is 28 pt bold with 12 before / 6 after; the rest follow Word/Docs
+/// proportions.
+pub const HEADING_DEFAULTS: [(f32, f32, f32); 6] = [
+    (28.0, 12.0, 6.0),
+    (22.0, 10.0, 6.0),
+    (18.0, 8.0, 4.0),
+    (16.0, 6.0, 4.0),
+    (14.0, 4.0, 4.0),
+    (12.0, 4.0, 4.0),
+];
+
+/// Normal paragraphs' default space after, in points (Word's 8 pt).
+pub const NORMAL_SPACE_AFTER: f32 = 8.0;
+
+/// Space before/after choices the style controls offer, in points.
+pub const PARAGRAPH_SPACING_CHOICES: [f32; 6] = [0.0, 4.0, 6.0, 8.0, 12.0, 24.0];
+
+/// Everything a paragraph style resolves to after its defaults are
+/// applied: what the canvas and the exports lay a paragraph out with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedStyle {
+    pub font: String,
+    /// Font size in points.
+    pub size: f32,
+    /// `None`: automatic (a heading's line box fits its glyphs).
+    pub line_spacing: Option<f32>,
+    /// Points above the paragraph's first line and below its last.
+    pub space_before: f32,
+    pub space_after: f32,
+}
+
+/// Line spacing of a heading whose style sets none: its line box is
+/// 1.4 × its size, as the canvas and the exports have always drawn it.
+pub const HEADING_LINE_SPACING: f32 = 1.4;
+
+/// Line spacing choices the style controls offer, as in Word.
+pub const LINE_SPACING_CHOICES: [f32; 6] = [1.0, 1.15, 1.5, 2.0, 2.5, 3.0];
+
+/// What a Heading style changes from its defaults. `None` keeps the
+/// default: `HEADING_LINE_SPACING`, and the body font.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HeadingStyle {
+    pub line_spacing: Option<f32>,
+    pub font: Option<String>,
+    /// Points; `None` keeps `HEADING_DEFAULTS`.
+    pub size: Option<f32>,
+    pub space_before: Option<f32>,
+    pub space_after: Option<f32>,
 }
 
 impl Document {
@@ -495,6 +553,9 @@ impl Document {
             body_font_size: 11.0,
             landscape: false,
             markdown: false,
+            heading_styles: Default::default(),
+            space_before: 0.0,
+            space_after: NORMAL_SPACE_AFTER,
         }
     }
 
@@ -509,6 +570,9 @@ impl Document {
             body_font_size: 11.0,
             landscape: false,
             markdown: false,
+            heading_styles: Default::default(),
+            space_before: 0.0,
+            space_after: NORMAL_SPACE_AFTER,
         }
     }
 
@@ -522,6 +586,115 @@ impl Document {
 
     pub fn set_line_spacing(&mut self, spacing: f32) {
         self.line_spacing = spacing.clamp(0.5, 3.0);
+    }
+
+    /// Line spacing of paragraph style `level`: 0 is Normal, 1–6 are the
+    /// headings. Every paragraph of that style uses it.
+    pub fn style_line_spacing(&self, level: u8) -> f32 {
+        match self.heading_style(level) {
+            None => self.line_spacing,
+            Some(style) => style.line_spacing.unwrap_or(HEADING_LINE_SPACING),
+        }
+    }
+
+    /// Font of paragraph style `level` (0 Normal, 1–6 headings).
+    pub fn style_font(&self, level: u8) -> &str {
+        self.heading_style(level)
+            .and_then(|style| style.font.as_deref())
+            .unwrap_or(&self.body_font)
+    }
+
+    /// Style `level` (0 Normal, 1–6 headings) with its defaults applied.
+    pub fn resolved_style(&self, level: u8) -> ResolvedStyle {
+        match self.heading_style(level) {
+            None => ResolvedStyle {
+                font: self.body_font.clone(),
+                size: self.body_font_size,
+                line_spacing: Some(self.line_spacing),
+                space_before: self.space_before,
+                space_after: self.space_after,
+            },
+            Some(style) => {
+                let (size, before, after) = HEADING_DEFAULTS[level as usize - 1];
+                ResolvedStyle {
+                    font: self.style_font(level).to_string(),
+                    size: style.size.unwrap_or(size),
+                    line_spacing: style.line_spacing,
+                    space_before: style.space_before.unwrap_or(before),
+                    space_after: style.space_after.unwrap_or(after),
+                }
+            }
+        }
+    }
+
+    /// All seven styles resolved, indexed by level (0 = Normal).
+    pub fn resolved_styles(&self) -> [ResolvedStyle; 7] {
+        std::array::from_fn(|level| self.resolved_style(level as u8))
+    }
+
+    /// Font size (points) of every paragraph of style `level`.
+    pub fn set_style_size(&mut self, level: u8, size: f32) {
+        let size = size.clamp(6.0, 96.0);
+        match level {
+            1..=6 => self.heading_styles[level as usize - 1].size = Some(size),
+            _ => self.body_font_size = size.clamp(8.0, 72.0),
+        }
+    }
+
+    /// Space (points) above every paragraph of style `level`.
+    pub fn set_style_space_before(&mut self, level: u8, points: f32) {
+        let points = points.clamp(0.0, 96.0);
+        match level {
+            1..=6 => self.heading_styles[level as usize - 1].space_before = Some(points),
+            _ => self.space_before = points,
+        }
+    }
+
+    /// Space (points) below every paragraph of style `level`.
+    pub fn set_style_space_after(&mut self, level: u8, points: f32) {
+        let points = points.clamp(0.0, 96.0);
+        match level {
+            1..=6 => self.heading_styles[level as usize - 1].space_after = Some(points),
+            _ => self.space_after = points,
+        }
+    }
+
+    /// Set the line spacing of every paragraph of style `level`.
+    pub fn set_style_line_spacing(&mut self, level: u8, spacing: f32) {
+        let spacing = spacing.clamp(0.5, 3.0);
+        match level {
+            1..=6 => self.heading_styles[level as usize - 1].line_spacing = Some(spacing),
+            _ => self.line_spacing = spacing,
+        }
+    }
+
+    /// Set the font of every paragraph of style `level`. For a heading,
+    /// the body font itself clears the override, so the heading follows
+    /// later body font changes again.
+    pub fn set_style_font(&mut self, level: u8, font: impl Into<String>) {
+        let font = font.into();
+        match level {
+            1..=6 => {
+                let style = &mut self.heading_styles[level as usize - 1];
+                style.font = (font != self.body_font).then_some(font);
+            }
+            _ => self.body_font = font,
+        }
+    }
+
+    /// One font for the whole document: the body and every heading.
+    pub fn set_font_everywhere(&mut self, font: impl Into<String>) {
+        self.body_font = font.into();
+        for style in &mut self.heading_styles {
+            style.font = None;
+        }
+    }
+
+    fn heading_style(&self, level: u8) -> Option<&HeadingStyle> {
+        match level {
+            1..=6 => Some(&self.heading_styles[level as usize - 1]),
+            _ => None,
+        }
     }
 
     pub fn set_body_font(&mut self, font: impl Into<String>) {
@@ -619,6 +792,9 @@ impl Document {
             body_font_size: 11.0,
             landscape: false,
             markdown: false,
+            heading_styles: Default::default(),
+            space_before: 0.0,
+            space_after: NORMAL_SPACE_AFTER,
         }
     }
 
@@ -725,6 +901,81 @@ mod tests {
         assert_eq!(loaded.page_size, PageSize::Letter);
         assert!(!loaded.landscape);
         assert_eq!(loaded.body_font_size, Document::new().body_font_size);
+    }
+
+    #[test]
+    fn test_styles_apply_per_style_and_default_sensibly() {
+        let mut doc = Document::new();
+        assert_eq!(doc.style_line_spacing(0), 1.15);
+        assert_eq!(doc.style_line_spacing(1), HEADING_LINE_SPACING);
+        assert_eq!(doc.style_font(2), DEFAULT_BODY_FONT);
+
+        // Heading 1 changes; Normal and Heading 2 do not.
+        doc.set_style_line_spacing(1, 2.0);
+        assert_eq!(doc.style_line_spacing(1), 2.0);
+        assert_eq!(doc.style_line_spacing(0), 1.15);
+        assert_eq!(doc.style_line_spacing(2), HEADING_LINE_SPACING);
+        doc.set_style_line_spacing(0, 1.5);
+        assert_eq!(doc.line_spacing, 1.5);
+        assert_eq!(doc.style_line_spacing(1), 2.0);
+
+        doc.set_style_font(1, "Hanken Grotesk");
+        assert_eq!(doc.style_font(1), "Hanken Grotesk");
+        assert_eq!(doc.style_font(0), DEFAULT_BODY_FONT);
+        // Headings without their own font follow the body.
+        doc.set_style_font(0, "JetBrains Mono");
+        assert_eq!(doc.style_font(2), "JetBrains Mono");
+        assert_eq!(doc.style_font(1), "Hanken Grotesk");
+        // Picking the body font for a heading clears its override.
+        doc.set_style_font(1, "JetBrains Mono");
+        assert_eq!(doc.heading_styles[0].font, None);
+        doc.set_style_font(3, "EB Garamond");
+        doc.set_font_everywhere("Hanken Grotesk");
+        assert!((0..=6).all(|level| doc.style_font(level) == "Hanken Grotesk"));
+    }
+
+    #[test]
+    fn test_size_and_paragraph_spacing_are_per_style() {
+        let mut doc = Document::new();
+        let h1 = doc.resolved_style(1);
+        assert_eq!(
+            (h1.size, h1.space_before, h1.space_after),
+            (28.0, 12.0, 6.0)
+        );
+        assert_eq!(h1.line_spacing, None);
+        let normal = doc.resolved_style(0);
+        assert_eq!(
+            (normal.size, normal.space_before, normal.space_after),
+            (11.0, 0.0, 8.0)
+        );
+        assert_eq!(normal.line_spacing, Some(1.15));
+
+        doc.set_style_size(2, 30.0);
+        doc.set_style_space_before(2, 24.0);
+        doc.set_style_space_after(0, 12.0);
+        assert_eq!(doc.resolved_style(2).size, 30.0);
+        assert_eq!(doc.resolved_style(2).space_before, 24.0);
+        assert_eq!(doc.resolved_style(1).size, 28.0, "Heading 1 untouched");
+        assert_eq!(doc.resolved_style(0).space_after, 12.0);
+        assert_eq!(doc.resolved_style(0).size, 11.0, "Normal size untouched");
+        doc.set_style_size(0, 14.0);
+        assert_eq!(doc.body_font_size, 14.0);
+        assert_eq!(doc.resolved_styles()[2].size, 30.0);
+    }
+
+    #[test]
+    fn test_models_without_styles_keep_their_look() {
+        let mut old = serde_json::to_value(Document::new()).unwrap();
+        old.as_object_mut().unwrap().remove("heading_styles");
+        old.as_object_mut().unwrap().remove("space_before");
+        old.as_object_mut().unwrap().remove("space_after");
+        let loaded: Document = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            (loaded.space_before, loaded.space_after),
+            (0.0, NORMAL_SPACE_AFTER)
+        );
+        assert_eq!(loaded.heading_styles, <[HeadingStyle; 6]>::default());
+        assert_eq!(loaded.style_line_spacing(3), HEADING_LINE_SPACING);
     }
 
     #[test]

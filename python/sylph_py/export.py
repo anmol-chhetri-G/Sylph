@@ -9,6 +9,21 @@ import os
 import re
 from typing import List, Tuple
 
+# Import the renderers' libraries once, when this module loads. Importing
+# them lazily inside the functions let two exports on different threads
+# import python-docx at the same time, and its circular imports then
+# deadlock (_DeadlockError on docx.enum). The function-level imports below
+# are now just lookups in sys.modules.
+import docx  # noqa: E402,F401
+import docx.enum.section  # noqa: F401
+import docx.enum.text  # noqa: F401
+import docx.opc.constants  # noqa: F401
+import docx.oxml  # noqa: F401
+import docx.oxml.ns  # noqa: F401
+import docx.shared  # noqa: F401
+import fpdf  # noqa: F401
+import fpdf.fonts  # noqa: F401
+
 
 def _parse_inline(text: str) -> List[Tuple[str, dict]]:
     """Parse inline markdown formatting into segments with styles.
@@ -207,8 +222,10 @@ def _parse_markdown_lines(text: str) -> List[dict]:
 def _apply_inline_docx(run, styles):
     """Apply parsed inline styles to a python-docx run."""
     from docx.shared import Pt
-    run.bold = styles.get('bold', False)
-    run.italic = styles.get('italic', False)
+    # None inherits from the paragraph style (bold headings); False would
+    # switch the style's bold off.
+    run.bold = True if styles.get('bold') else None
+    run.italic = True if styles.get('italic') else None
     if styles.get('strike', False):
         run.font.strike = True
     if styles.get('code', False):
@@ -287,8 +304,10 @@ def _add_styled_run_docx(paragraph, run_data):
         )
         return
     run = paragraph.add_run(text)
-    run.bold = 'Bold' in styles or 'BoldItalic' in styles
-    run.italic = 'Italic' in styles or 'BoldItalic' in styles
+    # True or None, never False: an explicit "not bold" on every plain run
+    # overrode the Heading styles' bold, so headings exported unbolded.
+    run.bold = True if ('Bold' in styles or 'BoldItalic' in styles) else None
+    run.italic = True if ('Italic' in styles or 'BoldItalic' in styles) else None
     if 'Code' in styles:
         run.font.name = 'Courier New'
         run.font.size = Pt(10)
@@ -421,11 +440,18 @@ _PDF_FONTS = {
     _SERIF: {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
     _SANS: {'': 'Regular', 'I': 'Regular', 'B': 'SemiBold', 'BI': 'SemiBold'},
     _MONO: {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
+    'SourceSerif4': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    'Lora': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    'Inter': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
     'NotoSerifDevanagari': {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
     'NotoSansDevanagari': {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
 }
 # Tried in order for characters the current font lacks.
-_PDF_FALLBACKS = ('NotoSerifDevanagari', 'NotoSansDevanagari', _SERIF, _SANS, _MONO)
+# Source Serif 4 has the task boxes (☐ ☑) and Inter ✓ ✗ □, which the
+# other families lack.
+_PDF_FALLBACKS = (
+    'NotoSerifDevanagari', 'NotoSansDevanagari', _SERIF, 'SourceSerif4', 'Inter', _SANS, _MONO,
+)
 
 
 def configure(fonts_dir=None):
@@ -712,6 +738,32 @@ def _body_type(doc_data: dict):
     return name, size, spacing
 
 
+def _heading_style(doc_data: dict, level) -> tuple:
+    """(font name, line spacing or None) of the Heading `level` style: what
+    its style sets, else the body font and no explicit spacing. Styles
+    come from sylph-core's Document.heading_styles (index 0 = Heading 1)."""
+    styles = doc_data.get('heading_styles') or []
+    index = min(max(int(level), 1), 6) - 1
+    style = styles[index] if index < len(styles) and isinstance(styles[index], dict) else {}
+    font = style.get('font') or _body_type(doc_data)[0]
+    return font, style.get('line_spacing')
+
+
+def _heading_type(doc_data: dict, level) -> tuple:
+    """(size pt, space before pt, space after pt) of the Heading `level`
+    style: what its style sets, else the default scale (H1 28/12/6 …)."""
+    size, before, after = _heading_metrics(level)
+    styles = doc_data.get('heading_styles') or []
+    index = min(max(int(level), 1), 6) - 1
+    style = styles[index] if index < len(styles) and isinstance(styles[index], dict) else {}
+
+    def pick(key, default):
+        value = style.get(key)
+        return default if value is None else float(value)
+
+    return pick('size', size), pick('space_before', before), pick('space_after', after)
+
+
 def _heading_metrics(level) -> tuple:
     return _HEADING_METRICS_PT[min(max(int(level), 1), 6)]
 
@@ -723,8 +775,20 @@ def _set_style_font_docx(style, name: str, size_pt: float):
     from docx.shared import Pt
     from docx.oxml.ns import qn
 
+    from docx.oxml import OxmlElement
+    from docx.shared import RGBColor
+
     style.font.name = name
     style.font.size = Pt(size_pt)
+    # Black like the page, not the template's theme blue for headings.
+    style.font.color.rgb = RGBColor(0, 0, 0)
+    rpr = style.element.rPr
+    # Complex-script text (Devanagari) at the same size as Latin text.
+    size_cs = rpr.find(qn('w:szCs'))
+    if size_cs is None:
+        size_cs = OxmlElement('w:szCs')
+        rpr.append(size_cs)
+    size_cs.set(qn('w:val'), str(int(round(size_pt * 2))))
     rfonts = style.element.rPr.rFonts
     for attr in ('w:asciiTheme', 'w:hAnsiTheme', 'w:eastAsiaTheme', 'w:cstheme'):
         rfonts.attrib.pop(qn(attr), None)
@@ -779,10 +843,13 @@ def _apply_typography_docx(doc, doc_data: dict):
     _set_style_font_docx(doc.styles['Normal'], name, size)
     _set_style_complex_script_docx(doc.styles['Normal'], cs_font)
     for level in range(1, 7):
-        heading_size, before, after = _heading_metrics(level)
+        heading_size, before, after = _heading_type(doc_data, level)
         style = doc.styles[f'Heading {level}']
-        _set_style_font_docx(style, name, heading_size)
-        _set_style_complex_script_docx(style, cs_font)
+        heading_font, heading_spacing = _heading_style(doc_data, level)
+        _set_style_font_docx(style, heading_font, heading_size)
+        _set_style_complex_script_docx(style, _devanagari_family(heading_font))
+        if heading_spacing:
+            style.paragraph_format.line_spacing = heading_spacing
         style.font.bold = True
         style.font.italic = False
         style.paragraph_format.space_before = Pt(before)
@@ -790,9 +857,14 @@ def _apply_typography_docx(doc, doc_data: dict):
 
 
 def _pdf_family(font_name: str) -> str:
-    """The bundled family standing in for the document's typeface: serif
-    faces map to EB Garamond, monospace to JetBrains Mono and everything
-    else to Hanken Grotesk (fonts that are not bundled cannot be embedded)."""
+    """The bundled family for the document's typeface: itself when it is
+    bundled ("Source Serif 4" -> SourceSerif4); otherwise serif faces map
+    to EB Garamond, monospace to JetBrains Mono and everything else to
+    Hanken Grotesk (fonts that are not bundled cannot be embedded)."""
+    bundled = {family.lower(): family for family in _PDF_FONTS}
+    exact = bundled.get((font_name or '').replace(' ', '').lower())
+    if exact:
+        return exact
     name = (font_name or '').lower()
     if 'mono' in name or 'courier' in name:
         return _MONO
@@ -878,12 +950,11 @@ def _render_block_docx(doc, block: dict):
         p = block['Paragraph']
         para = doc.add_paragraph()
         style_data = p.get('style', {})
-        if style_data.get('space_before', 0) > 0:
-            para.paragraph_format.space_before = Pt(style_data['space_before'])
-        if style_data.get('space_after', 0) > 0:
-            para.paragraph_format.space_after = Pt(style_data['space_after'])
-        if style_data.get('line_spacing', 1.5) != 1.0:
-            para.paragraph_format.line_spacing = style_data.get('line_spacing', 1.5)
+        # Always explicit: a value left unset falls back to the template's,
+        # which is not what the page shows.
+        para.paragraph_format.space_before = Pt(style_data.get('space_before', 0.0))
+        para.paragraph_format.space_after = Pt(style_data.get('space_after', 8.0))
+        para.paragraph_format.line_spacing = style_data.get('line_spacing', 1.15)
         for run_data in p.get('runs', []):
             _add_styled_run_docx(para, run_data)
     elif 'Image' in block:
@@ -1007,6 +1078,11 @@ def _render_quote_docx(doc, quote_data: dict):
     p_pr.append(p_bdr)
     for run_data in quote_data.get('runs', []):
         _add_styled_run_docx(para, run_data)
+    # Gray italic, as the page draws quotes.
+    from docx.shared import RGBColor
+    for run in para.runs:
+        run.italic = True
+        run.font.color.rgb = RGBColor(0x50, 0x50, 0x50)
 
 
 def _render_code_block_docx(doc, code_data: dict):
@@ -1140,6 +1216,7 @@ def rich_pdf(doc_json: str, output_path: str) -> List[str]:
     # Body type for the block renderers (read back through _pdf_body).
     body_name, pdf.sylph_size, pdf.sylph_spacing = _body_type(doc_data)
     pdf.sylph_family = _pdf_family(body_name)
+    pdf.sylph_doc = doc_data
     pdf.add_page()
 
     for block in doc_data.get('blocks', []):
@@ -1148,45 +1225,59 @@ def rich_pdf(doc_json: str, output_path: str) -> List[str]:
     return _pdf_output(pdf, output_path, doc_data)
 
 
-def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0, 0, 0)):
-    """Write flowing inline runs to the current PDF line position.
+def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0, 0, 0),
+                    indent=0.0, bullet=''):
+    """Write inline runs as one wrapped paragraph and move below it.
 
-    Runs use the document's body family and size (see _pdf_body). Plain
-    runs reset to `default_style`/`default_color` (set by the caller for
-    context, e.g. gray italic inside quotes); styled runs override. Links
-    are written as clickable PDF links (blue).
+    The runs go into a single fpdf2 text-flow paragraph, so lines wrap
+    only between words even where the font changes mid-line (writing each
+    run on its own broke words such as "sam|e" at the line end). Runs use
+    the document's body family and size (see _pdf_body); plain runs use
+    `default_style`/`default_color` (gray italic inside quotes); links are
+    blue and clickable. `indent` (mm) shifts the paragraph right, and a
+    `bullet` hangs in front of it, so wrapped lines align with the text.
     """
     family, size, body_spacing = _pdf_body(pdf)
-    line_h = _pdf_line_height(size, spacing or body_spacing)
-    for run_data in runs:
-        text = run_data.get('text', '')
-        if not text:
-            continue
-        styles = run_data.get('styles', [])
-        url = _link_url(styles)
-        if 'Code' in styles:
-            pdf.set_font(_MONO, '', size - 1)
-            pdf.set_text_color(200, 50, 50)
-        elif 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
-            pdf.set_font(family, 'BI', size)
-            pdf.set_text_color(0, 0, 0)
-        elif 'Bold' in styles:
-            pdf.set_font(family, 'B', size)
-            pdf.set_text_color(0, 0, 0)
-        elif 'Italic' in styles:
-            pdf.set_font(family, 'I', size)
-            pdf.set_text_color(0, 0, 0)
-        else:
-            pdf.set_font(family, default_style, size)
-            pdf.set_text_color(*default_color)
-        if url is not None:
-            pdf.set_text_color(0, 90, 180)
-            # write() keeps runs on the same flowing line; multi_cell()
-            # per run would stack each run on its own line.
-            pdf.write(line_h, text, link=url)
-            pdf.set_text_color(*default_color)
-        else:
-            pdf.write(line_h, text)
+    line_spacing = spacing or body_spacing
+    runs = [r for r in runs if r.get('text')]
+    _pdf_font(pdf, default_style)
+    pdf.set_text_color(*default_color)
+    with pdf.text_columns(
+        l_margin=pdf.l_margin + indent,
+        line_height=line_spacing,
+        skip_leading_spaces=False,
+    ) as columns:
+        with columns.paragraph(
+            bullet_string=bullet,
+            bullet_r_margin=1.5 if bullet else None,
+        ) as paragraph:
+            if not runs:
+                paragraph.write(' ')
+            for run_data in runs:
+                styles = run_data.get('styles', [])
+                strike = 'S' if 'Strikethrough' in styles else ''
+                url = _link_url(styles)
+                if 'Code' in styles:
+                    pdf.set_font(_MONO, strike, size - 1)
+                    pdf.set_text_color(200, 50, 50)
+                else:
+                    if 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
+                        emphasis = 'BI'
+                    elif 'Bold' in styles:
+                        emphasis = 'B'
+                    elif 'Italic' in styles:
+                        emphasis = 'I'
+                    else:
+                        emphasis = default_style
+                    pdf.set_font(family, emphasis + strike, size)
+                    pdf.set_text_color(*(default_color if emphasis == default_style else (0, 0, 0)))
+                if url is not None:
+                    pdf.set_text_color(0, 90, 180)
+                    paragraph.write(run_data['text'], link=url)
+                else:
+                    paragraph.write(run_data['text'])
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_x(pdf.l_margin)
 
 
 def _render_block_pdf(pdf, block: dict):
@@ -1197,26 +1288,32 @@ def _render_block_pdf(pdf, block: dict):
         h = block['Heading']
         # The canvas's heading scale (H1 28 pt, 12 before / 6 after, …)
         # in the document's typeface.
-        size, before, after = _heading_metrics(h['level'])
-        family = _pdf_body(pdf)[0]
+        doc_data = getattr(pdf, 'sylph_doc', {})
+        size, before, after = _heading_type(doc_data, h['level'])
+        heading_font, heading_spacing = _heading_style(doc_data, h['level'])
+        family = _pdf_family(heading_font)
         pdf.ln(before * _MM_PER_PT)
         pdf.set_x(pdf.l_margin)
         pdf.set_font(family, 'B', size)
         pdf.set_text_color(0, 0, 0)
         text = ''.join(r['text'] for r in h.get('runs', []))
-        pdf.multi_cell(pdf.epw, _pdf_line_height(size, _HEADING_LINE_FACTOR), text)
+        pdf.multi_cell(
+            pdf.epw, _pdf_line_height(size, heading_spacing or _HEADING_LINE_FACTOR), text
+        )
         pdf.ln(after * _MM_PER_PT)
     elif 'Paragraph' in block:
         p = block['Paragraph']
         style_data = p.get('style', {})
         _family, size, spacing = _pdf_body(pdf)
         spacing = style_data.get('line_spacing', spacing)
-        # space_after is in points, like every length in the model.
+        # Spacing is in points, like every length in the model.
+        space_before = style_data.get('space_before', 0.0)
         space_after = style_data.get('space_after', _DEFAULT_SPACE_AFTER_PT)
-        pdf.set_x(pdf.l_margin)
-        pdf.set_text_color(0, 0, 0)
+        # No space above a paragraph that starts a page, as in Word.
+        if space_before and pdf.get_y() > pdf.t_margin + 0.01:
+            pdf.ln(space_before * _MM_PER_PT)
         _write_pdf_runs(pdf, p.get('runs', []), spacing=spacing)
-        pdf.ln(_pdf_line_height(size, spacing) + space_after * _MM_PER_PT)
+        pdf.ln(space_after * _MM_PER_PT)
     elif 'Image' in block:
         img_data = block['Image']['data']
         path = img_data.get('path', '')
@@ -1297,39 +1394,28 @@ def _render_list_pdf(pdf, list_data: dict):
         for deeper in [lv for lv in counters if lv > level]:
             del counters[deeper]
         if checked is not None:
-            # Core PDF fonts are latin-1 only: ASCII task markers stay portable.
-            marker = '[x] ' if checked else '[ ] '
+            # Ballot boxes: in the fallback fonts, so no bundled face lacks them.
+            marker = '☑' if checked else '☐'
         elif ordered:
             counters[level] = counters.get(level, 0) + 1
-            marker = f'{counters[level]}. '
+            marker = f'{counters[level]}.'
         else:
             counters.pop(level, None)
-            # '•' (U+2022) is rejected by latin-1 core fonts; '·' is the
-            # closest latin-1 bullet and renders in every core family.
-            marker = '· '
-        _family, size, spacing = _pdf_body(pdf)
-        pdf.set_x(pdf.l_margin + 6.0 * (level + 1))
-        _pdf_font(pdf)
-        pdf.set_text_color(0, 0, 0)
-        pdf.write(_pdf_line_height(size, spacing), marker)
-        _write_pdf_runs(pdf, item.get('runs', []))
-        # One line per item, as on the canvas: no gap between items.
-        pdf.ln(_pdf_line_height(size, spacing))
+            marker = '•'
+        # One item per paragraph, no gap between items; wrapped lines hang
+        # under the text, not under the marker.
+        _write_pdf_runs(pdf, item.get('runs', []), indent=6.0 * (level + 1), bullet=marker)
     pdf.ln(_DEFAULT_SPACE_AFTER_PT * _MM_PER_PT)
 
 
 def _render_quote_pdf(pdf, quote_data: dict):
     """Render a blockquote as an indented, gray-italic paragraph."""
-    _family, size, spacing = _pdf_body(pdf)
     level = min(int(quote_data.get('level', 1)), 4)
-    pdf.set_x(pdf.l_margin + 6.0 * level)
-    _pdf_font(pdf, 'I')
-    pdf.set_text_color(80, 80, 80)
     _write_pdf_runs(
         pdf, quote_data.get('runs', []),
-        default_style='I', default_color=(80, 80, 80),
+        default_style='I', default_color=(80, 80, 80), indent=6.0 * level,
     )
-    pdf.ln(_pdf_line_height(size, spacing) + _DEFAULT_SPACE_AFTER_PT * _MM_PER_PT)
+    pdf.ln(_DEFAULT_SPACE_AFTER_PT * _MM_PER_PT)
 
 
 def _render_code_block_pdf(pdf, code_data: dict):

@@ -20,8 +20,10 @@ use sylph_core::{
 use sylph_storage::Storage;
 
 mod save_state;
+mod style_controls;
 mod ui;
 use save_state::*;
+use style_controls::Picker;
 mod export_job;
 use export_job::*;
 mod fonts;
@@ -116,6 +118,10 @@ struct TextInput {
     word_wrap: bool,
     save_task: Option<Task<()>>,
     save_state: SaveState,
+    /// The document's paragraph styles, resolved (0 Normal, 1–6
+    /// headings): what the canvas lays rows out with. Kept in step by
+    /// `SylphApp::sync_editor_styles`.
+    styles: [doc::ResolvedStyle; 7],
     /// Bumped by every change to `content`, so values derived from the
     /// text are computed once per edit instead of once per frame.
     content_rev: u64,
@@ -1407,6 +1413,7 @@ impl Element for TextElement {
         let show_line_numbers = input.show_line_numbers;
         let word_wrap = input.word_wrap;
         let markdown_on = input.markdown_mode;
+        let styles = input.styles.clone();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
@@ -1449,21 +1456,52 @@ impl Element for TextElement {
 
         // Source→display transform: identity when Markdown mode is OFF.
         let display_lines = build_display_lines(&lines, markdown_on);
+        // Normal paragraphs get their style's space above the first line
+        // and below the last, where the export's paragraphs start and end.
+        let edges = paragraph_edges(&display_lines, markdown_on);
+        const PT: f32 = 4.0 / 3.0;
 
         let available_width = bounds.size.width - gutter_width;
         let mut rows: Vec<PrepRow> = Vec::new();
         let mut y = px(0.0);
 
         for (i, dl) in display_lines.iter().enumerate() {
-            let row_font_size = dl.font_size.map(px).unwrap_or(font_size);
-            // Body rows keep the layout's line height; rows with an
-            // explicit size (headings) get a box that fits their glyphs.
-            let text_height = match dl.font_size {
-                Some(size) => line_height.max(px(size * 1.4)),
-                None => line_height,
+            let heading_style = (1..=6)
+                .contains(&dl.heading)
+                .then(|| &styles[dl.heading as usize]);
+            // A heading's size and spacing come from its style.
+            let heading_size = heading_style.map(|s| s.size * PT);
+            let row_font_size = heading_size.or(dl.font_size).map(px).unwrap_or(font_size);
+            // Body rows keep the layout's line height (Normal's spacing);
+            // heading rows use their style's spacing, or by default a box
+            // that fits their glyphs.
+            let text_height = match (heading_size, heading_style.and_then(|s| s.line_spacing)) {
+                (Some(size), Some(spacing)) => px(size * spacing),
+                (Some(size), None) => line_height.max(px(size * doc::HEADING_LINE_SPACING)),
+                (None, _) => line_height,
+            };
+            let (line_before, line_after) = match heading_style {
+                Some(style) => (style.space_before * PT, style.space_after * PT),
+                None => {
+                    let (first, last) = edges[i];
+                    (
+                        if first {
+                            styles[0].space_before * PT
+                        } else {
+                            dl.space_before
+                        },
+                        if last {
+                            styles[0].space_after * PT
+                        } else {
+                            dl.space_after
+                        },
+                    )
+                }
             };
             let mut font = if dl.mono {
                 gpui::font(ui::MONO_FONT)
+            } else if let Some(style) = heading_style {
+                gpui::font(style.font.clone())
             } else {
                 base_font.clone()
             };
@@ -1533,12 +1571,8 @@ impl Element for TextElement {
 
             let row_count = ranges.len();
             for (r, &(d0, d1)) in ranges.iter().enumerate() {
-                let space_before = if r == 0 { dl.space_before } else { 0.0 };
-                let space_after = if r + 1 == row_count {
-                    dl.space_after
-                } else {
-                    0.0
-                };
+                let space_before = if r == 0 { line_before } else { 0.0 };
+                let space_after = if r + 1 == row_count { line_after } else { 0.0 };
                 let box_top = y;
                 let text_top = y + px(space_before);
                 let box_height = px(space_before) + text_height + px(space_after);
@@ -1995,6 +2029,8 @@ struct SylphApp {
     dark_mode: bool,
     ai_panel: AiPanelState,
     palette: PaletteState,
+    /// The open format-bar dropdown (Style, Font, Line spacing).
+    open_picker: Option<Picker>,
     /// Pages the export produces, keyed by (text revision, Markdown mode,
     /// model): a full parse, so not once per frame.
     page_count_memo: Memo<(u64, bool, doc::Document), usize>,
@@ -3524,28 +3560,6 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn cycle_line_spacing(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.document.line_spacing;
-        let next = if (current - 1.0).abs() < 0.01 {
-            1.15
-        } else if (current - 1.15).abs() < 0.01 {
-            1.5
-        } else if (current - 1.5).abs() < 0.01 {
-            2.0
-        } else {
-            1.0
-        };
-        self.document.set_line_spacing(next);
-        self.set_status(format!("Line spacing: {:.2}", next), cx);
-        cx.notify();
-    }
-
-    fn set_line_spacing_value(&mut self, value: f32, _window: &mut Window, cx: &mut Context<Self>) {
-        self.document.set_line_spacing(value);
-        self.set_status(format!("Line spacing: {:.2}", value), cx);
-        cx.notify();
-    }
-
     fn cycle_heading(&mut self, _: &CycleHeading, _window: &mut Window, cx: &mut Context<Self>) {
         // Normal → H1 → … → H6 → Normal. Style controls never change the
         // Markdown toggle: apply_heading_level refuses while it is OFF.
@@ -3570,10 +3584,21 @@ impl SylphApp {
         cx.notify();
     }
 
+    /// Font size of every paragraph in the caret's style (Normal or a
+    /// heading), like changing the size in a Word style.
     fn adjust_body_font_size(&mut self, delta: i8, _window: &mut Window, cx: &mut Context<Self>) {
-        let new_size = (self.document.body_font_size + delta as f32).clamp(8.0, 72.0);
-        self.document.set_body_font_size(new_size);
-        self.set_status(format!("Font size: {}", new_size.round() as i32), cx);
+        let level = self.caret_style(cx);
+        let size = self.document.resolved_style(level).size + delta as f32;
+        self.document.set_style_size(level, size);
+        let size = self.document.resolved_style(level).size;
+        self.set_status(
+            format!(
+                "Size {} pt for every {} paragraph",
+                size.round() as i32,
+                style_controls::style_name(level)
+            ),
+            cx,
+        );
         cx.notify();
     }
 
@@ -4475,6 +4500,8 @@ struct DisplayLine {
     kind: DisplayKind,
     /// Explicit font size in px (headings); `None` inherits the editor's.
     font_size: Option<f32>,
+    /// Heading level 1–6 (its paragraph style), 0 for any other line.
+    heading: u8,
     /// Space before/after the line box in px (headings).
     space_before: f32,
     space_after: f32,
@@ -4485,6 +4512,8 @@ struct DisplayLine {
     /// The line is inside an open ``` fence (used by the OFF-mode
     /// highlighter path, matching the legacy `in_fence` flag).
     fenced: bool,
+    /// The line is a pipe-table row (Markdown mode), not a paragraph.
+    table: bool,
 }
 
 impl DisplayLine {
@@ -4507,12 +4536,14 @@ impl DisplayLine {
             styles: Vec::new(),
             kind: DisplayKind::Paragraph,
             font_size: None,
+            heading: 0,
             space_before: 0.0,
             space_after: 0.0,
             bold: false,
             italic: false,
             mono: false,
             fenced,
+            table: false,
         }
     }
 
@@ -4638,14 +4669,7 @@ impl DisplayBuilder {
 /// at 28pt bold with 12pt before / 6pt after; the rest follow Word/Docs
 /// proportions (each level ~10–20% smaller, tighter spacing as level ↑).
 fn heading_metrics_pt(level: u8) -> (f32, f32, f32) {
-    match level {
-        1 => (28.0, 12.0, 6.0),
-        2 => (22.0, 10.0, 6.0),
-        3 => (18.0, 8.0, 4.0),
-        4 => (16.0, 6.0, 4.0),
-        5 => (14.0, 4.0, 4.0),
-        _ => (12.0, 4.0, 4.0),
-    }
+    doc::HEADING_DEFAULTS[level.clamp(1, 6) as usize - 1]
 }
 
 /// The spec's heading scale in canvas pixels (pt → px at 96dpi). The
@@ -4670,6 +4694,7 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
     let mut b = DisplayBuilder::default();
     let mut kind = DisplayKind::Paragraph;
     let (mut font_size, mut space_before, mut space_after) = (None, 0.0, 0.0);
+    let mut heading = 0;
     let (mut bold, mut italic, mut mono) = (false, false, false);
 
     if trimmed.starts_with("```") {
@@ -4713,6 +4738,7 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
         kind = DisplayKind::Heading;
         let (size, before, after) = heading_metrics(level);
         font_size = Some(size);
+        heading = level;
         space_before = before;
         space_after = after;
         bold = true;
@@ -4753,12 +4779,14 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
         styles: b.styles,
         kind,
         font_size,
+        heading,
         space_before,
         space_after,
         bold,
         italic,
         mono,
         fenced: false,
+        table: false,
     }
 }
 
@@ -4785,10 +4813,36 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
                 // grids: the export reads their cells one by one, so
                 // styling a whole row could hide markers the export keeps.
                 out[i] = DisplayLine::identity(out[i].src_offset, &lines[i], false);
+                out[i].table = true;
             }
         }
     }
     out
+}
+
+/// For each display line, whether it starts and whether it ends a Normal
+/// paragraph as the export forms them: with Markdown mode ON, a run of
+/// consecutive plain paragraph lines is one paragraph; OFF, every
+/// non-blank line is its own. Other lines (blank, headings, lists,
+/// quotes, code, tables) are `(false, false)`.
+fn paragraph_edges(lines: &[DisplayLine], markdown_on: bool) -> Vec<(bool, bool)> {
+    let is_para = |dl: &DisplayLine| {
+        !dl.text.trim().is_empty()
+            && (!markdown_on || (dl.kind == DisplayKind::Paragraph && !dl.fenced && !dl.table))
+    };
+    (0..lines.len())
+        .map(|i| {
+            if !is_para(&lines[i]) {
+                return (false, false);
+            }
+            if !markdown_on {
+                return (true, true);
+            }
+            let first = i == 0 || !is_para(&lines[i - 1]);
+            let last = i + 1 == lines.len() || !is_para(&lines[i + 1]);
+            (first, last)
+        })
+        .collect()
 }
 
 /// Which lines belong to pipe tables, by the export parser's own loop: a
@@ -5427,11 +5481,19 @@ fn export_model(structured: &doc::Document, content: &str, markdown_on: bool) ->
             blocks.push(b.clone());
         }
     }
-    if markdown_on {
-        blocks.extend(parse_content_blocks(content, structured.line_spacing));
+    let text_blocks = if markdown_on {
+        parse_content_blocks(content, structured.line_spacing)
     } else {
-        blocks.extend(literal_blocks(content, structured.line_spacing));
-    }
+        literal_blocks(content, structured.line_spacing)
+    };
+    // The typed paragraphs take the Normal style's spacing.
+    blocks.extend(text_blocks.into_iter().map(|mut block| {
+        if let doc::Block::Paragraph { style, .. } = &mut block {
+            style.space_before = structured.space_before;
+            style.space_after = structured.space_after;
+        }
+        block
+    }));
     for b in &structured.blocks {
         match b {
             doc::Block::CoverPage { .. } => {}
@@ -5713,6 +5775,7 @@ fn main() {
                         word_wrap: true,
                         save_task: None,
                         content_rev: 0,
+                        styles: document.resolved_styles(),
                         save_state: opened_state(&read_only, &unpersisted),
                         unpersisted,
                         read_only,
@@ -5734,6 +5797,7 @@ fn main() {
                         // Any notify may follow a model change; this one hook
                         // saves it, so no handler has to remember to.
                         let model_observer = cx.observe_self(|this: &mut SylphApp, cx| {
+                            this.sync_editor_styles(cx);
                             this.persist_model_if_changed(cx)
                         });
                         let persisted_markdown = document.markdown;
@@ -5764,6 +5828,7 @@ fn main() {
                             documents: Vec::new(),
                             dark_mode: false,
                             palette: PaletteState::default(),
+                            open_picker: None,
                             page_count_memo: Memo::new(),
                             caret_status_memo: Memo::new(),
                             outline_memo: Memo::new(),
@@ -7191,6 +7256,76 @@ mod menu_label_tests {
             let text = shortcut_text(&binding);
             assert!(!text.is_empty() && !text.ends_with('+'), "{text:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod paragraph_spacing_export_tests {
+    use super::{doc, export_model};
+
+    #[test]
+    fn typed_paragraphs_take_the_normal_style_spacing() {
+        let mut structured = doc::Document::new();
+        structured.set_style_space_before(0, 6.0);
+        structured.set_style_space_after(0, 12.0);
+        for markdown in [true, false] {
+            let model = export_model(&structured, "One\n\nTwo", markdown);
+            let spacings: Vec<(f32, f32)> = model
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    doc::Block::Paragraph { style, .. } => {
+                        Some((style.space_before, style.space_after))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(spacings, [(6.0, 12.0), (6.0, 12.0)], "markdown {markdown}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod paragraph_edge_tests {
+    use super::{build_display_lines, paragraph_edges};
+
+    fn edges(text: &str, markdown_on: bool) -> Vec<(bool, bool)> {
+        let lines: Vec<String> = text.split('\n').map(String::from).collect();
+        paragraph_edges(&build_display_lines(&lines, markdown_on), markdown_on)
+    }
+
+    #[test]
+    fn markdown_paragraphs_span_consecutive_lines() {
+        let e = edges("# Title\none\ntwo\n\nthree\n- item\n```\ncode\n```", true);
+        assert_eq!(
+            e,
+            [
+                (false, false), // heading: its own style
+                (true, false),
+                (false, true),
+                (false, false), // blank
+                (true, true),
+                (false, false), // list
+                (false, false),
+                (false, false), // code
+                (false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_markdown_every_line_is_a_paragraph() {
+        assert_eq!(
+            edges("# a\nb\n\nc", false),
+            [(true, true), (true, true), (false, false), (true, true)]
+        );
+    }
+
+    #[test]
+    fn table_rows_are_not_paragraphs() {
+        let e = edges("| a | b |\n|---|---|\n| 1 | 2 |\nafter", true);
+        assert_eq!(e[..3], [(false, false); 3]);
+        assert_eq!(e[3], (true, true));
     }
 }
 

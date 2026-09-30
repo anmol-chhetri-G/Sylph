@@ -2,7 +2,14 @@
 
 /// Body fonts the toolbar cycles through: only bundled families, so each
 /// one renders the same on every machine.
-pub(crate) const BODY_FONTS: [&str; 3] = ["EB Garamond", "Hanken Grotesk", "JetBrains Mono"];
+pub(crate) const BODY_FONTS: [&str; 6] = [
+    "EB Garamond",
+    "Source Serif 4",
+    "Lora",
+    "Hanken Grotesk",
+    "Inter",
+    "JetBrains Mono",
+];
 
 /// The bundled OFL fonts (assets/fonts, each family with its OFL.txt).
 ///
@@ -27,6 +34,18 @@ pub(crate) fn bundled_fonts() -> Vec<std::borrow::Cow<'static, [u8]>> {
         font!("EBGaramond/Italic.ttf"),
         font!("EBGaramond/Bold.ttf"),
         font!("EBGaramond/BoldItalic.ttf"),
+        font!("SourceSerif4/Regular.ttf"),
+        font!("SourceSerif4/Italic.ttf"),
+        font!("SourceSerif4/Bold.ttf"),
+        font!("SourceSerif4/BoldItalic.ttf"),
+        font!("Lora/Regular.ttf"),
+        font!("Lora/Italic.ttf"),
+        font!("Lora/Bold.ttf"),
+        font!("Lora/BoldItalic.ttf"),
+        font!("Inter/Regular.ttf"),
+        font!("Inter/Italic.ttf"),
+        font!("Inter/Bold.ttf"),
+        font!("Inter/BoldItalic.ttf"),
         font!("HankenGrotesk/Regular.ttf"),
         font!("HankenGrotesk/SemiBold.ttf"),
         font!("JetBrainsMono/Regular.ttf"),
