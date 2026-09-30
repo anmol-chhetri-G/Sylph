@@ -307,11 +307,12 @@ def markdown_to_html(text: str) -> str:
 
 def markdown_to_docx(text: str, output_path: str) -> bool:
     """Convert markdown to DOCX format with real formatting."""
-    from docx import Document
     from docx.shared import Pt, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    doc = Document()
+    doc = _new_docx()
+    for style_name in ['Normal'] + [f'Heading {level}' for level in range(1, 7)]:
+        _set_style_complex_script_docx(doc.styles[style_name], 'Noto Sans Devanagari')
 
     # Set default font
     style = doc.styles['Normal']
@@ -729,17 +730,59 @@ def _set_style_font_docx(style, name: str, size_pt: float):
         rfonts.attrib.pop(qn(attr), None)
 
 
+def _new_docx():
+    """A python-docx Document that Word opens as a current (2013+) file.
+    The bundled template says Word 2010 (compatibilityMode 14), which Word
+    shows as "[Compatibility Mode]" and lays out with 2010 rules."""
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    doc = Document()
+    for setting in doc.settings.element.iter(qn('w:compatSetting')):
+        if setting.get(qn('w:name')) == 'compatibilityMode':
+            setting.set(qn('w:val'), '15')
+    return doc
+
+
+def _devanagari_family(font_name: str) -> str:
+    """The Devanagari face that goes with the body typeface: serif with
+    serif, sans with everything else (the same split as the PDF export)."""
+    return 'Noto Serif Devanagari' if _pdf_family(font_name) == _SERIF else 'Noto Sans Devanagari'
+
+
+def _set_style_complex_script_docx(style, cs_font: str):
+    """Word and LibreOffice set Devanagari (a complex script) in the run's
+    w:cs font, not w:ascii; without one they fall back to whatever the
+    theme or system picks. The language marks it as Nepali for shaping
+    and proofing."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    rpr = style.element.get_or_add_rPr()
+    rfonts = rpr.get_or_add_rFonts()
+    rfonts.set(qn('w:cs'), cs_font)
+    rfonts.attrib.pop(qn('w:cstheme'), None)
+    lang = rpr.find(qn('w:lang'))
+    if lang is None:
+        lang = OxmlElement('w:lang')
+        rpr.append(lang)
+    lang.set(qn('w:bidi'), 'ne-NP')
+
+
 def _apply_typography_docx(doc, doc_data: dict):
     """Body text and headings in the document's typeface at the canvas's
     sizes, instead of the template's Calibri and theme heading fonts."""
     from docx.shared import Pt
 
     name, size, _spacing = _body_type(doc_data)
+    cs_font = _devanagari_family(name)
     _set_style_font_docx(doc.styles['Normal'], name, size)
+    _set_style_complex_script_docx(doc.styles['Normal'], cs_font)
     for level in range(1, 7):
         heading_size, before, after = _heading_metrics(level)
         style = doc.styles[f'Heading {level}']
         _set_style_font_docx(style, name, heading_size)
+        _set_style_complex_script_docx(style, cs_font)
         style.font.bold = True
         style.font.italic = False
         style.paragraph_format.space_before = Pt(before)
@@ -798,12 +841,11 @@ def rich_docx(doc_json: str, output_path: str) -> bool:
     }
     """
     import json
-    from docx import Document
     from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     doc_data = json.loads(doc_json)
-    doc = Document()
+    doc = _new_docx()
     # python-docx's template is Letter with 1.25" side margins; use the
     # document's own page setup instead.
     _apply_page_setup_docx(doc, doc_data)

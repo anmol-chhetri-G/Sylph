@@ -28,6 +28,7 @@ editing.
 | 1.5 Dead code | done | `CrdtDocument` + `yrs`, `Caption`, `RewriteText`, `rewrite_text`, `save_image`, `markdown_to_markdown` removed |
 | 1.9 Derived stats per edit | partial | page count, caret status and outline cached by `content_rev`; canvas layout still per frame |
 | 1.11–1.13 Splitting main.rs/ui.rs | started | this session's helpers live in `save_state`, `export_job`, `fonts`, `memo`, `md_edit`, `palette`, `title` modules |
+| 5.3 DOCX complex script (early part) | partial | DOCX declares Word 2013+ (no Compatibility Mode); styles carry a Devanagari `w:cs` font and `ne-NP`; fonts are not embedded |
 | everything else | open | |
 
 Manual checks still owed by the author are listed in each task's VR boxes.

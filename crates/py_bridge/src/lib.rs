@@ -717,6 +717,48 @@ mod tests {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_docx_is_a_current_word_file_with_devanagari_fonts() {
+        // The python-docx template declared Word 2010, so Word opened every
+        // export in Compatibility Mode, and Devanagari had no complex-script
+        // font, so it fell back to whatever the system picked.
+        let nepali = "नेपालीमा काम गर्दै";
+        let doc = format!(
+            r#"{{"body_font": "EB Garamond", "blocks": [
+                {{"Heading": {{"level": 2, "runs": [{{"text": "{nepali}", "styles": []}}]}}}},
+                {{"Paragraph": {{"runs": [{{"text": "{nepali}", "styles": []}}],
+                  "style": {{"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}}}}
+            ]}}"#
+        );
+        for (path, serif) in [(tmp("nepali.docx"), true), (tmp("nepali_md.docx"), false)] {
+            let r = if serif {
+                export_rich_docx(&doc, &path)
+            } else {
+                export_to_docx(&format!("## {nepali}\n\n{nepali}"), &path)
+            };
+            assert!(r.starts_with("Exported"), "docx: {r}");
+            let settings = docx_part(&path, "word/settings.xml");
+            assert!(
+                settings.contains(r#"w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15""#),
+                "{settings}"
+            );
+            let styles = docx_part(&path, "word/styles.xml");
+            let cs = if serif {
+                r#"w:cs="Noto Serif Devanagari""#
+            } else {
+                r#"w:cs="Noto Sans Devanagari""#
+            };
+            // Normal and all six headings.
+            assert!(styles.matches(cs).count() >= 7, "{styles}");
+            assert!(styles.contains(r#"w:bidi="ne-NP""#), "{styles}");
+            assert!(docx_part(&path, "word/document.xml").contains(nepali));
+        }
+    }
+
     /// The fonts a PDF's pages use, via poppler's `pdffonts` (every
     /// registered font is written to the file, used or not).
     fn pdf_fonts(path: &str) -> Option<String> {
