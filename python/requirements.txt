@@ -1,7 +1,9 @@
-# Sylph Python export/AI dependencies.
+# Sylph Python export/AI dependencies, pinned (plan 0.12).
 # System Python on Arch is PEP-668 managed — use a venv:
 #   python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt
-# Then run with the venv active so the embedded (PyO3) interpreter finds them.
-fpdf2
-python-docx
-markdown
+# The bridge finds the repo .venv itself in debug builds.
+fpdf2==2.8.8
+# fpdf2's text shaping (Devanagari conjuncts, ligatures).
+uharfbuzz==0.56.2
+python-docx==1.2.0
+markdown==3.11

@@ -404,8 +404,85 @@ def markdown_to_docx(text: str, output_path: str) -> bool:
     return True
 
 
-def markdown_to_pdf(text: str, output_path: str) -> bool:
-    """Convert markdown to PDF format with real formatting."""
+# ── PDF fonts ────────────────────────────────────────────────────────
+#
+# PDFs embed Sylph's bundled OFL fonts (assets/fonts) instead of the 14
+# core PDF fonts, which are latin-1 only: Devanagari, arrows and dashes
+# export as themselves, never as '?'. Rust passes the fonts folder in
+# through `configure`, from its trusted-path logic.
+
+_FONTS_DIR = None
+# fpdf2 family ids (fpdf2 matches fallback fonts by the id without spaces).
+_SERIF, _SANS, _MONO = 'EBGaramond', 'HankenGrotesk', 'JetBrainsMono'
+# Family id -> {fpdf2 style: file in assets/fonts/<family>/}. A family with
+# no true italic or bold uses its nearest face rather than failing.
+_PDF_FONTS = {
+    _SERIF: {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    _SANS: {'': 'Regular', 'I': 'Regular', 'B': 'SemiBold', 'BI': 'SemiBold'},
+    _MONO: {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
+    'NotoSerifDevanagari': {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
+    'NotoSansDevanagari': {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
+}
+# Tried in order for characters the current font lacks.
+_PDF_FALLBACKS = ('NotoSerifDevanagari', 'NotoSansDevanagari', _SERIF, _SANS, _MONO)
+
+
+def configure(fonts_dir=None):
+    """Called by the Rust bridge with the bundled fonts folder."""
+    global _FONTS_DIR
+    _FONTS_DIR = fonts_dir
+
+
+def _pdf_setup_fonts(pdf):
+    """Register the bundled fonts, HarfBuzz shaping (Devanagari conjuncts)
+    and the fallback chain on a new FPDF."""
+    if not _FONTS_DIR or not os.path.isdir(_FONTS_DIR):
+        raise RuntimeError(f"Sylph's fonts folder was not found ({_FONTS_DIR!r})")
+    for family, styles in _PDF_FONTS.items():
+        for style, face in styles.items():
+            pdf.add_font(family, style, os.path.join(_FONTS_DIR, family, face + '.ttf'))
+    pdf.set_text_shaping(True)
+    pdf.set_fallback_fonts([family.lower() for family in _PDF_FALLBACKS])
+
+
+def _strings(value):
+    """Every string inside a JSON value (dict values, list items)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
+def _pdf_output(pdf, output_path: str, source) -> List[str]:
+    """Write the PDF and return warnings for characters of `source` (the
+    exported text or JSON value) that no bundled font covers, which print
+    as blank boxes, instead of hiding them. Returned, not stored: exports
+    on other threads must not see each other's warnings."""
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    pdf.output(output_path)
+    covered = set()
+    for font in pdf.fonts.values():
+        covered.update(getattr(font, 'cmap', None) or {})
+    used = {ord(c) for text in _strings(source) for c in text}
+    # Joiners and variation selectors have no glyph of their own.
+    invisible = lambda c: c < 0x20 or chr(c).isspace() or c in (0x200C, 0x200D) or 0xFE00 <= c <= 0xFE0F
+    lost = sorted(c for c in used - covered if not invisible(c))
+    warnings = []
+    if lost:
+        warnings.append(
+            'no bundled font has ' + ' '.join(f'{chr(c)} (U+{c:04X})' for c in lost[:10])
+            + (f' and {len(lost) - 10} more' if len(lost) > 10 else '')
+        )
+    return warnings
+
+
+def markdown_to_pdf(text: str, output_path: str) -> List[str]:
+    """Convert markdown to PDF format with real formatting. Returns the
+    export's warnings (empty when every character had a font)."""
     from fpdf import FPDF
 
     class SylphPDF(FPDF):
@@ -414,11 +491,12 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
 
         def footer(self):
             self.set_y(-15)
-            self.set_font('Helvetica', 'I', 8)
+            self.set_font(_SANS, 'I', 8)
             self.set_text_color(128, 128, 128)
             self.cell(0, 10, f'Page {self.page_no()}/{{nb}}', align='C')
 
     pdf = SylphPDF()
+    _pdf_setup_fonts(pdf)
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
@@ -435,9 +513,9 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
         elif btype == 'heading':
             level = block['level']
             size = max(24 - (level - 1) * 3, 12)
-            pdf.set_font('Helvetica', 'B', size)
+            pdf.set_font(_SANS, 'B', size)
             pdf.set_text_color(0, 0, 0)
-            pdf.multi_cell(0, size * 0.5, _pdf_safe(block['text']))
+            pdf.multi_cell(0, size * 0.5, block['text'])
             pdf.ln(2)
 
         elif btype == 'paragraph':
@@ -446,20 +524,20 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
 
         elif btype == 'code_block':
             pdf.set_fill_color(245, 245, 245)
-            pdf.set_font('Courier', '', 9)
+            pdf.set_font(_MONO, '', 9)
             pdf.set_text_color(50, 50, 50)
-            code_text = _pdf_safe(block['text'])
+            code_text = block['text']
             # Escape special PDF characters
             code_text = code_text.replace('\\', '\\\\')
             pdf.multi_cell(0, 5, code_text, fill=True)
             pdf.ln(3)
 
         elif btype == 'blockquote':
-            pdf.set_font('Helvetica', 'I', 11)
+            pdf.set_font(_SANS, 'I', 11)
             pdf.set_text_color(100, 100, 100)
             bx = pdf.l_margin + 10
             pdf.set_x(bx)
-            pdf.multi_cell(pdf.w - pdf.r_margin - bx, 6, _pdf_safe(block['text']))
+            pdf.multi_cell(pdf.w - pdf.r_margin - bx, 6, block['text'])
             pdf.set_text_color(0, 0, 0)
             pdf.ln(3)
 
@@ -471,7 +549,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
 
         elif btype == 'ul':
             for item in block['items']:
-                pdf.set_font('Helvetica', '', 11)
+                pdf.set_font(_SANS, '', 11)
                 pdf.set_text_color(0, 0, 0)
                 pdf.set_x(pdf.l_margin)
                 # Core PDF fonts are latin-1 only: use '-' instead of '•'.
@@ -482,7 +560,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
 
         elif btype == 'ol':
             for idx, item in enumerate(block['items'], 1):
-                pdf.set_font('Helvetica', '', 11)
+                pdf.set_font(_SANS, '', 11)
                 pdf.set_text_color(0, 0, 0)
                 pdf.set_x(pdf.l_margin)
                 pdf.cell(8, 6, f'{idx}.')
@@ -496,26 +574,7 @@ def markdown_to_pdf(text: str, output_path: str) -> bool:
                 _pdf_table(pdf, rows)
                 pdf.ln(2)
 
-    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    pdf.output(output_path)
-    return True
-
-
-def _pdf_safe(text: str) -> str:
-    """Core PDF fonts are latin-1: map common unicode to ASCII fallbacks."""
-    return (
-        text.replace('—', '--')
-        .replace('–', '-')
-        .replace('•', '-')
-        .replace('─', '-')
-        .replace('“', '"')
-        .replace('”', '"')
-        .replace('‘', "'")
-        .replace('’', "'")
-        .replace('…', '...')
-        .encode('latin-1', errors='replace')
-        .decode('latin-1')
-    )
+    return _pdf_output(pdf, output_path, text)
 
 
 def _pdf_table(pdf, rows, col_widths=None):
@@ -545,7 +604,7 @@ def _pdf_table(pdf, rows, col_widths=None):
         for row in rows:
             cells = table.row()
             for ci in range(num_cols):
-                cells.cell(_pdf_safe(row[ci] if ci < len(row) else ''))
+                cells.cell(row[ci] if ci < len(row) else '')
 
 
 def _render_inline_pdf(pdf, text: str, indent: int = 0):
@@ -557,19 +616,19 @@ def _render_inline_pdf(pdf, text: str, indent: int = 0):
         if not seg_text:
             continue
         if styles.get('code', False):
-            pdf.set_font('Courier', '', 10)
+            pdf.set_font(_MONO, '', 10)
             pdf.set_text_color(200, 50, 50)
         elif styles.get('bold') and styles.get('italic'):
-            pdf.set_font('Helvetica', 'BI', 11)
+            pdf.set_font(_SANS, 'BI', 11)
             pdf.set_text_color(0, 0, 0)
         elif styles.get('bold'):
-            pdf.set_font('Helvetica', 'B', 11)
+            pdf.set_font(_SANS, 'B', 11)
             pdf.set_text_color(0, 0, 0)
         elif styles.get('italic'):
-            pdf.set_font('Helvetica', 'I', 11)
+            pdf.set_font(_SANS, 'I', 11)
             pdf.set_text_color(0, 0, 0)
         else:
-            pdf.set_font('Helvetica', '', 11)
+            pdf.set_font(_SANS, '', 11)
             pdf.set_text_color(0, 0, 0)
 
         if indent > 0:
@@ -578,18 +637,10 @@ def _render_inline_pdf(pdf, text: str, indent: int = 0):
             x = pdf.l_margin + indent
             w = pdf.w - pdf.r_margin - x
             pdf.set_x(x)
-            pdf.multi_cell(w, 6, _pdf_safe(seg_text))
+            pdf.multi_cell(w, 6, seg_text)
         else:
             pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(0, 6, _pdf_safe(seg_text))
-
-
-def markdown_to_markdown(text: str, output_path: str) -> bool:
-    """Save markdown text to a .md file (identity export)."""
-    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(text)
-    return True
+            pdf.multi_cell(0, 6, seg_text)
 
 
 # Portrait page sizes in points, mirroring sylph-core's PageSize::dimensions().
@@ -645,7 +696,7 @@ _HEADING_METRICS_PT = {
 # The canvas lays heading rows out at 1.4 × their size.
 _HEADING_LINE_FACTOR = 1.4
 # Body type for documents that omit it: sylph-core's Document::new().
-_DEFAULT_BODY_FONT = 'Noto Serif'
+_DEFAULT_BODY_FONT = 'EB Garamond'
 _DEFAULT_BODY_SIZE = 11.0
 _DEFAULT_LINE_SPACING = 1.15
 # Paragraph gap when a block carries no style (ParagraphStyle's default).
@@ -696,22 +747,22 @@ def _apply_typography_docx(doc, doc_data: dict):
 
 
 def _pdf_family(font_name: str) -> str:
-    """The core PDF font standing in for the document's typeface. fpdf2 has
-    only the 14 standard fonts unless a TTF is registered, so serif faces
-    map to Times, monospace to Courier and everything else to Helvetica."""
+    """The bundled family standing in for the document's typeface: serif
+    faces map to EB Garamond, monospace to JetBrains Mono and everything
+    else to Hanken Grotesk (fonts that are not bundled cannot be embedded)."""
     name = (font_name or '').lower()
     if 'mono' in name or 'courier' in name:
-        return 'Courier'
+        return _MONO
     serif_faces = ('serif', 'garamond', 'georgia', 'times', 'cambria', 'palatino', 'baskerville')
     if 'sans' not in name and any(face in name for face in serif_faces):
-        return 'Times'
-    return 'Helvetica'
+        return _SERIF
+    return _SANS
 
 
 def _pdf_body(pdf):
     """(family, size pt, line spacing) that rich_pdf set on this PDF."""
     return (
-        getattr(pdf, 'sylph_family', 'Helvetica'),
+        getattr(pdf, 'sylph_family', _SANS),
         getattr(pdf, 'sylph_size', _DEFAULT_BODY_SIZE),
         getattr(pdf, 'sylph_spacing', _DEFAULT_LINE_SPACING),
     )
@@ -1014,8 +1065,9 @@ def _render_cover_page_docx(doc, data: dict):
     doc.add_page_break()
 
 
-def rich_pdf(doc_json: str, output_path: str) -> bool:
-    """Export a rich document (JSON) to PDF format."""
+def rich_pdf(doc_json: str, output_path: str) -> List[str]:
+    """Export a rich document (JSON) to PDF format. Returns the export's
+    warnings (empty when every character had a font)."""
     import json
     from fpdf import FPDF
 
@@ -1032,7 +1084,7 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
             # Centre the 10 mm page-number cell in the bottom margin so it
             # never overlaps body text, whatever the margin preset.
             self.set_y(-(bottom_mm / 2 + 5))
-            self.set_font('Helvetica', 'I', 8)
+            self.set_font(_SANS, 'I', 8)
             self.set_text_color(128, 128, 128)
             self.cell(0, 10, f'Page {self.page_no()}/{{nb}}', align='C')
 
@@ -1040,6 +1092,7 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
     pdf.set_margins(
         margins['left'] * _MM_PER_PT, margins['top'] * _MM_PER_PT, margins['right'] * _MM_PER_PT
     )
+    _pdf_setup_fonts(pdf)
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=bottom_mm)
     # Body type for the block renderers (read back through _pdf_body).
@@ -1050,9 +1103,7 @@ def rich_pdf(doc_json: str, output_path: str) -> bool:
     for block in doc_data.get('blocks', []):
         _render_block_pdf(pdf, block)
 
-    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    pdf.output(output_path)
-    return True
+    return _pdf_output(pdf, output_path, doc_data)
 
 
 def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0, 0, 0)):
@@ -1072,7 +1123,7 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
         styles = run_data.get('styles', [])
         url = _link_url(styles)
         if 'Code' in styles:
-            pdf.set_font('Courier', '', size - 1)
+            pdf.set_font(_MONO, '', size - 1)
             pdf.set_text_color(200, 50, 50)
         elif 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
             pdf.set_font(family, 'BI', size)
@@ -1090,10 +1141,10 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
             pdf.set_text_color(0, 90, 180)
             # write() keeps runs on the same flowing line; multi_cell()
             # per run would stack each run on its own line.
-            pdf.write(line_h, _pdf_safe(text), link=url)
+            pdf.write(line_h, text, link=url)
             pdf.set_text_color(*default_color)
         else:
-            pdf.write(line_h, _pdf_safe(text))
+            pdf.write(line_h, text)
 
 
 def _render_block_pdf(pdf, block: dict):
@@ -1111,7 +1162,7 @@ def _render_block_pdf(pdf, block: dict):
         pdf.set_font(family, 'B', size)
         pdf.set_text_color(0, 0, 0)
         text = ''.join(r['text'] for r in h.get('runs', []))
-        pdf.multi_cell(pdf.epw, _pdf_line_height(size, _HEADING_LINE_FACTOR), _pdf_safe(text))
+        pdf.multi_cell(pdf.epw, _pdf_line_height(size, _HEADING_LINE_FACTOR), text)
         pdf.ln(after * _MM_PER_PT)
     elif 'Paragraph' in block:
         p = block['Paragraph']
@@ -1137,32 +1188,32 @@ def _render_block_pdf(pdf, block: dict):
                     pdf.set_x(pdf.l_margin)
                     _pdf_font(pdf, 'I', -2)
                     pdf.set_text_color(100, 100, 100)
-                    pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
+                    pdf.cell(pdf.epw, 5, caption, align='C')
                     pdf.ln(3)
                 pdf.ln(3)
             except Exception:
                 pdf.set_x(pdf.l_margin)
                 _pdf_font(pdf, '', -1)
-                pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
+                pdf.cell(pdf.epw, 6, f'[Image: {path}]')
                 pdf.ln(3)
                 caption = img_data.get('caption')
                 if caption:
                     pdf.set_x(pdf.l_margin)
                     _pdf_font(pdf, 'I', -2)
                     pdf.set_text_color(100, 100, 100)
-                    pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
+                    pdf.cell(pdf.epw, 5, caption, align='C')
                     pdf.ln(3)
         else:
             pdf.set_x(pdf.l_margin)
             _pdf_font(pdf, '', -1)
-            pdf.cell(pdf.epw, 6, _pdf_safe(f'[Image: {path}]'))
+            pdf.cell(pdf.epw, 6, f'[Image: {path}]')
             pdf.ln(3)
             caption = img_data.get('caption')
             if caption:
                 pdf.set_x(pdf.l_margin)
                 _pdf_font(pdf, 'I', -2)
                 pdf.set_text_color(100, 100, 100)
-                pdf.cell(pdf.epw, 5, _pdf_safe(caption), align='C')
+                pdf.cell(pdf.epw, 5, caption, align='C')
                 pdf.ln(3)
     elif 'Table' in block:
         _render_table_pdf(pdf, block['Table']['data'])
@@ -1170,7 +1221,7 @@ def _render_block_pdf(pdf, block: dict):
         pdf.set_x(pdf.l_margin)
         _pdf_font(pdf, 'I', -2)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(pdf.epw, 5, _pdf_safe(block['Caption']['text']))
+        pdf.cell(pdf.epw, 5, block['Caption']['text'])
         pdf.ln(3)
     elif 'HorizontalRule' in block:
         pdf.set_x(pdf.l_margin)
@@ -1218,7 +1269,7 @@ def _render_list_pdf(pdf, list_data: dict):
         pdf.set_x(pdf.l_margin + 6.0 * (level + 1))
         _pdf_font(pdf)
         pdf.set_text_color(0, 0, 0)
-        pdf.write(_pdf_line_height(size, spacing), _pdf_safe(marker))
+        pdf.write(_pdf_line_height(size, spacing), marker)
         _write_pdf_runs(pdf, item.get('runs', []))
         # One line per item, as on the canvas: no gap between items.
         pdf.ln(_pdf_line_height(size, spacing))
@@ -1244,9 +1295,9 @@ def _render_code_block_pdf(pdf, code_data: dict):
     text = code_data.get('text', '')
     for line in text.split('\n'):
         pdf.set_x(pdf.l_margin + 6.0)
-        pdf.set_font('Courier', '', 9.5)
+        pdf.set_font(_MONO, '', 9.5)
         pdf.set_text_color(40, 40, 40)
-        pdf.multi_cell(pdf.epw - 6.0, 5, _pdf_safe(line) or ' ')
+        pdf.multi_cell(pdf.epw - 6.0, 5, line or ' ')
     pdf.ln(4)
 
 
@@ -1275,7 +1326,7 @@ def _render_cover_page_pdf(pdf, data: dict):
             pdf.set_font(_pdf_body(pdf)[0], 'B', 30)
         pdf.set_text_color(0, 0, 0)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(pdf.epw, 15, _pdf_safe(data['title']), align='C')
+        pdf.cell(pdf.epw, 15, data['title'], align='C')
         pdf.ln(15)
 
     # Subtitle
@@ -1283,7 +1334,7 @@ def _render_cover_page_pdf(pdf, data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font(_pdf_body(pdf)[0], '', 16)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(pdf.epw, 10, _pdf_safe(data['subtitle']), align='C')
+        pdf.cell(pdf.epw, 10, data['subtitle'], align='C')
         pdf.ln(15)
 
     pdf.ln(20)
@@ -1293,7 +1344,7 @@ def _render_cover_page_pdf(pdf, data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font(_pdf_body(pdf)[0], '', 14)
         pdf.set_text_color(0, 0, 0)
-        pdf.cell(pdf.epw, 10, _pdf_safe(data['author']), align='C')
+        pdf.cell(pdf.epw, 10, data['author'], align='C')
         pdf.ln(10)
 
     # Date
@@ -1301,7 +1352,7 @@ def _render_cover_page_pdf(pdf, data: dict):
         pdf.set_x(pdf.l_margin)
         pdf.set_font(_pdf_body(pdf)[0], '', 12)
         pdf.set_text_color(128, 128, 128)
-        pdf.cell(pdf.epw, 10, _pdf_safe(data['date']), align='C')
+        pdf.cell(pdf.epw, 10, data['date'], align='C')
         pdf.ln(10)
 
     pdf.add_page()
@@ -1326,7 +1377,7 @@ def _render_table_pdf(pdf, table_data: dict):
         pdf.set_x(pdf.l_margin)
         _pdf_font(pdf, 'I', -2)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, 5, _pdf_safe(caption), align='C')
+        pdf.cell(0, 5, caption, align='C')
         pdf.ln(3)
 
     pdf.ln(3)
