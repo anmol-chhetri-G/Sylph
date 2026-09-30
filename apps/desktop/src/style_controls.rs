@@ -333,6 +333,92 @@ impl SylphApp {
         row.into_any_element()
     }
 
+    /// Put the caret at the top of body page `page` (0-based), as clicking
+    /// a page in Docs' page list does. `false` when that page has no text.
+    pub(crate) fn go_to_page(
+        &mut self,
+        page: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let editor = self.editor.read(cx);
+        let Some(flow) = editor.page_flow else {
+            return false;
+        };
+        let rows = editor.row_metas.iter().map(|row| {
+            let offset = editor
+                .display_lines
+                .get(row.line_idx)
+                .map_or(row.src_start, |dl| {
+                    dl.src_offset + dl.disp_to_src(row.disp_start)
+                });
+            (f32::from(row.box_top), offset)
+        });
+        let Some(offset) = crate::pagination::first_row_on_page(&flow, rows, page) else {
+            return false;
+        };
+        self.go_to_offset(offset, window, cx);
+        true
+    }
+
+    /// The navigator's Pages list: a tile per page, the caret's page
+    /// highlighted; clicking a body page moves the caret to its top.
+    pub(crate) fn page_tiles(&self, count: usize, cx: &mut Context<Self>) -> Div {
+        let cover = usize::from(self.document.has_cover_page());
+        let current = cover + self.editor.read(cx).cursor_page;
+        let (primary, muted, border) = (self.ui_primary(), self.ui_muted(), self.ui_border());
+        let page_w: f32 = self.page_width().into();
+        let page_h: f32 = self.page_height().into();
+        let tile_w = 96.0;
+        let tile_h = tile_w * page_h / page_w.max(1.0);
+        let mut list = div()
+            .mt(px(10.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(12.0));
+        for index in 0..count {
+            let active = index == current;
+            let is_cover = index < cover;
+            let tile = div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.0))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(tile_w))
+                        .h(px(tile_h))
+                        .bg(self.ui_page())
+                        .border_2()
+                        .border_color(if active { primary } else { border })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(is_cover, |t| t.child(label("Cover", muted, 10.0))),
+                )
+                .child(label(
+                    (index + 1).to_string(),
+                    if active { primary } else { muted },
+                    11.0,
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        if is_cover {
+                            return;
+                        }
+                        if !this.go_to_page(index - cover, window, cx) {
+                            this.set_status("That page has no text to put the cursor in", cx);
+                        }
+                    }),
+                );
+            list = list.child(tile);
+        }
+        list
+    }
+
     /// The inspector's Before/After field: − value + in 2 pt steps, for
     /// every paragraph of the caret's style.
     pub(crate) fn spacing_stepper(&self, before: bool, value: f32, cx: &mut Context<Self>) -> Div {
@@ -440,6 +526,21 @@ mod tests {
         assert_eq!(crate::display_line("Body", false, true).heading, 0);
         assert_eq!(crate::display_line("# Title", false, false).heading, 0);
         assert_eq!(crate::display_line("# Title", true, true).heading, 0);
+    }
+
+    #[test]
+    fn page_breaks_draw_as_breaks_in_both_modes() {
+        for markdown in [true, false] {
+            let dl = crate::display_line("\\newpage", false, markdown);
+            assert_eq!(
+                dl.kind,
+                crate::DisplayKind::PageBreak,
+                "markdown {markdown}"
+            );
+            assert!(dl.text.is_empty());
+        }
+        // Other lines stay literal with Markdown off.
+        assert_eq!(crate::display_line("# a", false, false).text, "# a");
     }
 
     #[test]

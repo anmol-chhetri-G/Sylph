@@ -829,6 +829,15 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        // A page break is one unit, as in Word: removed whole, never
+        // merged into the next line as text.
+        if self.selected_range.is_empty() {
+            if let Some(range) =
+                pagination::backspace_page_break(&self.content, self.cursor_offset())
+            {
+                return self.replace_text_in_range(Some(range), "", cx);
+            }
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -840,6 +849,12 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            if let Some(range) = pagination::delete_page_break(&self.content, self.cursor_offset())
+            {
+                return self.replace_text_in_range(Some(range), "", cx);
+            }
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -1430,6 +1445,7 @@ impl Element for TextElement {
         let flow = input.page_flow;
         let input_rev = input.content_rev;
         let input_followed = input.followed;
+        let input_page_count = input.page_count;
         let canvas_scroll = input.canvas_scroll.clone();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
@@ -1824,6 +1840,11 @@ impl Element for TextElement {
             ),
             None => (1, 0),
         };
+        // The page sheets are drawn from the previous layout's count: when
+        // text first flows onto a new page (or leaves one), draw again.
+        if page_count != input_page_count {
+            window.refresh();
+        }
         self.input.update(cx, |input, _cx| {
             input.followed = follow_key;
             input.page_count = page_count;
@@ -2749,7 +2770,22 @@ impl SylphApp {
     }
 
     fn load_document_by_id(&mut self, doc_id: i64, cx: &mut Context<Self>) {
-        let (saved, read_only) = load_text_or_read_only(&self.editor.read(cx).storage, doc_id);
+        let (mut saved, read_only) = load_text_or_read_only(&self.editor.read(cx).storage, doc_id);
+        // Each document keeps its own page setup, cover page and inserted
+        // blocks, so nothing leaks from the previous document.
+        let (mut model, warning) = load_model_or_default(
+            &self.editor.read(cx).storage,
+            doc_id,
+            recovered_dir().as_deref(),
+        );
+        if read_only.is_none() {
+            migrate_page_breaks(
+                &self.editor.read(cx).storage,
+                doc_id,
+                &mut model,
+                &mut saved,
+            );
+        }
         let doc_title = self
             .editor
             .read(cx)
@@ -2774,13 +2810,6 @@ impl SylphApp {
             editor.read_only = read_only.clone();
             cx.notify();
         });
-        // Each document keeps its own page setup, cover page and inserted
-        // blocks, so nothing leaks from the previous document.
-        let (model, warning) = load_model_or_default(
-            &self.editor.read(cx).storage,
-            doc_id,
-            recovered_dir().as_deref(),
-        );
         self.persisted_model = model.clone();
         self.document = model;
         self.sync_markdown_mode(cx);
@@ -4765,6 +4794,11 @@ fn heading_metrics(level: u8) -> (f32, f32, f32) {
 /// transform (display == source) so nothing is parsed or hidden.
 fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
     if !markdown_on {
+        // The page-break marker is Sylph's, not Markdown: it breaks the
+        // page in both modes, so it draws as a break in both.
+        if pagination::is_page_break_line(line) {
+            return display_line(line, false, true);
+        }
         return DisplayLine::identity(0, line, in_fence);
     }
 
@@ -5478,6 +5512,24 @@ fn export_page_count(model: &doc::Document) -> usize {
         .count()
 }
 
+/// Move old page-break blocks into the text (see
+/// `pagination::move_page_breaks_into_text`) and save both together, so
+/// the move happens once.
+fn migrate_page_breaks(
+    storage: &Storage,
+    doc_id: i64,
+    model: &mut doc::Document,
+    text: &mut String,
+) {
+    if pagination::move_page_breaks_into_text(model, text) == 0 {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&*model) {
+        // A failed save leaves both as stored; the move is redone next time.
+        let _ = storage.save_snapshot(doc_id, text, Some(&json));
+    }
+}
+
 /// Where unreadable saved models are copied before defaults replace them.
 fn recovered_dir() -> Option<PathBuf> {
     sylph_storage::data_dir()
@@ -5826,12 +5878,15 @@ fn main() {
                     // Reopen what was open last time instead of adding a new
                     // empty "Untitled" on every launch.
                     let doc_id = storage.open_last_or_create().unwrap_or(1);
-                    let (saved, read_only) = load_text_or_read_only(&storage, doc_id);
+                    let (mut saved, read_only) = load_text_or_read_only(&storage, doc_id);
                     let doc_title = storage
                         .get_title(doc_id)
                         .unwrap_or_else(|_| "Untitled".to_string());
-                    let (document, model_warning) =
+                    let (mut document, model_warning) =
                         load_model_or_default(&storage, doc_id, recovered_dir().as_deref());
+                    if read_only.is_none() {
+                        migrate_page_breaks(&storage, doc_id, &mut document, &mut saved);
+                    }
 
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
@@ -6738,9 +6793,11 @@ mod markdown_wysiwyg_tests {
         assert_eq!(page_break.kind, DisplayKind::PageBreak);
         assert!(page_break.text.is_empty());
 
-        let literal = off("\\newpage");
-        assert_eq!(literal.kind, DisplayKind::Paragraph);
-        assert_eq!(literal.text, "\\newpage");
+        // Markdown OFF exports the marker as a page break too (it is
+        // Sylph's own, not Markdown), so the canvas draws it as one.
+        let off_break = off("\\newpage");
+        assert_eq!(off_break.kind, DisplayKind::PageBreak);
+        assert!(off_break.text.is_empty());
 
         let fenced = display_line("\\newpage", true, true);
         assert_eq!(fenced.kind, DisplayKind::Code);

@@ -33,6 +33,7 @@ editing.
 | Export quality (author request) | done | PDF: no mid-word breaks at font changes, real bullets, strikethrough, task boxes; DOCX: headings bold and black, Word 2013+ mode; three more bundled fonts (Source Serif 4, Lora, Inter) |
 | Style size and paragraph spacing (author request) | done | size box, Space before/after act on the caret's style; canvas spaces Normal paragraphs where the export does |
 | Print-layout pagination (author request) | done | rows flow page to page (overflow and `\newpage`); click any page to put the caret there; Ctrl+Enter breaks at the caret; the canvas follows the caret |
+| Page breaks like Word (author request) | done | Backspace/Delete remove a break whole; old break blocks move into the text on load; break marker drawn in both modes; Pages tab jumps to a page; cover page has a Remove button |
 | everything else | open | |
 
 ## Next: formatting on a paragraph or a selection (proposed, needs the author's go-ahead)

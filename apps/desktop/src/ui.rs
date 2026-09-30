@@ -448,7 +448,7 @@ impl SylphApp {
         }
     }
 
-    fn ui_page(&self) -> Rgba {
+    pub(crate) fn ui_page(&self) -> Rgba {
         if self.dark_mode {
             rgb(0x111c2e)
         } else {
@@ -489,12 +489,12 @@ impl SylphApp {
     }
 
     /// Returns width in pixels for the current page size + orientation.
-    fn page_width(&self) -> Pixels {
+    pub(crate) fn page_width(&self) -> Pixels {
         px(self.document.page_width() * 96.0 / 72.0)
     }
 
     /// Returns height in pixels for the current page size + orientation.
-    fn page_height(&self) -> Pixels {
+    pub(crate) fn page_height(&self) -> Pixels {
         px(self.document.page_height() * 96.0 / 72.0)
     }
 
@@ -1748,35 +1748,7 @@ impl SylphApp {
                         label(format!("PAGES ({})", count), muted, 11.0)
                             .font_weight(gpui::FontWeight(600.0)),
                     )
-                    .child(div().py(px(6.0)).child(label(
-                        "Page thumbnails aren’t available yet.",
-                        muted,
-                        11.0,
-                    )))
-                    .child(
-                        div()
-                            .mt(px(10.0))
-                            .w(px(150.0))
-                            .h(px(194.0))
-                            .mx_auto()
-                            .border_2()
-                            .border_color(primary)
-                            .bg(self.ui_page())
-                            .child(
-                                div()
-                                    .m(px(14.0))
-                                    .h(px(6.0))
-                                    .w(px(70.0))
-                                    .bg(self.ui_panel_high()),
-                            )
-                            .child(
-                                label("P.1", primary, 10.0)
-                                    .absolute()
-                                    .right(px(8.0))
-                                    .top(px(8.0)),
-                            ),
-                    )
-                    .child(label("1", primary, 11.0).text_center());
+                    .child(self.page_tiles(count, cx));
             }
             NavigatorTab::Assets => {
                 body =
@@ -2086,7 +2058,38 @@ impl SylphApp {
             // The document's own typeface, like the body text below it.
             .font_family(self.document.body_font.clone())
             .shadow_md()
+            .relative()
             .child(self.cover_fields(cover, cx))
+            // Word's "Remove Current Cover Page", on the page itself.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(12.0))
+                    .right(px(12.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(self.ui_border())
+                    .bg(self.surface_color())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(self.hover_color()))
+                    .child(
+                        label("✕  Remove cover page", self.ui_muted(), 11.0).font_family(UI_FONT),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.document.remove_cover_page();
+                            this.set_status(
+                                "Cover page removed · Insert → Cover page adds one back",
+                                cx,
+                            );
+                            cx.notify();
+                        }),
+                    ),
+            )
     }
 
     /// The body pages of print layout: page sheets stacked with a gap,
