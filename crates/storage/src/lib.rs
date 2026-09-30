@@ -20,15 +20,23 @@ CREATE TABLE IF NOT EXISTS app_state (
 CREATE TABLE IF NOT EXISTS document_models (
     document_id INTEGER PRIMARY KEY REFERENCES documents(id),
     model_json TEXT NOT NULL
-);";
+);
+CREATE INDEX IF NOT EXISTS crdt_updates_by_doc ON crdt_updates(document_id, id);";
+
+/// Saves closer together than this rewrite the document's newest row
+/// instead of adding one, so autosave (a save after every pause in typing)
+/// adds about 12 rows per editing hour, not thousands. Interim cap until
+/// the new schema (plan 3.4).
+const GROWTH_WINDOW_SECS: i64 = 300;
 
 /// Platform data directory for Sylph (database, exports, images).
 /// Not relative to the launch cwd: starting the app from another folder
 /// must not scatter or lose its files.
-pub fn data_dir() -> PathBuf {
+/// An error, never a guess like ".", when the platform has none.
+pub fn data_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("sylph")
+        .map(|dir| dir.join("sylph"))
+        .ok_or_else(|| "no data directory (set HOME or XDG_DATA_HOME)".into())
 }
 
 pub struct Storage {
@@ -60,26 +68,115 @@ pub struct DocumentSummary {
 impl Storage {
     /// Open the database in the platform data directory.
     pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::open_in(data_dir())
+        Self::open_at(data_dir()?)
     }
 
     /// Open a database inside `dir` (created if missing). Tests use this
     /// with a private temp dir so they never touch the real user data.
-    pub fn open_in(dir: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn open_at(dir: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let conn = Connection::open(dir.join("sylph.db"))?;
+        // WAL: a crash mid-write never leaves a torn database, and readers
+        // don't block the writer. The pragma answers with the mode it got.
+        let mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(format!("could not enable WAL (journal_mode is {mode})").into());
+        }
+        Self::configure(conn)
+    }
+
+    /// Durability and integrity settings shared by every connection, then
+    /// the schema.
+    fn configure(conn: Connection) -> Result<Self, Box<dyn std::error::Error>> {
+        // FULL: a save that returned Ok survives a power cut.
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
 
-    /// Working in-memory database; the fallback when the data dir cannot
-    /// be opened (read-only system, missing permissions).
-    fn in_memory() -> Self {
+    /// A working database that lives only in memory: nothing written to it
+    /// survives the process. For tests, and for running on when the real
+    /// database cannot open, where the caller must show that nothing is
+    /// being saved. There is deliberately no `Default`: falling back to
+    /// this silently is how an app pretends to save.
+    pub fn in_memory() -> Self {
         let conn = Connection::open(":memory:").expect("Failed to open in-memory database");
-        conn.execute_batch(SCHEMA)
-            .expect("Failed to create in-memory tables");
-        Self { conn }
+        Self::configure(conn).expect("Failed to create in-memory tables")
+    }
+
+    /// Run `f` inside one `BEGIN IMMEDIATE … COMMIT`: either every write
+    /// in it lands or none does.
+    fn in_transaction<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(&self.conn) {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Record `blob` as the document's newest save. A newest row younger
+    /// than `GROWTH_WINDOW_SECS` is replaced (keeping its `created_at`, so
+    /// the window can't slide forever) unless `new_revision` asks for a
+    /// fresh row. Replacing deletes and re-inserts, so row ids keep
+    /// following save order across documents.
+    fn write_save(
+        conn: &Connection,
+        doc_id: i64,
+        blob: &[u8],
+        new_revision: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let recent: Option<(i64, String)> = if new_revision {
+            None
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, created_at FROM crdt_updates
+                 WHERE document_id = ?1
+                   AND created_at > datetime('now', ?2)
+                   AND id = (SELECT max(id) FROM crdt_updates WHERE document_id = ?1)",
+            )?;
+            let mut rows = stmt.query(params![doc_id, format!("-{GROWTH_WINDOW_SECS} seconds")])?;
+            match rows.next()? {
+                Some(row) => Some((row.get(0)?, row.get(1)?)),
+                None => None,
+            }
+        };
+        match recent {
+            Some((id, created_at)) => {
+                conn.execute("DELETE FROM crdt_updates WHERE id = ?1", params![id])?;
+                conn.execute(
+                    "INSERT INTO crdt_updates (document_id, update_blob, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![doc_id, blob, created_at],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO crdt_updates (document_id, update_blob) VALUES (?1, ?2)",
+                    params![doc_id, blob],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE documents SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![doc_id],
+        )?;
+        Ok(())
     }
 
     pub fn save_document(
@@ -87,15 +184,32 @@ impl Storage {
         doc_id: i64,
         crdt_update: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.conn.execute(
-            "INSERT INTO crdt_updates (document_id, update_blob) VALUES (?1, ?2)",
-            params![doc_id, crdt_update],
-        )?;
-        self.conn.execute(
-            "UPDATE documents SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![doc_id],
-        )?;
-        Ok(())
+        self.in_transaction(|conn| Self::write_save(conn, doc_id, crdt_update, false))
+    }
+
+    /// Save the text and, when given, the structured model in one
+    /// transaction: a failure leaves both as they were, never one new and
+    /// one old.
+    pub fn save_snapshot(
+        &self,
+        doc_id: i64,
+        text: &str,
+        model_json: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.in_transaction(|conn| {
+            Self::write_save(conn, doc_id, text.as_bytes(), false)?;
+            if let Some(json) = model_json {
+                Self::write_model(conn, doc_id, json)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Save `text` as a version of its own, never folded into the newest
+    /// row: restoring an old version must not overwrite the text it
+    /// replaces in the history.
+    pub fn save_revision(&self, doc_id: i64, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.in_transaction(|conn| Self::write_save(conn, doc_id, text.as_bytes(), true))
     }
 
     pub fn load_document(
@@ -246,11 +360,19 @@ impl Storage {
         doc_id: i64,
         model_json: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.conn.execute(
+        self.in_transaction(|conn| Self::write_model(conn, doc_id, model_json))
+    }
+
+    fn write_model(
+        conn: &Connection,
+        doc_id: i64,
+        model_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        conn.execute(
             "INSERT OR REPLACE INTO document_models (document_id, model_json) VALUES (?1, ?2)",
             params![doc_id, model_json],
         )?;
-        self.conn.execute(
+        conn.execute(
             "UPDATE documents SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![doc_id],
         )?;
@@ -332,12 +454,6 @@ impl Storage {
     }
 }
 
-impl Default for Storage {
-    fn default() -> Self {
-        Self::open().unwrap_or_else(|_| Self::in_memory())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +468,7 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
-        Storage::open_in(&dir).unwrap()
+        Storage::open_at(&dir).unwrap()
     }
 
     // ── Launch document ───────────────────────────────────────────
@@ -540,17 +656,168 @@ mod tests {
         assert_eq!(storage.load_model(b).unwrap(), None);
     }
 
+    // ── Durable, atomic, bounded saves ────────────────────────────
+
+    fn row_count(storage: &Storage, doc_id: i64) -> i64 {
+        storage
+            .conn
+            .query_row(
+                "SELECT count(*) FROM crdt_updates WHERE document_id = ?1",
+                params![doc_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_open_enables_wal_and_foreign_keys() {
+        let storage = temp_storage();
+        let mode: String = storage
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let fk: i64 = storage
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+        let sync: i64 = storage
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous must be FULL");
+    }
+
+    #[test]
+    fn test_snapshot_is_all_or_nothing() {
+        let storage = temp_storage();
+        let id = storage.create_document("Doc").unwrap();
+        storage.save_text(id, "before").unwrap();
+        storage
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_model BEFORE INSERT ON document_models
+                 BEGIN SELECT RAISE(ABORT, 'x'); END;",
+            )
+            .unwrap();
+        assert!(storage.save_snapshot(id, "after", Some("{}")).is_err());
+        assert_eq!(storage.load_text(id).unwrap().as_deref(), Some("before"));
+        assert_eq!(row_count(&storage, id), 1);
+        assert_eq!(storage.load_model(id).unwrap(), None);
+        // The connection is usable again after the rollback.
+        storage.save_snapshot(id, "text only", None).unwrap();
+        assert_eq!(storage.load_text(id).unwrap().as_deref(), Some("text only"));
+    }
+
+    #[test]
+    fn test_snapshot_saves_text_and_model_together() {
+        let storage = temp_storage();
+        let id = storage.create_document("Doc").unwrap();
+        storage
+            .save_snapshot(id, "body", Some("{\"m\":1}"))
+            .unwrap();
+        assert_eq!(storage.load_text(id).unwrap().as_deref(), Some("body"));
+        assert_eq!(
+            storage.load_model(id).unwrap().as_deref(),
+            Some("{\"m\":1}")
+        );
+    }
+
+    #[test]
+    fn test_autosaves_within_the_window_share_one_row() {
+        let storage = temp_storage();
+        let id = storage.create_document("Doc").unwrap();
+        for i in 0..100 {
+            storage.save_text(id, &format!("draft {i}")).unwrap();
+        }
+        assert_eq!(row_count(&storage, id), 1);
+        assert_eq!(storage.load_text(id).unwrap().as_deref(), Some("draft 99"));
+        // Six minutes later the next save starts a new version.
+        storage
+            .conn
+            .execute(
+                "UPDATE crdt_updates SET created_at = datetime(created_at, '-6 minutes')",
+                [],
+            )
+            .unwrap();
+        storage.save_text(id, "later").unwrap();
+        assert_eq!(row_count(&storage, id), 2);
+        assert_eq!(storage.load_text(id).unwrap().as_deref(), Some("later"));
+        let revisions = storage.list_revisions(id, 300).unwrap();
+        let texts: Vec<&str> = revisions.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["later", "draft 99"]);
+    }
+
+    #[test]
+    fn test_growth_cap_keeps_save_order_across_documents() {
+        // Rewriting a row must not leave it with an older id than a later
+        // save of another document: the launch picks the newest save.
+        let storage = temp_storage();
+        let a = storage.create_document("A").unwrap();
+        let b = storage.create_document("B").unwrap();
+        storage.save_text(a, "a1").unwrap();
+        storage.save_text(b, "b1").unwrap();
+        storage.save_text(a, "a2").unwrap();
+        assert_eq!(row_count(&storage, a), 1);
+        assert_eq!(storage.latest_document().unwrap(), Some(a));
+    }
+
+    #[test]
+    fn test_save_revision_always_adds_a_row() {
+        let storage = temp_storage();
+        let id = storage.create_document("Doc").unwrap();
+        storage.save_text(id, "current").unwrap();
+        storage.save_revision(id, "restored").unwrap();
+        assert_eq!(row_count(&storage, id), 2);
+        assert_eq!(storage.load_text(id).unwrap().as_deref(), Some("restored"));
+        let all: Vec<String> = storage
+            .conn
+            .prepare("SELECT update_blob FROM crdt_updates WHERE document_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![id], |row| {
+                Ok(String::from_utf8(row.get::<_, Vec<u8>>(0)?).unwrap())
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(all, ["current", "restored"]);
+    }
+
+    #[test]
+    fn test_save_to_a_missing_document_fails() {
+        let storage = temp_storage();
+        assert!(storage.save_text(4242, "orphan").is_err());
+    }
+
     // ── Construction ──────────────────────────────────────────────
 
     #[test]
     fn test_data_dir_is_not_relative_to_the_launch_cwd() {
-        let dir = data_dir();
+        let dir = data_dir().unwrap();
         assert!(
             dir.is_absolute(),
             "data dir must not depend on the launch cwd: {}",
             dir.display()
         );
         assert!(dir.ends_with("sylph"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_in_a_read_only_directory_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sylph-ro-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // root ignores permissions; the check only means something without it.
+        let writable = std::fs::write(dir.join("probe"), b"").is_ok();
+        let result = Storage::open_at(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        if !writable {
+            assert!(result.is_err(), "a read-only data dir must not open");
+        }
     }
 
     #[test]
@@ -668,23 +935,7 @@ mod tests {
 
     #[test]
     fn test_list_documents_empty() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL DEFAULT 'Untitled',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS crdt_updates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER REFERENCES documents(id),
-                update_blob BLOB NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );",
-        )
-        .unwrap();
-        let storage = Storage { conn };
+        let storage = temp_storage();
         let docs = storage.list_documents().unwrap();
         assert!(docs.is_empty());
     }
@@ -710,23 +961,7 @@ mod tests {
 
     #[test]
     fn test_list_documents_ordered_by_updated() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL DEFAULT 'Untitled',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS crdt_updates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER REFERENCES documents(id),
-                update_blob BLOB NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );",
-        )
-        .unwrap();
-        let storage = Storage { conn };
+        let storage = temp_storage();
         let id1 = storage.create_document("First").unwrap();
         let id2 = storage.create_document("Second").unwrap();
         let docs = storage.list_documents().unwrap();
