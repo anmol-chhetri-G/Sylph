@@ -1,13 +1,13 @@
 use crate::{
-    heading_level_and_text, heading_metrics_pt, AddCoverPage, BoldText, CloseOverlay,
-    ContextMenuCopy, ContextMenuCut, ContextMenuPaste, ContextMenuSelectAll, CycleBodyFont,
-    CycleHeading, EditingField, ExportFormat, FindAndReplace, FocusMode, Heading1, Heading2,
-    Heading3, Heading4, Heading5, Heading6, InsertPageBreak, InsertTable, InspectorMode,
-    ItalicText, NavigatorTab, NewDocument, NormalText, OpenCommandPalette, OpenExportDialog,
-    OpenFindBar, OpenPageSetup, PasteImage, PrintLayout, Redo, ReplaceAll, ReplaceCurrent, SaveDoc,
-    SaveState, ShowImageInspector, ShowParagraphInspector, ShowShortcuts, ShowVersionHistory,
-    StrikethroughText, SylphApp, ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler,
-    ToggleSidebar, Undo, WebLayout, WorkspaceOverlay,
+    heading_metrics_pt, AddCoverPage, BoldText, CloseOverlay, ContextMenuCopy, ContextMenuCut,
+    ContextMenuPaste, ContextMenuSelectAll, CycleBodyFont, CycleHeading, EditingField,
+    ExportFormat, FindAndReplace, FocusMode, Heading1, Heading2, Heading3, Heading4, Heading5,
+    Heading6, InsertPageBreak, InsertTable, InspectorMode, ItalicText, NavigatorTab, NewDocument,
+    NormalText, OpenCommandPalette, OpenExportDialog, OpenFindBar, OpenPageSetup, PasteImage,
+    PrintLayout, Redo, ReplaceAll, ReplaceCurrent, SaveDoc, SaveState, ShowImageInspector,
+    ShowParagraphInspector, ShowShortcuts, ShowVersionHistory, StrikethroughText, SylphApp,
+    ToggleDarkMode, ToggleInspector, ToggleMarkdownMode, ToggleRuler, ToggleSidebar, Undo,
+    WebLayout, WorkspaceOverlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -15,8 +15,8 @@ use gpui::{
     Rgba, Stateful, Window,
 };
 
-const UI_FONT: &str = "Hanken Grotesk";
-const PROSE_FONT: &str = "EB Garamond";
+pub(crate) const UI_FONT: &str = "Hanken Grotesk";
+pub(crate) const PROSE_FONT: &str = "EB Garamond";
 pub(crate) const MONO_FONT: &str = "JetBrains Mono";
 
 /// One entry of a menu-bar menu.
@@ -299,14 +299,21 @@ impl SylphApp {
     fn open_command_palette(
         &mut self,
         _: &OpenCommandPalette,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.overlay = WorkspaceOverlay::CommandPalette;
+        self.palette = crate::PaletteState::default();
+        // The palette takes the keyboard, so typing filters commands
+        // instead of reaching the document.
+        window.focus(&self.focus_handle);
         cx.notify();
     }
 
     fn close_overlay(&mut self, _: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay == WorkspaceOverlay::CommandPalette {
+            self.close_palette(window, cx);
+        }
         self.overlay = WorkspaceOverlay::None;
         self.context_menu.visible = false;
         self.open_menu = None;
@@ -343,7 +350,7 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn show_image_inspector(
+    pub(crate) fn show_image_inspector(
         &mut self,
         _: &ShowImageInspector,
         _window: &mut Window,
@@ -382,10 +389,16 @@ impl SylphApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.markdown_mode = !self.markdown_mode;
-        // The toggle is the single source of truth: the canvas follows it
-        // (ON = WYSIWYG with hidden syntax, OFF = literal source).
-        let on = self.markdown_mode;
+        // Stored in the document model, so it is saved with the document.
+        self.document.markdown = !self.document.markdown;
+        self.sync_markdown_mode(cx);
+    }
+
+    /// Make the canvas and the export follow the document's Markdown flag
+    /// (ON = WYSIWYG with hidden syntax, OFF = literal source).
+    pub(crate) fn sync_markdown_mode(&mut self, cx: &mut Context<Self>) {
+        let on = self.document.markdown;
+        self.markdown_mode = on;
         self.editor.update(cx, |editor, cx| {
             editor.markdown_mode = on;
             cx.notify();
@@ -575,8 +588,10 @@ impl SylphApp {
             .child(text.into())
     }
 
-    fn title_bar(&self, _window: &mut Window) -> Div {
-        let title = if self.doc_title.is_empty() {
+    fn title_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let title = if self.editing_title {
+            format!("{}▏", self.doc_title)
+        } else if self.doc_title.is_empty() {
             "Untitled — Sylph".to_string()
         } else {
             format!("{} — Sylph", self.doc_title)
@@ -601,13 +616,25 @@ impl SylphApp {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    // The logo returns with an embedded asset (plan task 7.1):
+                    // a relative string path is fetched as a URL and never drew.
                     .child(
-                        img("assets/icons/sylph-logo.png")
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .rounded(px(2.0)),
-                    )
-                    .child(label(title, title_color, 12.0)),
+                        label(title, title_color, 12.0)
+                            .px(px(4.0))
+                            .rounded(px(3.0))
+                            .when(self.editing_title, |t| t.bg(rgb(0x334155)))
+                            // Double-click renames; a single press still
+                            // drags the window like the rest of the bar.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                                    if event.click_count == 2 {
+                                        cx.stop_propagation();
+                                        this.start_title_edit(window, cx);
+                                    }
+                                }),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -672,6 +699,7 @@ impl SylphApp {
                 "File",
                 vec![
                     Item("New document", Box::new(NewDocument), None),
+                    Item("Rename…", Box::new(crate::RenameDocument), None),
                     Separator,
                     Item("Export…", Box::new(OpenExportDialog), None),
                     Item("Page setup…", Box::new(OpenPageSetup), None),
@@ -1723,32 +1751,21 @@ impl SylphApp {
                 // The Markdown toggle is the single source of truth: the
                 // outline only parses headings when it is ON, so OFF never
                 // claims structure the canvas does not show.
-                let content = self.editor.read(cx).content.clone();
-                let mut headings: Vec<(u8, String)> = Vec::new();
+                // Typed headings carry their offset, so clicking one jumps
+                // there; heading blocks from the model have none.
+                let mut headings: Vec<(u8, String, Option<usize>)> = Vec::new();
                 if self.markdown_mode {
-                    // Real headings parsed from editor content with the
-                    // same rules as the export parser: nothing inside ```
-                    // fences is a heading, and `# ` with no text is not
-                    // one either.
-                    let mut in_fence = false;
-                    for line in content.lines() {
-                        if line.trim_start().starts_with("```") {
-                            in_fence = !in_fence;
-                            continue;
-                        }
-                        if in_fence {
-                            continue;
-                        }
-                        if let Some((level, text)) = heading_level_and_text(line.trim_start()) {
-                            headings.push((level, text.to_string()));
-                        }
-                    }
+                    headings.extend(
+                        self.outline(cx)
+                            .into_iter()
+                            .map(|(level, text, offset)| (level, text, Some(offset))),
+                    );
                     // Also include structured heading blocks from the rich document.
                     for b in &self.document.blocks {
                         if let sylph_core::document::Block::Heading { level, runs } = b {
                             let s: String = runs.iter().map(|r| r.text.as_str()).collect();
                             if !s.trim().is_empty() {
-                                headings.push((*level, s));
+                                headings.push((*level, s, None));
                             }
                         }
                     }
@@ -1766,16 +1783,23 @@ impl SylphApp {
                         12.0,
                     )));
                 } else {
-                    for (level, title) in headings.iter().take(30) {
-                        let indent = px((*level as f32 - 1.0).clamp(0.0, 4.0) * 12.0);
-                        body = body.child(
-                            div()
-                                .pl(indent)
-                                .py(px(5.0))
-                                .text_color(muted)
-                                .hover(|s| s.bg(hover).text_color(text))
-                                .child(label(title.clone(), muted, 12.0)),
-                        );
+                    for (level, title, offset) in headings.into_iter().take(200) {
+                        let indent = px((level as f32 - 1.0).clamp(0.0, 4.0) * 12.0);
+                        let row = div()
+                            .pl(indent)
+                            .py(px(5.0))
+                            .text_color(muted)
+                            .hover(|s| s.bg(hover).text_color(text))
+                            .child(label(title, muted, 12.0).truncate());
+                        body = body.child(match offset {
+                            Some(offset) => row.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.go_to_offset(offset, window, cx);
+                                }),
+                            ),
+                            None => row,
+                        });
                     }
                 }
             }
@@ -1974,7 +1998,14 @@ impl SylphApp {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .child(img(data.path.clone()).max_w(px(480.0)).max_h(px(300.0)))
+                            .child(
+                                // A PathBuf loads from disk; a String is parsed
+                                // as a URL, which GPUI can't fetch, so inserted
+                                // images never painted.
+                                img(std::path::PathBuf::from(&data.path))
+                                    .max_w(px(480.0))
+                                    .max_h(px(300.0)),
+                            )
                             .child(caption(EditingField::ImageCaption(idx), &data.caption, cx)),
                     );
                 }
@@ -3034,28 +3065,27 @@ impl SylphApp {
         // Markdown ON counts the blocks export will produce; OFF exports
         // one paragraph per source line, so the line *is* the block.
         let markdown_on = self.markdown_mode;
+        // Cached per edit and caret move: these parse the whole text.
+        let (line, column, words, (block, of_blocks), body_page) = self.caret_status(cx);
         let (position, body_page, word_count, save_state) = {
             let editor = self.editor.read(cx);
-            let cursor = editor.cursor_offset();
-            let (line, column, words) = cursor_status(&editor.content, cursor);
             let position = if markdown_on {
-                let (block, of_blocks) = block_status(&editor.content, cursor);
                 format!("Block {block} of {of_blocks}")
             } else {
                 format!("Ln {line}, Col {column}")
             };
             // OFF exports no typed page breaks, so the caret stays on the
             // first body page; inserted breaks all follow the typed text.
-            let body_page = if markdown_on {
-                caret_text_page(&editor.content, cursor)
-            } else {
-                1
-            };
-            let save_state = match &self.model_save_error {
+            let save_state = match (&editor.save_state, &self.model_save_error) {
+                // No database / an unreadable document outrank everything.
+                (state @ (SaveState::Unpersisted(_) | SaveState::ReadOnly(_)), _) => state.clone(),
                 // Page setup / inserted objects failed to save: a good
                 // text save must not hide that.
-                Some(reason) => SaveState::Failed(reason.clone()),
-                None => editor.save_state.clone(),
+                (_, Some(reason)) => SaveState::Failed {
+                    error: reason.clone(),
+                    last_ok_at: editor.last_saved_at,
+                },
+                (state, None) => state.clone(),
             };
             (position, body_page, words, save_state)
         };
@@ -3068,7 +3098,7 @@ impl SylphApp {
         let save_color = match save_state {
             SaveState::Saved => self.ui_success(),
             SaveState::Saving => muted,
-            SaveState::Failed(_) => self.ui_danger(),
+            _ => self.ui_danger(),
         };
         // The position and word count never shrink; long transient
         // messages and save errors truncate with an ellipsis instead of
@@ -3110,6 +3140,11 @@ impl SylphApp {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    // Stays for the whole export; transient messages expire.
+                    .when(self.export_running, |row| {
+                        row.child(label("Exporting…", text, 11.0).flex_shrink_0())
+                            .child("·")
+                    })
                     .when_some(self.status_message.clone(), |row, message| {
                         row.child(label(message, text, 11.0).min_w(px(0.0)).truncate())
                             .child("·")
@@ -3150,89 +3185,53 @@ impl SylphApp {
         let primary = self.ui_primary();
         let border = self.ui_border();
         let mut rows = div().border_t_1().border_color(border);
-        for (index, (glyph, title, shortcut)) in [
-            ("H1", "Heading 1", "# + space"),
-            ("H2", "Heading 2", "## + space"),
-            ("☷", "Bullet list", "- + space"),
-            ("1.", "Numbered list", "1. + space"),
-            ("▦", "Table", "grid"),
-            ("▧", "Image", "upload"),
-            ("↵", "Page break", "Ctrl+Enter"),
-            ("<>\u{00a0}", "Code block", ""),
-        ]
-        .iter()
-        .enumerate()
-        {
-            // Heading rows call a Markdown-only command, so they dim with
-            // the rest of the Markdown-driven controls.
-            let markdown_command = title.starts_with("Heading");
-            let enabled = !markdown_command || self.markdown_mode;
+        let matches = crate::palette_matches(&self.palette.query);
+        if matches.is_empty() {
+            rows = rows.child(
+                div()
+                    .h(px(50.0))
+                    .px(px(32.0))
+                    .flex()
+                    .items_center()
+                    .child(label("No matching command", muted, 14.0)),
+            );
+        }
+        for (index, &command) in matches.iter().enumerate() {
+            let (glyph, title, shortcut) = crate::PALETTE_COMMANDS[command];
+            // Markdown commands dim with the rest of the Markdown-driven
+            // controls.
+            let enabled = !crate::palette_command_needs_markdown(title) || self.markdown_mode;
+            let selected = index == self.palette.selected;
             let row = div()
                 .h(px(50.0))
                 .px(px(32.0))
                 .flex()
                 .items_center()
                 .gap(px(16.0))
-                .when(index == 0, |s| s.bg(self.ui_panel_low()))
+                .when(selected, |s| s.bg(self.ui_panel_low()))
                 .hover(|s| s.bg(self.ui_panel_low()))
                 .cursor_pointer()
                 .when(!enabled, |s| s.opacity(0.45))
                 .child(
                     label(
-                        *glyph,
-                        if index == 0 && enabled {
-                            primary
-                        } else {
-                            muted
-                        },
+                        glyph,
+                        if selected && enabled { primary } else { muted },
                         14.0,
                     )
                     .w(px(20.0)),
                 )
-                .child(label(*title, if enabled { text } else { muted }, 16.0))
+                .child(label(title, if enabled { text } else { muted }, 16.0))
                 .child(
-                    label(*shortcut, muted, 12.0)
+                    label(shortcut, muted, 12.0)
                         .font_family(MONO_FONT)
                         .ml_auto(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.run_palette_command(title, window, cx);
+                    }),
                 );
-            let row = match *title {
-                "Heading 1" => row.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.set_heading(1, window, cx);
-                        this.close_overlay(&CloseOverlay, window, cx);
-                    }),
-                ),
-                "Heading 2" => row.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.set_heading(2, window, cx);
-                        this.close_overlay(&CloseOverlay, window, cx);
-                    }),
-                ),
-                "Table" => row.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.insert_table(&InsertTable, window, cx);
-                    }),
-                ),
-                "Image" => row.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.show_image_inspector(&ShowImageInspector, window, cx);
-                        this.paste_image(&PasteImage, window, cx);
-                        this.close_overlay(&CloseOverlay, window, cx);
-                    }),
-                ),
-                "Page break" => row.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.insert_page_break(&InsertPageBreak, window, cx);
-                        this.close_overlay(&CloseOverlay, window, cx);
-                    }),
-                ),
-                _ => row,
-            };
             rows = rows.child(row);
         }
         div()
@@ -3260,7 +3259,11 @@ impl SylphApp {
                             .border_b_1()
                             .border_color(border)
                             .child(icon("⌕", muted, 18.0))
-                            .child(label("/ Type a command...", muted, 16.0))
+                            .child(if self.palette.query.is_empty() {
+                                label("Type a command…", muted, 16.0)
+                            } else {
+                                label(format!("{}▏", self.palette.query), text, 16.0)
+                            })
                             .child(
                                 label("ESC", muted, 11.0)
                                     .ml_auto()
@@ -3281,7 +3284,14 @@ impl SylphApp {
                             .text_size(px(11.0))
                             .text_color(muted)
                             .child("Navigate with ↑ ↓  ·  Select with ↵")
-                            .child(label("● Sylph Commands v1.4", primary, 11.0)),
+                            .child(label(
+                                match matches.len() {
+                                    1 => "1 command".to_string(),
+                                    n => format!("{n} commands"),
+                                },
+                                primary,
+                                11.0,
+                            )),
                     ),
             )
             .on_mouse_down(
@@ -3385,7 +3395,7 @@ impl SylphApp {
             (
                 ExportFormat::Pdf,
                 "PDF",
-                "Print-ready pages with the document's page setup.",
+                "Print-ready pages with the document's page setup and embedded fonts.",
             ),
             (
                 ExportFormat::Docx,
@@ -3580,6 +3590,7 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::confirm_title))
             .on_action(cx.listener(Self::cancel_title))
             .on_action(cx.listener(Self::new_document))
+            .on_action(cx.listener(Self::rename_document))
             .on_action(cx.listener(Self::toggle_dark_mode))
             .on_action(cx.listener(Self::export_docx))
             .on_action(cx.listener(Self::export_pdf))
@@ -3626,7 +3637,7 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::normal_text))
             .on_action(cx.listener(Self::strikethrough_text))
             .on_action(cx.listener(Self::cycle_body_font))
-            .child(self.title_bar(window))
+            .child(self.title_bar(window, cx))
             .child(self.menu_bar(window, cx))
             .child(self.utility_bar(cx))
             .child(self.format_bar(cx))
