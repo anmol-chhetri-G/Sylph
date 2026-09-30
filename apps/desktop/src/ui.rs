@@ -18,6 +18,8 @@ use gpui::{
 pub(crate) const UI_FONT: &str = "Hanken Grotesk";
 pub(crate) const PROSE_FONT: &str = "EB Garamond";
 pub(crate) const MONO_FONT: &str = "JetBrains Mono";
+/// Space between page sheets in print layout.
+const PAGE_GAP: Pixels = px(24.0);
 
 /// One entry of a menu-bar menu.
 pub(crate) enum MenuEntry {
@@ -2087,27 +2089,38 @@ impl SylphApp {
             .child(self.cover_fields(cover, cx))
     }
 
-    fn render_blank_editor_page(&mut self, page_number: usize, cx: &mut Context<Self>) -> Div {
-        let border = self.ui_border();
+    /// The body pages of print layout: page sheets stacked with a gap,
+    /// and the editor laid over them, its rows flowing from one page's
+    /// text area to the next (see `pagination`). Clicking anywhere on a
+    /// page, including its margins or an empty page, puts the caret there.
+    fn render_body_pages(
+        &mut self,
+        first_page_number: usize,
+        page_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let text = self.ui_text();
-        let muted = self.ui_muted();
-        let page = self.ui_page();
-        let page_w = self.page_width();
         let page_h = self.page_height();
         let (margin_top, margin_right, margin_bottom, margin_left) = self.page_margins_px();
+        let flow = crate::PageFlow {
+            content_height: (page_h - margin_top - margin_bottom).into(),
+            gap: (margin_bottom + PAGE_GAP + margin_top).into(),
+        };
+        self.editor
+            .update(cx, |editor, _| editor.page_flow = Some(flow));
         // The body size is set in points; the canvas paints pixels
         // (pt × 4/3 at 96dpi) — what the toolbar says is what the page
-        // shows. The editor fills the page's layout box but never clips
-        // the caret: content taller than one page grows the galley
-        // (explicit page breaks split off further pages).
+        // shows.
         let content_height = self.editor.read(cx).content_height;
-        let editor_h = (page_h - margin_top - margin_bottom).max(content_height + px(24.0));
+        let editor_h = content_height.max(px(flow.content_height)) + px(24.0);
         let text_size = px(self.document.body_font_size * (4.0 / 3.0));
         let line_height = text_size * self.document.line_spacing;
         let editor = div()
-            .w_full()
+            .absolute()
+            .top(margin_top)
+            .left(margin_left)
+            .right(margin_right)
             .h(editor_h)
-            .flex_shrink_0()
             .overflow_hidden()
             .font_family(self.document.body_font.clone())
             .text_size(text_size)
@@ -2122,51 +2135,49 @@ impl SylphApp {
             )
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_editor_right_click));
 
-        let mut page_content = div()
-            .w(page_w)
-            .min_h(page_h)
-            .flex_shrink_0()
+        let mut sheets = div().flex().flex_col().gap(PAGE_GAP);
+        for page in 0..page_count.max(1) {
+            sheets = sheets.child(self.render_blank_page(first_page_number + page));
+        }
+        // Inserted objects (images, tables) follow the typed text.
+        let blocks = div()
+            .absolute()
+            .top(margin_top + content_height)
+            .left(margin_left)
+            .right(margin_right)
             .flex()
             .flex_col()
+            .children(self.rich_block_divs(cx));
+        div()
             .relative()
-            .pt(margin_top)
-            .pb(margin_bottom)
-            .pl(margin_left)
-            .pr(margin_right)
-            .bg(page)
+            .flex_shrink_0()
             .text_color(text)
             .font_family(PROSE_FONT)
-            .shadow_md()
-            .child(
-                div()
-                    .absolute()
-                    .top(margin_top)
-                    .left(margin_left)
-                    .right(margin_right)
-                    .bottom(margin_bottom)
-                    .border_1()
-                    .border_color(border),
+            .child(sheets)
+            .child(editor)
+            .child(blocks)
+            // Clicks on a page outside the text (margins, below the last
+            // line, an empty page) move the caret to the nearest text.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    let inside_text = this
+                        .editor
+                        .read(cx)
+                        .last_bounds
+                        .is_some_and(|bounds| bounds.contains(&event.position));
+                    if inside_text {
+                        return;
+                    }
+                    this.commit_field_edit(cx);
+                    let position = event.position;
+                    this.editor.update(cx, |editor, cx| {
+                        let offset = editor.index_for_mouse_position(position);
+                        editor.move_to(offset, cx);
+                    });
+                    window.focus(&this.editor.focus_handle(cx));
+                }),
             )
-            .child(editor);
-
-        page_content = page_content.children(self.rich_block_divs(cx));
-
-        // Page number footer: the first body page (page 2 after a cover).
-        page_content = page_content.child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .bottom(margin_bottom - px(24.0))
-                .flex()
-                .justify_center()
-                .font_family(MONO_FONT)
-                .text_size(px(10.0))
-                .text_color(muted)
-                .child(page_number.to_string()),
-        );
-
-        page_content
     }
 
     /// Web layout: the document flows at the canvas width — no fixed page
@@ -2174,6 +2185,8 @@ impl SylphApp {
     /// editor and the rich blocks with the Print page, so content and font
     /// size stay identical across views.
     fn render_web_editor(&mut self, cx: &mut Context<Self>) -> Div {
+        // One continuous flow: no pages.
+        self.editor.update(cx, |editor, _| editor.page_flow = None);
         let text = self.ui_text();
         let page = self.ui_page();
         let text_size = px(self.document.body_font_size * (4.0 / 3.0));
@@ -2265,24 +2278,6 @@ impl SylphApp {
 
     fn center_canvas(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let page_count = self.page_count(cx);
-        let page_w = self.page_width();
-        let page_gap_border = self.ui_border();
-        let page_gap_muted = self.ui_muted();
-        let page_gap = || {
-            div()
-                .w(page_w)
-                .h(px(96.0))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .text_color(page_gap_muted)
-                .child(div().flex_1().h(px(1.0)).bg(page_gap_border))
-                .child(
-                    label("↵  PAGE BREAK · NEW PAGE", page_gap_muted, 10.0).font_family(MONO_FONT),
-                )
-                .child(div().flex_1().h(px(1.0)).bg(page_gap_border))
-        };
         // Web layout drops the page metaphor: one continuous flow, no
         // page gaps, no extra pages, no ruler (page geometry is off).
         let web = self.web_layout;
@@ -2305,17 +2300,12 @@ impl SylphApp {
         pages = pages.child(if web {
             self.render_web_editor(cx)
         } else {
-            self.render_blank_editor_page(first_body_page, cx)
+            let body_pages = page_count + 1 - first_body_page;
+            self.render_body_pages(first_body_page, body_pages, cx)
         });
-        if !web {
-            for page_number in (first_body_page + 1)..=page_count {
-                pages = pages
-                    .child(page_gap())
-                    .child(self.render_blank_page(page_number));
-            }
-        }
         div()
             .id("document-canvas")
+            .track_scroll(&self.editor.read(cx).canvas_scroll)
             .flex_1()
             .h_full()
             .flex()
@@ -2338,23 +2328,6 @@ impl SylphApp {
         let text = self.ui_text();
         let muted = self.ui_muted();
         let primary = self.ui_primary();
-        let stepper = |name: &str, value: &str| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .child(label(name, muted, 11.0))
-                .child(
-                    div()
-                        .h(px(56.0))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .bg(panel)
-                        .child(label(value, text, 12.0).font_family(MONO_FONT)),
-                )
-        };
         let current_ls = self
             .document
             .style_line_spacing(self.current_heading_level(cx));
@@ -2435,8 +2408,8 @@ impl SylphApp {
                             .mt(px(8.0))
                             .flex()
                             .gap(px(4.0))
-                            .child(stepper("Before", &format!("{before_pt:.0} pt")))
-                            .child(stepper("After", &format!("{after_pt:.0} pt"))),
+                            .child(self.spacing_stepper(true, before_pt, cx))
+                            .child(self.spacing_stepper(false, after_pt, cx)),
                     )
                     .child(label("Line Spacing", muted, 11.0).mt(px(14.0)))
                     .child(line_spacing)
@@ -3029,6 +3002,13 @@ impl SylphApp {
         };
         let page_count = self.page_count(cx);
         // A cover is page 1, so the body's pages come after it.
+        // Print layout knows the caret's real page (text flows across
+        // pages); web layout has one page.
+        let body_page = if self.web_layout {
+            body_page
+        } else {
+            self.editor.read(cx).cursor_page + 1
+        };
         let caret_page = usize::from(self.document.has_cover_page()) + body_page;
         // The save indicator always shows the real save state in Word/Docs
         // wording (never a storage path). Transient action feedback gets

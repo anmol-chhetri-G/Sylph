@@ -333,6 +333,48 @@ impl SylphApp {
         row.into_any_element()
     }
 
+    /// The inspector's Before/After field: − value + in 2 pt steps, for
+    /// every paragraph of the caret's style.
+    pub(crate) fn spacing_stepper(&self, before: bool, value: f32, cx: &mut Context<Self>) -> Div {
+        let (text, muted, hover) = (self.ui_text(), self.ui_muted(), self.ui_panel_low());
+        let step = |glyph: &'static str, delta: f32, cx: &mut Context<Self>| {
+            div()
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(move |b| b.bg(hover))
+                .child(label(glyph, text, 14.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _: &mut Window, cx| {
+                        let next = (value + delta).max(0.0);
+                        this.set_style_paragraph_space(before, next, cx);
+                    }),
+                )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(label(if before { "Before" } else { "After" }, muted, 11.0))
+            .child(
+                div()
+                    .h(px(56.0))
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(self.surface_color())
+                    .child(step("−", -2.0, cx))
+                    .child(label(format!("{value:.0} pt"), text, 12.0))
+                    .child(step("+", 2.0, cx)),
+            )
+    }
+
     fn picker_heading(&self, title: &str) -> AnyElement {
         div()
             .px(px(8.0))

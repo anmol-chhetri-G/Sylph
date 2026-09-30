@@ -32,6 +32,7 @@ editing.
 | Paragraph styles (author request) | done | Normal + Heading 1–6 each have line spacing and font; Style/Font/Line spacing dropdowns act on the caret's style; canvas, PDF and DOCX follow them |
 | Export quality (author request) | done | PDF: no mid-word breaks at font changes, real bullets, strikethrough, task boxes; DOCX: headings bold and black, Word 2013+ mode; three more bundled fonts (Source Serif 4, Lora, Inter) |
 | Style size and paragraph spacing (author request) | done | size box, Space before/after act on the caret's style; canvas spaces Normal paragraphs where the export does |
+| Print-layout pagination (author request) | done | rows flow page to page (overflow and `\newpage`); click any page to put the caret there; Ctrl+Enter breaks at the caret; the canvas follows the caret |
 | everything else | open | |
 
 ## Next: formatting on a paragraph or a selection (proposed, needs the author's go-ahead)

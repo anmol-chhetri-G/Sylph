@@ -19,8 +19,10 @@ use sylph_core::{
 };
 use sylph_storage::Storage;
 
+mod pagination;
 mod save_state;
 mod style_controls;
+use pagination::{caret_scroll_offset, page_break_insertion, PageFlow};
 mod ui;
 use save_state::*;
 use style_controls::Picker;
@@ -103,6 +105,18 @@ struct TextInput {
     row_metas: Vec<RowMeta>,
     /// Total laid-out content height from the last prepaint.
     content_height: gpui::Pixels,
+    /// Print layout's page geometry (None in web layout): rows flow from
+    /// page to page. Set by the canvas before each layout.
+    page_flow: Option<PageFlow>,
+    /// Pages the text fills, and the page the caret is on (0-based), from
+    /// the last layout.
+    page_count: usize,
+    cursor_page: usize,
+    /// The document canvas's scroller, so the canvas can follow the caret
+    /// onto another page; `followed` is the (text revision, caret) it last
+    /// followed, so free scrolling is left alone until the caret moves.
+    canvas_scroll: gpui::ScrollHandle,
+    followed: (u64, usize),
     /// Source→display maps from the last prepaint (identity when OFF).
     display_lines: Vec<DisplayLine>,
     /// Row the caret was laid out in, for scroll-into-view.
@@ -208,15 +222,15 @@ impl TextInput {
         if local_y < px(0.0) {
             return 0;
         }
-        // Row containing the click — rows have variable heights, so walk
-        // the box ranges instead of dividing by a uniform line height.
-        let mut row_idx = self.row_metas.len() - 1;
-        for (i, m) in self.row_metas.iter().enumerate() {
-            if local_y < m.box_top + m.box_height {
-                row_idx = i;
-                break;
-            }
-        }
+        // The last row starting at or above the click. Rows have variable
+        // heights and pages leave gaps, so a click in a page's empty
+        // bottom (or the gap after it) lands on that page's last line, and
+        // a click on a later page lands on that page's rows.
+        let row_idx = self
+            .row_metas
+            .iter()
+            .rposition(|m| m.box_top <= local_y)
+            .unwrap_or(0);
         let meta = self.row_metas[row_idx];
         let local_x = (position.x - bounds.left()).max(px(0.0));
         // The shaped line is display text; map back through the source→
@@ -1345,7 +1359,6 @@ struct RowMeta {
     box_top: gpui::Pixels,
     text_top: gpui::Pixels,
     text_height: gpui::Pixels,
-    box_height: gpui::Pixels,
     src_start: usize,
     disp_start: usize,
     line_idx: usize,
@@ -1414,6 +1427,10 @@ impl Element for TextElement {
         let word_wrap = input.word_wrap;
         let markdown_on = input.markdown_mode;
         let styles = input.styles.clone();
+        let flow = input.page_flow;
+        let input_rev = input.content_rev;
+        let input_followed = input.followed;
+        let canvas_scroll = input.canvas_scroll.clone();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
@@ -1570,11 +1587,24 @@ impl Element for TextElement {
             }
 
             let row_count = ranges.len();
+            let mut last_box_top = y;
             for (r, &(d0, d1)) in ranges.iter().enumerate() {
-                let space_before = if r == 0 { line_before } else { 0.0 };
+                let mut space_before = if r == 0 { line_before } else { 0.0 };
                 let space_after = if r + 1 == row_count { line_after } else { 0.0 };
-                let box_top = y;
-                let text_top = y + px(space_before);
+                let mut box_top = y;
+                if let Some(flow) = flow {
+                    // Print layout: a row that does not fit on the rest of
+                    // the page starts the next one, without its space
+                    // before (as in Word, space is not added at a page top).
+                    let height = space_before + f32::from(text_height) + space_after;
+                    let placed = flow.place(y.into(), height);
+                    if placed > f32::from(y) + 0.01 {
+                        space_before = 0.0;
+                    }
+                    box_top = px(placed);
+                }
+                last_box_top = box_top;
+                let text_top = box_top + px(space_before);
                 let box_height = px(space_before) + text_height + px(space_after);
                 y = box_top + box_height;
 
@@ -1612,6 +1642,12 @@ impl Element for TextElement {
                     line_idx: i,
                     rule_color,
                 });
+            }
+            // A page-break line ends its page: what follows starts the next.
+            if let Some(flow) = flow {
+                if pagination::is_page_break_line(&lines[i]) && !content.is_empty() {
+                    y = px(flow.next_page_top(last_box_top.into()));
+                }
             }
         }
         let content_height = y;
@@ -1755,14 +1791,43 @@ impl Element for TextElement {
                 box_top: r.box_top,
                 text_top: r.text_top,
                 text_height: r.text_height,
-                box_height: r.box_height,
                 src_start: r.src_start,
                 disp_start: r.disp_start,
                 line_idx: r.line_idx,
             })
             .collect();
         let cursor_row_idx = cursor_row;
+        // After an edit or a caret move, scroll the canvas just enough to
+        // show the caret (typing onto the next page brings it into view).
+        let follow_key = (input_rev, cursor);
+        if follow_key != input_followed {
+            if let Some(row) = rows.get(cursor_row) {
+                let top = bounds.top() + row.text_top - scroll_offset_y;
+                let bottom = top + row.text_height;
+                if let Some(offset) = caret_scroll_offset(
+                    canvas_scroll.offset().y,
+                    canvas_scroll.bounds(),
+                    top,
+                    bottom,
+                ) {
+                    canvas_scroll.set_offset(point(canvas_scroll.offset().x, offset));
+                    window.refresh();
+                }
+            }
+        }
+        let (page_count, cursor_page) = match flow {
+            Some(flow) => (
+                flow.page_count(content_height.into()),
+                row_metas
+                    .get(cursor_row_idx)
+                    .map_or(0, |row| flow.page_of(row.box_top.into())),
+            ),
+            None => (1, 0),
+        };
         self.input.update(cx, |input, _cx| {
+            input.followed = follow_key;
+            input.page_count = page_count;
+            input.cursor_page = cursor_page;
             input.last_layout = last_layout;
             input.all_lines = all_lines;
             input.line_char_offsets = line_char_offsets;
@@ -2810,8 +2875,19 @@ impl SylphApp {
             self.markdown_mode,
             self.document.clone(),
         );
-        self.page_count_memo
-            .get(key, || export_page_count(&self.export_view(cx)))
+        let exported = self
+            .page_count_memo
+            .get(key, || export_page_count(&self.export_view(cx)));
+        // Print layout also breaks pages where text overflows them; the
+        // canvas shows at least that many.
+        let editor = self.editor.read(cx);
+        let laid_out = usize::from(self.document.has_cover_page())
+            + if editor.page_flow.is_some() {
+                editor.page_count
+            } else {
+                1
+            };
+        exported.max(laid_out)
     }
 
     /// See `CaretStatus`. Block and page figures only mean something in
@@ -3401,11 +3477,14 @@ impl SylphApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The structured block is the source for pagination. The current visual
-        // scaffold appends it to the active report flow until block positions are
-        // unified with TextInput in the editor-kernel phase.
-        self.document
-            .push_block(sylph_core::document::Block::page_break());
+        // At the caret, as in Word: the `\newpage` marker on a line of its
+        // own, then a fresh line at the top of the next page for the caret.
+        self.editor.update(cx, |editor, cx| {
+            let cursor = editor.cursor_offset();
+            let at_line_start = editor.line_start(cursor) == cursor;
+            let text = page_break_insertion(at_line_start);
+            editor.replace_text_in_range(None, &text, cx);
+        });
         self.set_status("Page break inserted", cx);
         cx.notify();
     }
@@ -5455,6 +5534,12 @@ fn literal_blocks(content: &str, line_spacing: f32) -> Vec<doc::Block> {
             // Blank lines are spacing, not content.
             continue;
         }
+        // Sylph's page-break marker is not Markdown: it breaks the page
+        // in both modes, as the canvas shows.
+        if pagination::is_page_break_line(line) {
+            out.push(doc::Block::PageBreak);
+            continue;
+        }
         out.push(doc::Block::Paragraph {
             runs: vec![doc::TextRun::plain(line)],
             style: doc::ParagraphStyle {
@@ -5762,6 +5847,11 @@ fn main() {
                         markdown_mode: document.markdown,
                         row_metas: Vec::new(),
                         content_height: px(0.0),
+                        page_flow: None,
+                        page_count: 1,
+                        cursor_page: 0,
+                        canvas_scroll: gpui::ScrollHandle::new(),
+                        followed: (0, 0),
                         display_lines: Vec::new(),
                         cursor_row: 0,
                         line_height: px(20.0),
@@ -6035,12 +6125,16 @@ mod export_model_tests {
         use sylph_core::document::{Block, Document};
         let structured = Document::new();
         let model = export_model(&structured, "# Title\n\n\\newpage\n\n**bold**", false);
-        assert!(model
+        // Markdown stays literal; the page-break marker still breaks the
+        // page (it is Sylph's own, and the canvas breaks there too).
+        assert!(matches!(model.blocks[1], Block::PageBreak));
+        let texts: Vec<String> = model
             .blocks
             .iter()
-            .all(|b| matches!(b, Block::Paragraph { .. })));
-        let texts: Vec<String> = model.blocks.iter().map(Block::plain_text).collect();
-        assert_eq!(texts, ["# Title", "\\newpage", "**bold**"]);
+            .filter(|b| matches!(b, Block::Paragraph { .. }))
+            .map(Block::plain_text)
+            .collect();
+        assert_eq!(texts, ["# Title", "**bold**"]);
     }
 
     #[test]
