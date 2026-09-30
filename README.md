@@ -31,6 +31,21 @@ sylph/
 cargo build
 ```
 
+## Fonts
+
+Sylph ships its fonts in `assets/fonts/` and loads them at startup, so the
+editor looks the same whatever the system has installed. All are under the
+SIL Open Font License 1.1; each family's folder has its `OFL.txt`. They are
+static instances of the Google Fonts releases.
+
+| Family | Used for | Styles |
+| --- | --- | --- |
+| EB Garamond | the page (default body font) | Regular, Italic, Bold, Bold Italic |
+| Hanken Grotesk | the interface | Regular, SemiBold |
+| JetBrains Mono | code and line numbers | Regular, Bold |
+| Noto Sans Devanagari | Devanagari text (script fallback) | Regular, Bold |
+| Noto Serif Devanagari | Devanagari text | Regular, Bold |
+
 ## Vision
 
 Sylph's vision is to be a **native, local-first document editor**, a Word/Google Docs

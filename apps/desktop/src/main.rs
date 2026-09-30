@@ -19,7 +19,21 @@ use sylph_core::{
 };
 use sylph_storage::Storage;
 
+mod save_state;
 mod ui;
+use save_state::*;
+mod export_job;
+use export_job::*;
+mod fonts;
+use fonts::*;
+mod memo;
+use memo::*;
+mod md_edit;
+use md_edit::*;
+mod palette;
+use palette::*;
+mod title;
+use title::*;
 
 actions!(
     text_input,
@@ -67,34 +81,6 @@ struct EditAction {
     selection_before: Range<usize>,
 }
 
-/// Where the typed text stands relative to storage. The status bar shows
-/// this instead of assuming every save worked.
-#[derive(Clone, Debug, PartialEq)]
-enum SaveState {
-    Saved,
-    /// Edited; waiting for the autosave debounce or the write itself.
-    Saving,
-    Failed(String),
-}
-
-impl SaveState {
-    fn from_result(result: Result<(), Box<dyn std::error::Error>>) -> Self {
-        match result {
-            Ok(()) => Self::Saved,
-            Err(e) => Self::Failed(e.to_string()),
-        }
-    }
-
-    /// Status-bar wording (Word/Docs style); a failure says why.
-    fn label(&self) -> String {
-        match self {
-            Self::Saved => "All changes saved".to_string(),
-            Self::Saving => "Saving…".to_string(),
-            Self::Failed(reason) => format!("Save failed: {reason}"),
-        }
-    }
-}
-
 struct TextInput {
     focus_handle: FocusHandle,
     content: String,
@@ -130,6 +116,15 @@ struct TextInput {
     word_wrap: bool,
     save_task: Option<Task<()>>,
     save_state: SaveState,
+    /// Bumped by every change to `content`, so values derived from the
+    /// text are computed once per edit instead of once per frame.
+    content_rev: u64,
+    /// Why nothing reaches disk this session (the database did not open).
+    unpersisted: Option<String>,
+    /// Why this document is read-only (its text could not be loaded).
+    read_only: Option<String>,
+    /// When a write last reached the database.
+    last_saved_at: Option<std::time::Instant>,
 }
 
 impl TextInput {
@@ -1048,16 +1043,49 @@ impl TextInput {
     /// Write the text immediately and record whether it worked. Supersedes
     /// a pending autosave, which would only write the same text again.
     fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_now_with_model(None, cx)
+    }
+
+    /// `save_now`, also writing the structured model when given, in the
+    /// same transaction as the text.
+    ///
+    /// `true` when the write reached storage (only memory, in a session
+    /// without a database: the status bar says NOT SAVING either way).
+    /// A read-only document is never written.
+    fn save_now_with_model(&mut self, model_json: Option<&str>, cx: &mut Context<Self>) -> bool {
         self.save_task.take();
-        let text = self.content.clone();
-        let _ = std::fs::write(data_path("document.txt"), &text);
-        self.save_state = SaveState::from_result(self.storage.save_text(self.doc_id, &text));
+        if self.read_only.is_some() {
+            return false;
+        }
+        let result = self
+            .storage
+            .save_snapshot(self.doc_id, &self.content, model_json);
+        let ok = self.record_write(result);
         cx.notify();
-        self.save_state == SaveState::Saved
+        ok
+    }
+
+    /// Update the save state from a finished write; `true` if it worked.
+    fn record_write(&mut self, result: Result<(), Box<dyn std::error::Error>>) -> bool {
+        let ok = result.is_ok();
+        if ok && self.unpersisted.is_none() {
+            self.last_saved_at = Some(std::time::Instant::now());
+        }
+        self.save_state =
+            SaveState::after_write(result, self.unpersisted.as_deref(), self.last_saved_at);
+        ok
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.save_task.take();
+        if self.read_only.is_some() {
+            return;
+        }
+        if self.unpersisted.is_some() {
+            // Memory only: nothing to debounce, and "Saving…" would lie.
+            self.save_now(cx);
+            return;
+        }
         self.save_state = SaveState::Saving;
         let doc_id = self.doc_id;
         let text = self.content.clone();
@@ -1066,25 +1094,21 @@ impl TextInput {
                 // Keep writes out of the typing path while saving shortly after
                 // the user pauses. Dropping the previous task debounces bursts.
                 gpui::Timer::after(std::time::Duration::from_millis(750)).await;
-                let _ = std::fs::write(data_path("document.txt"), &text);
-                let state = SaveState::from_result(
-                    sylph_storage::Storage::open()
-                        .and_then(|storage| storage.save_text(doc_id, &text)),
-                );
+                // Through the long-lived connection, not a fresh open (and
+                // schema run) per save. Writes the text as it was when the
+                // save was scheduled, to the document it belongs to.
                 let _ = this.update(cx, |this, cx| {
-                    this.save_state = state;
+                    let result = this.storage.save_text(doc_id, &text);
+                    this.record_write(result);
                     cx.notify();
                 });
             },
         ));
     }
 
-    fn summarize(&mut self, _: &Summarize, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.content.clone();
-        let summary = sylph_py_bridge::summarize_text(&text);
-        let _ = std::fs::write(data_path("summary.txt"), &summary);
-        cx.notify();
-    }
+    /// AI summaries are not implemented yet (plan Phase 6). This used to
+    /// write a mock summary to a plaintext file nothing read.
+    fn summarize(&mut self, _: &Summarize, _: &mut Window, _cx: &mut Context<Self>) {}
 
     /// Replace `range` (byte offsets; the selection when `None`) with
     /// `new_text` as one undoable edit.
@@ -1094,6 +1118,13 @@ impl TextInput {
         new_text: &str,
         cx: &mut Context<Self>,
     ) {
+        // Every edit enters here (typing, paste, IME, replace, restore), so
+        // this one check keeps a document that failed to load untouched.
+        if self.read_only.is_some() {
+            return;
+        }
+        // Text from CRLF or CR sources can never leave a stray `\r` behind.
+        let new_text = &*normalize_newlines(new_text);
         let range = range.unwrap_or(self.selected_range.clone());
         let start = snap_to_char_boundary(&self.content, range.start);
         let end = snap_to_char_boundary(&self.content, range.end).max(start);
@@ -1122,6 +1153,7 @@ impl TextInput {
         }
 
         self.content.replace_range(start..end, new_text);
+        self.content_rev += 1;
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.selection_reversed = false;
         self.preferred_column = None;
@@ -1956,10 +1988,21 @@ struct SylphApp {
     context_menu: ContextMenuState,
     doc_title: String,
     editing_title: bool,
+    /// The title when renaming started, restored by Esc.
+    title_before_edit: String,
     /// Every document for the Recent Files list, newest first.
     documents: Vec<sylph_storage::DocumentSummary>,
     dark_mode: bool,
     ai_panel: AiPanelState,
+    palette: PaletteState,
+    /// Pages the export produces, keyed by (text revision, Markdown mode,
+    /// model): a full parse, so not once per frame.
+    page_count_memo: Memo<(u64, bool, doc::Document), usize>,
+    /// The status bar's caret figures, keyed by (text revision, caret,
+    /// Markdown mode).
+    caret_status_memo: Memo<(u64, usize, bool), CaretStatus>,
+    /// The typed headings, keyed by text revision.
+    outline_memo: Memo<u64, Vec<OutlineEntry>>,
     /// Transient action feedback; set it with `set_status` so it clears
     /// itself. The save indicator is separate (`TextInput::save_state`).
     status_message: Option<String>,
@@ -1974,8 +2017,18 @@ struct SylphApp {
     ruler_visible: bool,
     zoom_percent: u16,
     image_picker_task: Option<Task<()>>,
-    /// The pending Save dialog of an export.
+    /// The copy of an inserted image into the data folder.
+    image_copy_task: Option<Task<()>>,
+    /// The export in progress: its Save dialog, then the write on a
+    /// background thread. Dropping it discards the result, but a Python
+    /// call already running still runs to completion (GPUI cannot cancel a
+    /// blocking call on a background thread).
     export_task: Option<Task<()>>,
+    /// True from the Save dialog to the end of the write: one export at a
+    /// time, so a double click cannot start two.
+    export_running: bool,
+    /// The AI request in progress (a new one replaces it).
+    ai_task: Option<Task<()>>,
     /// Size under the pointer in the Insert Table grid: (rows, columns).
     table_picker: (usize, usize),
     /// The open menu-bar menu, if any (index into `SylphApp::menus`).
@@ -2015,6 +2068,7 @@ actions!(
         ConfirmTitle,
         CancelTitle,
         NewDocument,
+        RenameDocument,
         ToggleDarkMode,
         ExportDocx,
         ExportPdf,
@@ -2025,7 +2079,6 @@ actions!(
         ItalicText,
         StrikethroughText,
         InsertTable,
-        RewriteText,
         OpenAiPanel,
         CloseAiPanel,
         AiSubmit,
@@ -2066,16 +2119,18 @@ actions!(
 );
 
 impl SylphApp {
+    /// Ctrl+S. Says so in the status bar when nothing reached the disk,
+    /// instead of leaving the user to trust it did.
     fn save_doc(&mut self, _: &SaveDoc, _window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| editor.save_now(cx));
+        let state = self.editor.read(cx).save_state.clone();
+        if state.is_problem() {
+            self.set_status(format!("Not saved. {}", state.label()), cx);
+        }
     }
 
-    fn summarize_doc(&mut self, _: &SummarizeDoc, _window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.editor.read(cx).content.clone();
-        let summary = sylph_py_bridge::summarize_text(&text);
-        let _ = std::fs::write(data_path("summary.txt"), &summary);
-        cx.notify();
-    }
+    /// See `TextInput::summarize`: AI is Phase 6; no plaintext side copy.
+    fn summarize_doc(&mut self, _: &SummarizeDoc, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_visible = !self.sidebar_visible;
@@ -2438,18 +2493,53 @@ impl SylphApp {
         cx.notify();
     }
 
-    fn confirm_title(&mut self, _: &ConfirmTitle, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Rename the document in place (double-click the title). The title
+    /// takes the keyboard until Enter, Esc or a click back in the page.
+    pub(crate) fn start_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_title {
-            self.editing_title = false;
-            let title = self.doc_title.clone();
-            let doc_id = self.editor.read(cx).doc_id;
-            let _ = self.editor.read(cx).storage.update_title(doc_id, &title);
-            cx.notify();
+            return;
         }
+        self.editing_title = true;
+        self.title_before_edit = self.doc_title.clone();
+        window.focus(&self.focus_handle);
+        cx.notify();
     }
 
-    fn cancel_title(&mut self, _: &CancelTitle, _window: &mut Window, cx: &mut Context<Self>) {
+    fn rename_document(&mut self, _: &RenameDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.start_title_edit(window, cx);
+    }
+
+    fn confirm_title(&mut self, _: &ConfirmTitle, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_title {
+            return;
+        }
         self.editing_title = false;
+        self.doc_title = confirmed_title(&self.doc_title);
+        let doc_id = self.editor.read(cx).doc_id;
+        match self
+            .editor
+            .read(cx)
+            .storage
+            .update_title(doc_id, &self.doc_title)
+        {
+            Ok(()) => self.load_documents(cx),
+            Err(e) => {
+                self.doc_title = std::mem::take(&mut self.title_before_edit);
+                self.set_status(format!("Could not rename the document: {e}"), cx);
+            }
+        }
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn cancel_title(&mut self, _: &CancelTitle, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_title {
+            return;
+        }
+        self.editing_title = false;
+        self.doc_title = std::mem::take(&mut self.title_before_edit);
+        window.focus(&self.editor.focus_handle(cx));
         cx.notify();
     }
 
@@ -2461,6 +2551,10 @@ impl SylphApp {
     ) {
         if !self.editing_title {
             return;
+        }
+        // A click back in the page ends the rename, keeping what was typed.
+        if self.editor.focus_handle(cx).is_focused(_window) {
+            return self.confirm_title(&ConfirmTitle, _window, cx);
         }
         let key = event.keystroke.key.as_str();
         if key == "enter" {
@@ -2499,7 +2593,7 @@ impl SylphApp {
     /// forget it. It never notifies itself: a failed save retries on the
     /// next notify instead of looping.
     fn persist_model_if_changed(&mut self, cx: &mut Context<Self>) {
-        if self.document == self.persisted_model {
+        if self.document == self.persisted_model || self.editor.read(cx).read_only.is_some() {
             return;
         }
         let result = {
@@ -2521,9 +2615,32 @@ impl SylphApp {
     /// Callers about to replace the editor content must then stay put, or
     /// the unsaved work is lost.
     fn save_current_document(&mut self, cx: &mut Context<Self>) -> bool {
-        self.persist_model_if_changed(cx);
-        let saved = self.editor.update(cx, |editor, cx| editor.save_now(cx))
-            && self.model_save_error.is_none();
+        // Nothing of a read-only document may be written, and nothing in
+        // it changed, so leaving it loses nothing.
+        if self.editor.read(cx).read_only.is_some() {
+            return true;
+        }
+        // Text and model go in one transaction: a document never ends up
+        // with its new text and its old page setup, or the reverse.
+        let model_json = if self.document == self.persisted_model {
+            None
+        } else {
+            match serde_json::to_string(&self.document) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    self.model_save_error = Some(e.to_string());
+                    None
+                }
+            }
+        };
+        let saved = self.editor.update(cx, |editor, cx| {
+            editor.save_now_with_model(model_json.as_deref(), cx)
+        });
+        if saved && model_json.is_some() {
+            self.persisted_model = self.document.clone();
+            self.model_save_error = None;
+        }
+        let saved = saved && self.model_save_error.is_none();
         if !saved {
             self.set_status("Could not save this document, so it stays open", cx);
         }
@@ -2531,13 +2648,7 @@ impl SylphApp {
     }
 
     fn load_document_by_id(&mut self, doc_id: i64, cx: &mut Context<Self>) {
-        let saved = self
-            .editor
-            .read(cx)
-            .storage
-            .load_text(doc_id)
-            .unwrap_or(None)
-            .unwrap_or_default();
+        let (saved, read_only) = load_text_or_read_only(&self.editor.read(cx).storage, doc_id);
         let doc_title = self
             .editor
             .read(cx)
@@ -2550,6 +2661,7 @@ impl SylphApp {
         self.editor.update(cx, |editor, cx| {
             editor.doc_id = doc_id;
             editor.content = saved.clone();
+            editor.content_rev += 1;
             editor.selected_range = 0..0;
             editor.selection_reversed = false;
             editor.preferred_column = None;
@@ -2557,15 +2669,20 @@ impl SylphApp {
             editor.undo_stack.clear();
             editor.redo_stack.clear();
             // The text just came from storage, so there is nothing to save.
-            editor.save_state = SaveState::Saved;
+            editor.save_state = opened_state(&read_only, &editor.unpersisted);
+            editor.read_only = read_only.clone();
             cx.notify();
         });
         // Each document keeps its own page setup, cover page and inserted
         // blocks, so nothing leaks from the previous document.
-        let (model, warning) =
-            load_model_or_default(&self.editor.read(cx).storage, doc_id, &recovered_dir());
+        let (model, warning) = load_model_or_default(
+            &self.editor.read(cx).storage,
+            doc_id,
+            recovered_dir().as_deref(),
+        );
         self.persisted_model = model.clone();
         self.document = model;
+        self.sync_markdown_mode(cx);
         self.model_save_error = None;
         self.revisions.clear();
         self.selected_revision = None;
@@ -2574,6 +2691,12 @@ impl SylphApp {
         }
         if let Some(warning) = warning {
             self.set_status(warning, cx);
+        }
+        if let Some(reason) = read_only {
+            self.set_status(
+                format!("{reason}. It is open read-only, so nothing can overwrite it"),
+                cx,
+            );
         }
         self.doc_title = doc_title;
     }
@@ -2646,7 +2769,55 @@ impl SylphApp {
     }
 
     fn page_count(&self, cx: &mut Context<Self>) -> usize {
-        export_page_count(&self.export_view(cx))
+        let key = (
+            self.editor.read(cx).content_rev,
+            self.markdown_mode,
+            self.document.clone(),
+        );
+        self.page_count_memo
+            .get(key, || export_page_count(&self.export_view(cx)))
+    }
+
+    /// See `CaretStatus`. Block and page figures only mean something in
+    /// Markdown mode (OFF, every line is a block and the text is page 1).
+    /// The Document Map's typed headings (cached per edit).
+    pub(crate) fn outline(&self, cx: &mut Context<Self>) -> Vec<OutlineEntry> {
+        let editor = self.editor.read(cx);
+        self.outline_memo
+            .get(editor.content_rev, || text_outline(&editor.content))
+    }
+
+    /// Put the caret on the heading at `offset` and hand the keyboard to
+    /// the page, as Word's navigation pane does.
+    pub(crate) fn go_to_offset(
+        &mut self,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            let offset = offset.min(editor.content.len());
+            editor.move_to(offset, cx);
+        });
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    pub(crate) fn caret_status(&self, cx: &mut Context<Self>) -> CaretStatus {
+        let editor = self.editor.read(cx);
+        let cursor = editor.cursor_offset();
+        let markdown = self.markdown_mode;
+        self.caret_status_memo
+            .get((editor.content_rev, cursor, markdown), || {
+                let (line, column, words) = ui::cursor_status(&editor.content, cursor);
+                if markdown {
+                    let blocks = ui::block_status(&editor.content, cursor);
+                    let page = ui::caret_text_page(&editor.content, cursor);
+                    (line, column, words, blocks, page)
+                } else {
+                    (line, column, words, (0, 0), 1)
+                }
+            })
     }
 
     /// Export as `format` wherever the user chooses, like Save As in Word
@@ -2655,61 +2826,61 @@ impl SylphApp {
     /// file goes to the Documents folder and the status bar says so.
     fn export_document(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         self.overlay = WorkspaceOverlay::None;
+        if self.export_running {
+            self.set_status("An export is already running", cx);
+            return;
+        }
         let file_name = format!("{}.{}", safe_file_stem(&self.doc_title), format.ext());
         let folder = dirs::document_dir()
             .or_else(dirs::home_dir)
-            .unwrap_or_else(sylph_storage::data_dir);
+            .or_else(|| sylph_storage::data_dir().ok())
+            .unwrap_or_else(std::env::temp_dir);
         let answer = cx.prompt_for_new_path(&folder, Some(&file_name));
+        self.export_running = true;
         self.export_task = Some(cx.spawn(
             async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
                 let path = match answer.await {
                     Ok(Ok(Some(path))) => path,
-                    Ok(Ok(None)) => return, // cancelled
+                    Ok(Ok(None)) => {
+                        // Cancelled.
+                        let _ = this.update(cx, |this, cx| {
+                            this.export_running = false;
+                            cx.notify();
+                        });
+                        return;
+                    }
                     _ => folder.join(&file_name),
                 };
-                let _ = this.update(cx, |this, cx| this.export_to_path(format, &path, cx));
+                // Snapshot the document on the UI thread…
+                let Ok(job) = this.update(cx, |this, cx| {
+                    this.set_status(format!("Exporting {}…", file_name_of(&path)), cx);
+                    this.export_job(cx)
+                }) else {
+                    return;
+                };
+                // …and render it on a background thread, so a long export
+                // never freezes typing.
+                let out = path.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { run_export(format, job, &out) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.export_running = false;
+                    this.set_status(export_message(&path, result), cx);
+                });
             },
         ));
         cx.notify();
     }
 
-    /// Write the export (the same merged model as the canvas, through the
-    /// Python renderers) to `path` and report the result in the status bar.
-    fn export_to_path(&mut self, format: ExportFormat, path: &Path, cx: &mut Context<Self>) {
-        let out = path.to_string_lossy().into_owned();
-        let content = self.editor.read(cx).content.clone();
-        let model = self.export_view(cx);
-        let result = match serde_json::to_string(&model) {
-            Ok(json) => match format {
-                ExportFormat::Pdf => sylph_py_bridge::export_rich_pdf(&json, &out),
-                ExportFormat::Docx => sylph_py_bridge::export_rich_docx(&json, &out),
-                ExportFormat::Markdown => sylph_py_bridge::export_rich_markdown(&json, &out),
-            },
-            Err(e) => match format {
-                ExportFormat::Pdf => {
-                    // Never write DOCX bytes into a .pdf path.
-                    format!("Export failed to serialize document: {e}")
-                }
-                ExportFormat::Docx => {
-                    let fallback = sylph_py_bridge::export_to_docx(&content, &out);
-                    format!("Export failed to serialize document: {e}. Fallback: {fallback}")
-                }
-                ExportFormat::Markdown => format!("Export failed to serialize document: {e}"),
-            },
-        };
-        let name = path
-            .file_name()
-            .map_or(out.clone(), |n| n.to_string_lossy().into_owned());
-        let folder = path
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let message = if result.starts_with("Exported to ") {
-            format!("Exported · {name} (in {folder})")
-        } else {
-            result
-        };
-        self.set_status(message, cx);
+    /// What an export needs, taken on the UI thread: the same merged model
+    /// as the canvas, serialized, plus the raw text for the DOCX fallback.
+    fn export_job(&self, cx: &mut Context<Self>) -> ExportJob {
+        ExportJob {
+            json: serde_json::to_string(&self.export_view(cx)).map_err(|e| e.to_string()),
+            content: self.editor.read(cx).content.clone(),
+        }
     }
 
     fn export_docx(&mut self, _: &ExportDocx, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2745,21 +2916,10 @@ impl SylphApp {
     }
 
     fn add_image_asset(&mut self, bytes: &[u8], extension: &str, cx: &mut Context<Self>) {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let filename = format!("image_{}.{}", timestamp, extension);
-        let stored = data_path(&format!("images/{}", filename));
-        let path = stored.to_string_lossy().into_owned();
-        if std::fs::write(&path, bytes).is_ok() {
-            self.document
-                .push_block(sylph_core::document::Block::image(&path));
-            self.set_status(format!("Image added: {}", filename), cx);
-        } else {
-            self.set_status("Could not store the selected image", cx);
-        }
-        cx.notify();
+        let bytes = bytes.to_vec();
+        self.store_image(extension, cx, move |destination| {
+            std::fs::write(destination, bytes)
+        });
     }
 
     fn add_image_file(&mut self, source: PathBuf, cx: &mut Context<Self>) {
@@ -2776,22 +2936,50 @@ impl SylphApp {
             cx.notify();
             return;
         }
+        self.store_image(&extension, cx, move |destination| {
+            std::fs::copy(&source, destination).map(|_| ())
+        });
+    }
 
+    /// Write a new image into the data folder with `write` on a background
+    /// thread (a large file must not freeze typing), then insert its block.
+    fn store_image(
+        &mut self,
+        extension: &str,
+        cx: &mut Context<Self>,
+        write: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+    ) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let filename = format!("image_{}.{}", timestamp, extension);
-        let destination = data_path(&format!("images/{}", filename));
-        if std::fs::copy(&source, &destination).is_ok() {
-            let path = destination.to_string_lossy().into_owned();
-            self.document
-                .push_block(sylph_core::document::Block::image(&path));
-            self.set_status(format!("Image added: {}", filename), cx);
-        } else {
-            self.set_status("Could not copy the selected image", cx);
-        }
-        cx.notify();
+        let Some(destination) = data_path(&format!("images/{}", filename)) else {
+            self.set_status("Could not store the image: no data folder", cx);
+            cx.notify();
+            return;
+        };
+        let work = cx.background_spawn({
+            let destination = destination.clone();
+            async move { write(&destination) }
+        });
+        self.image_copy_task = Some(cx.spawn(
+            async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
+                let result = work.await;
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            let path = destination.to_string_lossy().into_owned();
+                            this.document
+                                .push_block(sylph_core::document::Block::image(&path));
+                            this.set_status(format!("Image added: {}", filename), cx);
+                        }
+                        Err(e) => this.set_status(format!("Could not store the image: {e}"), cx),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     fn open_image_picker(&mut self, cx: &mut Context<Self>) {
@@ -2940,6 +3128,24 @@ impl SylphApp {
         if !self.require_markdown(cx) {
             return;
         }
+        self.rewrite_selected_lines(cx, |_, line| with_heading_level(line, level));
+        let label = match level {
+            1..=6 => format!("Heading {level}"),
+            _ => "Normal".to_string(),
+        };
+        self.set_status(format!("Style: {label}"), cx);
+        cx.notify();
+    }
+
+    /// Replace every line the selection touches (the caret's line when it
+    /// is empty) with `rewrite(index, line)`, as one undoable edit.
+    /// `rewrite` returns the new line and the byte lengths of the marker
+    /// before and after, so the caret stays on the same character.
+    fn rewrite_selected_lines(
+        &mut self,
+        cx: &mut Context<Self>,
+        rewrite: impl Fn(usize, &str) -> (String, usize, usize),
+    ) {
         self.editor.update(cx, |editor, cx| {
             let sel = editor.selected_range.clone();
             let cursor = editor.cursor_offset();
@@ -2953,7 +3159,7 @@ impl SylphApp {
                 if i > 0 {
                     new_block.push('\n');
                 }
-                let (new_line, marker_before, marker_after) = with_heading_level(line, level);
+                let (new_line, marker_before, marker_after) = rewrite(i, line);
                 if new_cursor.is_none() && cursor <= line_start + line.len() {
                     // Same character after the marker; a caret inside the
                     // old marker lands at the start of the text.
@@ -2972,11 +3178,49 @@ impl SylphApp {
                 editor.select_to(start + new_block.len(), cx);
             }
         });
-        let label = match level {
-            1..=6 => format!("Heading {level}"),
-            _ => "Normal".to_string(),
+    }
+
+    /// Bullet or numbered list on the selected lines; applying the kind
+    /// they already have turns the list off again (like Word's buttons).
+    fn apply_list(&mut self, kind: ListKind, cx: &mut Context<Self>) {
+        if !self.require_markdown(cx) {
+            return;
+        }
+        let content = self.editor.read(cx).content.clone();
+        let sel = self.editor.read(cx).selected_range.clone();
+        let editor = self.editor.read(cx);
+        let (start, end) = (editor.line_start(sel.start), editor.line_end(sel.end));
+        let all_on = content[start..end]
+            .split('\n')
+            .all(|line| list_marker(line).is_some_and(|(k, _)| k == kind));
+        let target = (!all_on).then_some(kind);
+        self.rewrite_selected_lines(cx, |i, line| with_list_marker(line, target, i + 1));
+        let label = match (target, kind) {
+            (None, _) => "Normal",
+            (Some(_), ListKind::Bullet) => "Bullet list",
+            (Some(_), ListKind::Numbered) => "Numbered list",
         };
         self.set_status(format!("Style: {label}"), cx);
+        cx.notify();
+    }
+
+    /// Fence the selected lines (or an empty new block at the caret) as a
+    /// code block.
+    fn insert_code_block(&mut self, cx: &mut Context<Self>) {
+        if !self.require_markdown(cx) {
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            let sel = editor.selected_range.clone();
+            let start = editor.line_start(sel.start);
+            let end = editor.line_end(sel.end);
+            let body = editor.content[start..end].to_string();
+            let fenced = format!("```\n{body}\n```");
+            editor.replace_text_in_range(Some(start..end), &fenced, cx);
+            // The caret lands at the end of the code, inside the fence.
+            editor.move_to(start + 4 + body.len(), cx);
+        });
+        self.set_status("Inserted a code block", cx);
         cx.notify();
     }
 
@@ -3053,12 +3297,25 @@ impl SylphApp {
         if self.ai_panel.query.is_empty() {
             return;
         }
-        let query = self.ai_panel.query.clone();
+        let query = std::mem::take(&mut self.ai_panel.query);
         let doc_text = self.editor.read(cx).content.clone();
-        let response = sylph_py_bridge::chat_with_doc(&query, &doc_text);
-        self.ai_panel.history.push((query, response.clone()));
-        self.ai_panel.response = response;
-        self.ai_panel.query.clear();
+        self.ai_panel.response = "Thinking…".to_string();
+        // Off the UI thread; a newer question replaces (drops) this task,
+        // which discards its answer.
+        let work = cx.background_spawn({
+            let query = query.clone();
+            async move { sylph_py_bridge::chat_with_doc(&query, &doc_text) }
+        });
+        self.ai_task = Some(cx.spawn(
+            async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
+                let response = work.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.ai_panel.history.push((query, response.clone()));
+                    this.ai_panel.response = response;
+                    cx.notify();
+                });
+            },
+        ));
         cx.notify();
     }
 
@@ -3231,7 +3488,14 @@ impl SylphApp {
             let whole = 0..editor.content.len();
             editor.replace_text_in_range(Some(whole), &revision.text, cx);
             editor.move_to(0, cx);
-            editor.save_now(cx);
+            // A version of its own: folding it into the newest row would
+            // drop the text it replaces from the history.
+            editor.save_task.take();
+            if editor.read_only.is_none() {
+                let result = editor.storage.save_revision(editor.doc_id, &editor.content);
+                editor.record_write(result);
+            }
+            cx.notify();
         });
         self.load_revisions(cx);
         self.selected_revision = None;
@@ -3294,14 +3558,7 @@ impl SylphApp {
     }
 
     fn cycle_body_font(&mut self, _: &CycleBodyFont, _window: &mut Window, cx: &mut Context<Self>) {
-        let fonts = [
-            "Noto Serif",
-            "Noto Sans",
-            "Liberation Serif",
-            "Liberation Sans",
-            "DejaVu Serif",
-            "DejaVu Sans",
-        ];
+        let fonts = BODY_FONTS;
         let current = &self.document.body_font;
         let next_idx = fonts
             .iter()
@@ -3329,8 +3586,9 @@ impl SylphApp {
         if !self.markdown_mode {
             return 0;
         }
-        let content = self.editor.read(cx).content.clone();
-        let cursor = self.editor.read(cx).cursor_offset();
+        let editor = self.editor.read(cx);
+        let content = &editor.content;
+        let cursor = editor.cursor_offset();
         let line_start = content[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let line_end = content[cursor..]
             .find('\n')
@@ -3471,6 +3729,84 @@ impl SylphApp {
                 self.ai_panel.query.push_str(ch);
                 cx.notify();
             }
+        }
+    }
+
+    /// Keys for the open command palette, which holds the keyboard while
+    /// open: typing filters, ↑/↓ move, Enter runs, Esc closes.
+    fn on_palette_keystroke(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay != WorkspaceOverlay::CommandPalette
+            || self.editor.focus_handle(cx).is_focused(window)
+        {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let count = palette_matches(&self.palette.query).len();
+        match keystroke.key.as_str() {
+            "escape" => return self.close_palette(window, cx),
+            "down" if count > 0 => self.palette.selected = (self.palette.selected + 1) % count,
+            "up" if count > 0 => {
+                self.palette.selected = (self.palette.selected + count - 1) % count;
+            }
+            "enter" => {
+                if let Some(&i) = palette_matches(&self.palette.query).get(self.palette.selected) {
+                    self.run_palette_command(PALETTE_COMMANDS[i].1, window, cx);
+                }
+                return;
+            }
+            "backspace" => {
+                self.palette.query.pop();
+                self.palette.selected = 0;
+            }
+            _ => match &keystroke.key_char {
+                Some(ch)
+                    if !keystroke.modifiers.control
+                        && !keystroke.modifiers.platform
+                        && !keystroke.modifiers.alt =>
+                {
+                    self.palette.query.push_str(ch);
+                    self.palette.selected = 0;
+                }
+                _ => return,
+            },
+        }
+        cx.notify();
+    }
+
+    /// Close the palette and give the keyboard back to the document.
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = WorkspaceOverlay::None;
+        self.palette = PaletteState::default();
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Run the palette command titled `title` (see `PALETTE_COMMANDS`).
+    pub(crate) fn run_palette_command(
+        &mut self,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_palette(window, cx);
+        match title {
+            "Heading 1" => self.set_heading(1, window, cx),
+            "Heading 2" => self.set_heading(2, window, cx),
+            "Bullet list" => self.apply_list(ListKind::Bullet, cx),
+            "Numbered list" => self.apply_list(ListKind::Numbered, cx),
+            "Table" => self.insert_table(&InsertTable, window, cx),
+            "Image" => {
+                self.show_image_inspector(&ShowImageInspector, window, cx);
+                self.paste_image(&PasteImage, window, cx);
+            }
+            "Page break" => self.insert_page_break(&InsertPageBreak, window, cx),
+            "Code block" => self.insert_code_block(cx),
+            _ => {}
         }
     }
 
@@ -3669,6 +4005,17 @@ fn markdown_table(rows: usize, cols: usize) -> String {
         lines.push(row(vec![" ".to_string(); cols]));
     }
     lines.join("\n")
+}
+
+/// `text` with `\r\n` and lone `\r` turned into `\n`. The editor splits
+/// lines on `\n` and counts one byte per break, so a stray `\r` shifts
+/// every offset after it. Borrows when there is nothing to change.
+fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 /// Byte ranges of `query` in `text`, left to right and never overlapping.
@@ -4377,7 +4724,10 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
         // List: keep indent (nesting), render the bullet as `• ` and keep
         // ordered markers verbatim; task boxes become ☐/☑.
         b.ident(line, indent);
-        if trimmed.as_bytes()[indent].is_ascii_digit() {
+        // The marker starts at `trimmed`'s first byte; `indent` is measured
+        // on `line`, so indexing `trimmed` with it read the wrong byte and
+        // panicked on short lines such as "  - ".
+        if trimmed.starts_with(|c: char| c.is_ascii_digit()) {
             b.ident(line, marker_len);
         } else {
             b.replace(marker_len, "• ");
@@ -4977,12 +5327,12 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
 
 /// A path under the platform data directory (never relative to the launch
 /// cwd). Creates the parent directory so callers can write immediately.
-fn data_path(rel: &str) -> PathBuf {
-    let path = sylph_storage::data_dir().join(rel);
+fn data_path(rel: &str) -> Option<PathBuf> {
+    let path = sylph_storage::data_dir().ok()?.join(rel);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    path
+    Some(path)
 }
 
 /// Physical pages as the exporters lay the model out: one per page break,
@@ -4996,8 +5346,10 @@ fn export_page_count(model: &doc::Document) -> usize {
 }
 
 /// Where unreadable saved models are copied before defaults replace them.
-fn recovered_dir() -> PathBuf {
-    sylph_storage::data_dir().join("recovered")
+fn recovered_dir() -> Option<PathBuf> {
+    sylph_storage::data_dir()
+        .ok()
+        .map(|dir| dir.join("recovered"))
 }
 
 /// The saved structured model (page setup, cover page, inserted blocks)
@@ -5007,7 +5359,7 @@ fn recovered_dir() -> PathBuf {
 fn load_model_or_default(
     storage: &Storage,
     doc_id: i64,
-    recovered: &std::path::Path,
+    recovered: Option<&std::path::Path>,
 ) -> (doc::Document, Option<String>) {
     let json = match storage.load_model(doc_id) {
         Ok(Some(json)) => json,
@@ -5025,8 +5377,10 @@ fn load_model_or_default(
                 .unwrap_or_default()
                 .as_millis();
             let name = format!("document-{doc_id}-model-{millis}.json");
-            let kept = std::fs::create_dir_all(recovered).is_ok()
-                && std::fs::write(recovered.join(&name), &json).is_ok();
+            let kept = recovered.is_some_and(|recovered| {
+                std::fs::create_dir_all(recovered).is_ok()
+                    && std::fs::write(recovered.join(&name), &json).is_ok()
+            });
             let warning = if kept {
                 format!("Page setup could not be read ({e}); a copy was kept as recovered/{name}")
             } else {
@@ -5289,6 +5643,11 @@ fn main() {
     }
     Application::new().run(|cx: &mut App| {
         cx.bind_keys(key_bindings());
+        // Before any window: the UI and the page name these families, and
+        // they must not depend on what the system happens to have.
+        if let Err(e) = cx.text_system().add_fonts(bundled_fonts()) {
+            eprintln!("Could not load the bundled fonts: {e}");
+        }
 
         let bounds = Bounds::centered(None, size(px(1600.0), px(1280.0)), cx);
         let window = cx
@@ -5305,22 +5664,27 @@ fn main() {
                     ..Default::default()
                 },
                 |_, cx| {
-                    let storage = Storage::open().unwrap_or_else(|e| {
-                        eprintln!("Storage init failed: {}", e);
-                        Storage::default()
-                    });
+                    // No database means nothing can be saved. Run on in
+                    // memory, but say so permanently (never pretend).
+                    let (storage, unpersisted) = match Storage::open() {
+                        Ok(storage) => (storage, None),
+                        Err(e) => {
+                            eprintln!("Storage init failed: {e}");
+                            (
+                                Storage::in_memory(),
+                                Some(format!("the database could not open ({e})")),
+                            )
+                        }
+                    };
                     // Reopen what was open last time instead of adding a new
                     // empty "Untitled" on every launch.
                     let doc_id = storage.open_last_or_create().unwrap_or(1);
-                    let saved = storage
-                        .load_text(doc_id)
-                        .unwrap_or(None)
-                        .unwrap_or_default();
+                    let (saved, read_only) = load_text_or_read_only(&storage, doc_id);
                     let doc_title = storage
                         .get_title(doc_id)
                         .unwrap_or_else(|_| "Untitled".to_string());
                     let (document, model_warning) =
-                        load_model_or_default(&storage, doc_id, &recovered_dir());
+                        load_model_or_default(&storage, doc_id, recovered_dir().as_deref());
 
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
@@ -5333,7 +5697,7 @@ fn main() {
                         last_bounds: None,
                         all_lines: Vec::new(),
                         line_char_offsets: Vec::new(),
-                        markdown_mode: false,
+                        markdown_mode: document.markdown,
                         row_metas: Vec::new(),
                         content_height: px(0.0),
                         display_lines: Vec::new(),
@@ -5348,7 +5712,11 @@ fn main() {
                         show_line_numbers: false,
                         word_wrap: true,
                         save_task: None,
-                        save_state: SaveState::Saved,
+                        content_rev: 0,
+                        save_state: opened_state(&read_only, &unpersisted),
+                        unpersisted,
+                        read_only,
+                        last_saved_at: None,
                     });
                     cx.new(|cx| {
                         let keystroke_subscription = cx.observe_keystrokes(
@@ -5359,6 +5727,7 @@ fn main() {
                                 this.on_find_keystroke(event, _window, cx);
                                 this.on_title_keystroke(event, _window, cx);
                                 this.on_ai_keystroke(event, _window, cx);
+                                this.on_palette_keystroke(event, _window, cx);
                                 this.on_field_keystroke(event, _window, cx);
                             },
                         );
@@ -5367,6 +5736,7 @@ fn main() {
                         let model_observer = cx.observe_self(|this: &mut SylphApp, cx| {
                             this.persist_model_if_changed(cx)
                         });
+                        let persisted_markdown = document.markdown;
                         SylphApp {
                             editor,
                             persisted_model: document.clone(),
@@ -5390,8 +5760,13 @@ fn main() {
                             },
                             doc_title,
                             editing_title: false,
+                            title_before_edit: String::new(),
                             documents: Vec::new(),
                             dark_mode: false,
+                            palette: PaletteState::default(),
+                            page_count_memo: Memo::new(),
+                            caret_status_memo: Memo::new(),
+                            outline_memo: Memo::new(),
                             ai_panel: AiPanelState {
                                 visible: false,
                                 query: String::new(),
@@ -5406,11 +5781,14 @@ fn main() {
                             inspector_mode: InspectorMode::Paragraph,
                             inspector_visible: true,
                             overlay: WorkspaceOverlay::None,
-                            markdown_mode: false,
+                            markdown_mode: persisted_markdown,
                             ruler_visible: true,
                             zoom_percent: 100,
                             image_picker_task: None,
                             export_task: None,
+                            export_running: false,
+                            image_copy_task: None,
+                            ai_task: None,
                             table_picker: (0, 0),
                             open_menu: None,
                             revisions: Vec::new(),
@@ -5891,30 +6269,6 @@ mod export_model_tests {
         // Round-trip: the same JSON the headless CLI validates.
         let back: Document = serde_json::from_str(&json).expect("parse back");
         assert_eq!(back, model);
-    }
-
-    #[test]
-    #[ignore = "writes a proof artifact for manual headless CLI verification"]
-    fn write_merged_proof_json() {
-        use sylph_core::document::{Block, CoverPageData, Document};
-        let mut structured = Document::new();
-        structured.set_cover_page(
-            CoverPageData::new()
-                .with_title("Merge Proof — cover")
-                .with_subtitle("subtitle")
-                .with_author("Anmol"),
-        );
-        structured.push_block(Block::page_break());
-        structured.push_block(Block::table(2, 2));
-        let model = export_model(
-            &structured,
-            "# Merged Head\n\nBody **bold** and *italic* text.\n\nSecond paragraph.",
-            true,
-        );
-        let json = serde_json::to_string_pretty(&model).expect("serialize");
-        std::fs::create_dir_all("/tmp/opencode").expect("tmp dir");
-        std::fs::write("/tmp/opencode/merged.json", &json).expect("write proof");
-        assert!(json.contains("Merged Head"));
     }
 }
 
@@ -6579,26 +6933,6 @@ mod markdown_wysiwyg_tests {
 }
 
 #[cfg(test)]
-mod save_state_tests {
-    use super::SaveState;
-
-    #[test]
-    fn save_state_reports_the_real_result() {
-        assert_eq!(SaveState::from_result(Ok(())), SaveState::Saved);
-        let failed = SaveState::from_result(Err("disk full".into()));
-        assert_eq!(failed, SaveState::Failed("disk full".to_string()));
-        // A failure says why instead of claiming the changes were saved.
-        assert_eq!(failed.label(), "Save failed: disk full");
-    }
-
-    #[test]
-    fn save_state_labels_use_word_docs_wording() {
-        assert_eq!(SaveState::Saved.label(), "All changes saved");
-        assert_eq!(SaveState::Saving.label(), "Saving…");
-    }
-}
-
-#[cfg(test)]
 mod model_persistence_tests {
     use super::{doc, load_model_or_default};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6618,7 +6952,7 @@ mod model_persistence_tests {
     #[test]
     fn saved_model_loads_back() {
         let dir = temp_dir();
-        let storage = Storage::open_in(&dir).unwrap();
+        let storage = Storage::open_at(&dir).unwrap();
         let id = storage.create_document("Report").unwrap();
         let mut model = doc::Document::new();
         model.set_page_size(doc::PageSize::Letter);
@@ -6626,7 +6960,7 @@ mod model_persistence_tests {
         let json = serde_json::to_string(&model).unwrap();
         storage.save_model(id, &json).unwrap();
 
-        let (loaded, warning) = load_model_or_default(&storage, id, &dir.join("recovered"));
+        let (loaded, warning) = load_model_or_default(&storage, id, Some(&dir.join("recovered")));
         assert_eq!(loaded, model);
         assert_eq!(warning, None);
     }
@@ -6634,9 +6968,9 @@ mod model_persistence_tests {
     #[test]
     fn document_without_a_model_gets_defaults_silently() {
         let dir = temp_dir();
-        let storage = Storage::open_in(&dir).unwrap();
+        let storage = Storage::open_at(&dir).unwrap();
         let id = storage.create_document("Older document").unwrap();
-        let (loaded, warning) = load_model_or_default(&storage, id, &dir.join("recovered"));
+        let (loaded, warning) = load_model_or_default(&storage, id, Some(&dir.join("recovered")));
         assert_eq!(loaded, doc::Document::new());
         assert_eq!(warning, None);
     }
@@ -6644,13 +6978,13 @@ mod model_persistence_tests {
     #[test]
     fn unreadable_model_is_kept_before_defaults_take_over() {
         let dir = temp_dir();
-        let storage = Storage::open_in(&dir).unwrap();
+        let storage = Storage::open_at(&dir).unwrap();
         let id = storage.create_document("From a newer Sylph").unwrap();
         let json = r#"{"blocks":[{"Hologram":{}}]}"#;
         storage.save_model(id, json).unwrap();
 
         let recovered = dir.join("recovered");
-        let (loaded, warning) = load_model_or_default(&storage, id, &recovered);
+        let (loaded, warning) = load_model_or_default(&storage, id, Some(&recovered));
         assert_eq!(loaded, doc::Document::new());
         let warning = warning.expect("an unreadable model must be reported");
         assert!(
@@ -6750,6 +7084,15 @@ mod find_replace_tests {
         // The old search stepped one byte past each hit, which lands inside
         // a two-byte character and panicked.
         assert_eq!(find_matches("éé", "é", false), vec![0..2, 2..4]);
+        // Devanagari: two hits, both on character boundaries.
+        let text = "नेपाल नेपाली";
+        let hits = find_matches(text, "नेपाल", false);
+        assert_eq!(hits.len(), 2);
+        assert!(hits
+            .iter()
+            .all(|r| text.is_char_boundary(r.start) && text.is_char_boundary(r.end)));
+        assert_eq!(find_matches("café é", "é", false).len(), 2);
+        assert!(find_matches("ab", "abc", false).is_empty());
         assert_eq!(find_matches("naïve NAÏVE", "naïve", false), vec![0..6]);
         // Non-ASCII letters match exactly (case folding them would move
         // byte offsets).
@@ -6848,5 +7191,62 @@ mod menu_label_tests {
             let text = shortcut_text(&binding);
             assert!(!text.is_empty() && !text.ends_with('+'), "{text:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod indented_list_tests {
+    use super::*;
+
+    #[test]
+    fn indented_list_lines_never_panic() {
+        for line in ["  - ", "    - x", "        - a", "  -", "   "] {
+            display_line(line, false, true);
+        }
+    }
+
+    #[test]
+    fn indented_ordered_item_keeps_its_number() {
+        let dl = display_line("  1. first", false, true);
+        assert_eq!(dl.kind, DisplayKind::List);
+        assert_eq!(dl.text, "  1. first");
+        let dl = display_line("  - item", false, true);
+        assert_eq!(dl.text, "  • item");
+    }
+
+    #[test]
+    fn every_short_line_over_list_characters_is_safe() {
+        // 6 + 6² + … + 6⁶ = 55,986 strings.
+        let alphabet = [' ', '-', '*', '1', '.', 'x'];
+        let mut stack: Vec<String> = vec![String::new()];
+        let mut checked = 0;
+        while let Some(prefix) = stack.pop() {
+            if prefix.len() == 6 {
+                continue;
+            }
+            for c in alphabet {
+                let line = format!("{prefix}{c}");
+                display_line(&line, false, true);
+                checked += 1;
+                stack.push(line);
+            }
+        }
+        assert_eq!(checked, 55_986);
+    }
+}
+
+#[cfg(test)]
+mod newline_tests {
+    use super::*;
+
+    #[test]
+    fn crlf_and_cr_become_lf() {
+        assert_eq!(normalize_newlines("a\r\nb"), "a\nb");
+        assert_eq!(normalize_newlines("a\rb"), "a\nb");
+        assert_eq!(normalize_newlines("a\r\n\r\nb"), "a\n\nb");
+        assert!(matches!(
+            normalize_newlines("plain\ntext"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

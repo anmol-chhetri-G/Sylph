@@ -1,0 +1,7 @@
+# Honoured by rustup (e.g. CI). The author builds with Arch's system Rust,
+# which ignores this file, so keep the pin equal to `rustc --version` there.
+# Floor: 1.95 (gpui 0.2.2 is edition 2024; krilla needs >=1.92 and
+# rusqlite_migration 2.6 needs >=1.95, both later in the plan).
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

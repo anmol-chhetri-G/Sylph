@@ -42,6 +42,7 @@ AGENT.md
 codex-session-*
 WORKFLOW.md
 SYLPH_PLAN.md
+.claude/
 
 # Secrets and env
 .env

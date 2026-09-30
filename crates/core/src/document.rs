@@ -141,17 +141,6 @@ impl ImageData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Caption {
-    pub text: String,
-}
-
-impl Caption {
-    pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoverPageData {
     pub title: String,
     pub subtitle: String,
@@ -471,6 +460,10 @@ impl Default for PageMargins {
     }
 }
 
+/// The page font of a new document. A bundled family (assets/fonts), so it
+/// looks the same on every machine.
+pub const DEFAULT_BODY_FONT: &str = "EB Garamond";
+
 /// `#[serde(default)]`: a saved model that predates a field loads with that
 /// field's default instead of failing (models are persisted per document).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -484,6 +477,10 @@ pub struct Document {
     pub body_font: String,
     pub body_font_size: f32,
     pub landscape: bool,
+    /// Markdown mode: the text is Markdown source (headings, lists,
+    /// emphasis) rather than literal lines. Saved per document because it
+    /// changes what the export produces.
+    pub markdown: bool,
 }
 
 impl Document {
@@ -494,9 +491,10 @@ impl Document {
             page_size: PageSize::A4,
             page_margins: PageMargins::default(),
             line_spacing: 1.15,
-            body_font: "Noto Serif".to_string(),
+            body_font: DEFAULT_BODY_FONT.to_string(),
             body_font_size: 11.0,
             landscape: false,
+            markdown: false,
         }
     }
 
@@ -507,9 +505,10 @@ impl Document {
             page_size: PageSize::A4,
             page_margins: PageMargins::default(),
             line_spacing: 1.15,
-            body_font: "Noto Serif".to_string(),
+            body_font: DEFAULT_BODY_FONT.to_string(),
             body_font_size: 11.0,
             landscape: false,
+            markdown: false,
         }
     }
 
@@ -616,9 +615,10 @@ impl Document {
             page_size: PageSize::A4,
             page_margins: PageMargins::default(),
             line_spacing: 1.15,
-            body_font: "Noto Serif".to_string(),
+            body_font: DEFAULT_BODY_FONT.to_string(),
             body_font_size: 11.0,
             landscape: false,
+            markdown: false,
         }
     }
 
@@ -727,6 +727,21 @@ mod tests {
         assert_eq!(loaded.body_font_size, Document::new().body_font_size);
     }
 
+    #[test]
+    fn test_markdown_flag_is_saved_with_the_document() {
+        let doc = Document {
+            markdown: true,
+            ..Document::new()
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(serde_json::from_str::<Document>(&json).unwrap().markdown);
+        // Models saved before the flag existed open with Markdown off, as
+        // every launch did then.
+        let mut old = serde_json::to_value(Document::new()).unwrap();
+        old.as_object_mut().unwrap().remove("markdown");
+        assert!(!serde_json::from_value::<Document>(old).unwrap().markdown);
+    }
+
     // ── TextRun ─────────────────────────────────────────────────
 
     #[test]
@@ -788,14 +803,6 @@ mod tests {
         assert!(img.caption.is_none());
         assert!(img.width > 0.0);
         assert!(img.height > 0.0);
-    }
-
-    // ── Caption ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_caption_new() {
-        let cap = Caption::new("Figure 1");
-        assert_eq!(cap.text, "Figure 1");
     }
 
     // ── Block ───────────────────────────────────────────────────
