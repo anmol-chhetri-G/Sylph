@@ -307,8 +307,9 @@ fn split_runs(
             let mut piece = run.clone();
             piece.len = end - start;
             if let Some(family) = &format.font {
-                piece.font.family = family.clone().into();
+                piece.font.family = crate::fonts::render_family(family).to_string().into();
             }
+            apply_emphasis(&mut piece, format);
             let size = format.size.map_or(base_size, |pt| px(pt * PX_PER_PT));
             out.push((start..end, size, piece));
         }
@@ -340,7 +341,9 @@ pub(crate) fn line_formats(
     let text = &dl.text[range.clone()];
     let mut out: Vec<(Range<usize>, CharFormat)> = Vec::new();
     for (i, _) in text.char_indices() {
-        let src = dl.src_offset + dl.disp_to_src(range.start + i);
+        // The character's own source byte (not the caret position, which
+        // after hidden `**` would read the marker's formatting).
+        let src = dl.src_offset + dl.char_src(range.start + i);
         let format = formats.format_at(src);
         match out.last_mut() {
             Some((r, f)) if *f == format => r.end = i,
@@ -382,4 +385,40 @@ fn slice_formats(
             (start < end).then(|| (start - range.start..end - range.start, f.clone()))
         })
         .collect()
+}
+
+/// Bold / italic / underline / strikethrough from character formatting on
+/// a run; `Some(false)` turns off what the style or Markdown gave it.
+fn apply_emphasis(run: &mut TextRun, format: &CharFormat) {
+    match format.bold {
+        Some(true) => run.font.weight = gpui::FontWeight::BOLD,
+        Some(false) => run.font.weight = gpui::FontWeight::NORMAL,
+        None => {}
+    }
+    match format.italic {
+        Some(true) => run.font.style = gpui::FontStyle::Italic,
+        Some(false) => run.font.style = gpui::FontStyle::Normal,
+        None => {}
+    }
+    match format.underline {
+        Some(true) => {
+            run.underline = Some(gpui::UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(run.color),
+                wavy: false,
+            })
+        }
+        Some(false) => run.underline = None,
+        None => {}
+    }
+    match format.strike {
+        Some(true) => {
+            run.strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(run.color),
+            })
+        }
+        Some(false) => run.strikethrough = None,
+        None => {}
+    }
 }

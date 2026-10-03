@@ -1,8 +1,12 @@
 //! The bundled OFL fonts (assets/fonts).
 
-/// Body fonts the toolbar cycles through: only bundled families, so each
-/// one renders the same on every machine.
-pub(crate) const BODY_FONTS: [&str; 6] = [
+/// Body fonts the font list offers: bundled families (or Word's names for
+/// their metric-compatible stand-ins, see `FONT_ALIASES`), so each one
+/// renders the same on every machine.
+pub(crate) const BODY_FONTS: [&str; 9] = [
+    "Times New Roman",
+    "Arial",
+    "Courier New",
     "EB Garamond",
     "Source Serif 4",
     "Lora",
@@ -10,6 +14,25 @@ pub(crate) const BODY_FONTS: [&str; 6] = [
     "Inter",
     "JetBrains Mono",
 ];
+
+/// Word's standard fonts, which universities ask for by name, drawn with
+/// their open (OFL) metric-compatible equivalents: every character has the
+/// same width, so lines and pages break as in Word, as LibreOffice does.
+/// The document (and its DOCX) keeps the Word name, so Word uses the real
+/// font; the canvas and the PDF use the stand-in.
+pub(crate) const FONT_ALIASES: [(&str, &str); 3] = [
+    ("Times New Roman", "Liberation Serif"),
+    ("Arial", "Liberation Sans"),
+    ("Courier New", "Liberation Mono"),
+];
+
+/// The bundled family that draws font `name`.
+pub(crate) fn render_family(name: &str) -> &str {
+    FONT_ALIASES
+        .iter()
+        .find(|(word, _)| word.eq_ignore_ascii_case(name))
+        .map_or(name, |(_, bundled)| bundled)
+}
 
 /// The bundled OFL fonts (assets/fonts, each family with its OFL.txt).
 ///
@@ -46,10 +69,27 @@ pub(crate) fn bundled_fonts() -> Vec<std::borrow::Cow<'static, [u8]>> {
         font!("Inter/Italic.ttf"),
         font!("Inter/Bold.ttf"),
         font!("Inter/BoldItalic.ttf"),
+        font!("LiberationSerif/Regular.ttf"),
+        font!("LiberationSerif/Bold.ttf"),
+        font!("LiberationSerif/Italic.ttf"),
+        font!("LiberationSerif/BoldItalic.ttf"),
+        font!("LiberationSans/Regular.ttf"),
+        font!("LiberationSans/Bold.ttf"),
+        font!("LiberationSans/Italic.ttf"),
+        font!("LiberationSans/BoldItalic.ttf"),
+        font!("LiberationMono/Regular.ttf"),
+        font!("LiberationMono/Bold.ttf"),
+        font!("LiberationMono/Italic.ttf"),
+        font!("LiberationMono/BoldItalic.ttf"),
         font!("HankenGrotesk/Regular.ttf"),
         font!("HankenGrotesk/SemiBold.ttf"),
+        font!("HankenGrotesk/Bold.ttf"),
+        font!("HankenGrotesk/Italic.ttf"),
+        font!("HankenGrotesk/BoldItalic.ttf"),
         font!("JetBrainsMono/Regular.ttf"),
         font!("JetBrainsMono/Bold.ttf"),
+        font!("JetBrainsMono/Italic.ttf"),
+        font!("JetBrainsMono/BoldItalic.ttf"),
         font!("NotoSansDevanagari/Regular.ttf"),
         font!("NotoSansDevanagari/Bold.ttf"),
         font!("NotoSerifDevanagari/Regular.ttf"),
@@ -80,12 +120,40 @@ mod bundled_font_tests {
     }
 
     #[test]
+    fn every_body_font_has_bold_and_italic_faces() {
+        // GPUI does not fake missing styles: without these faces, Ctrl+B
+        // and Ctrl+I silently did nothing in that font.
+        let mut faces: Vec<(String, u16, bool)> = Vec::new();
+        for bytes in bundled_fonts() {
+            let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+            let family = face
+                .names()
+                .into_iter()
+                .find(|n| n.name_id == 1 && n.is_unicode())
+                .and_then(|n| n.to_string())
+                .unwrap();
+            faces.push((family, face.weight().to_number(), face.is_italic()));
+        }
+        for family in BODY_FONTS.map(super::render_family) {
+            for (weight, italic) in [(400, false), (400, true), (700, false), (700, true)] {
+                assert!(
+                    faces
+                        .iter()
+                        .any(|(f, w, i)| f == family && *w == weight && *i == italic),
+                    "{family} lacks weight {weight} italic {italic}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_family_the_ui_names_is_bundled() {
         let families = bundled_families();
-        for family in BODY_FONTS
-            .iter()
-            .chain(&[ui::UI_FONT, ui::PROSE_FONT, ui::MONO_FONT])
-        {
+        for family in BODY_FONTS.iter().map(|f| super::render_family(f)).chain([
+            ui::UI_FONT,
+            ui::PROSE_FONT,
+            ui::MONO_FONT,
+        ]) {
             assert!(
                 families.iter().any(|f| f == family),
                 "{family} is named but not bundled: {families:?}"

@@ -806,7 +806,7 @@ mod tests {
         let r = export_rich_pdf(doc, &tmp("styles.pdf"));
         assert!(r.starts_with("Exported"), "pdf: {r}");
         if let Some(fonts) = pdf_fonts(&tmp("styles.pdf")) {
-            assert!(fonts.contains("+HankenGroteskSemiBold "), "{fonts}");
+            assert!(fonts.contains("+HankenGroteskBold "), "{fonts}");
             assert!(fonts.contains("+EBGaramondBold "), "{fonts}");
             assert!(fonts.contains("+EBGaramond "), "{fonts}");
         }
@@ -953,6 +953,32 @@ mod tests {
         assert!(r.starts_with("Exported"), "pdf: {r}");
     }
 
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_times_new_roman_documents() {
+        // A document set in Times New Roman: the PDF embeds the metric-
+        // compatible Liberation Serif (bold included), the DOCX keeps the
+        // Word name so Word uses the real font.
+        let r = export_rich_pdf(&typography_doc("Times New Roman"), &tmp("tnr.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        if let Some(fonts) = pdf_fonts(&tmp("tnr.pdf")) {
+            assert!(fonts.contains("+LiberationSerif "), "{fonts}");
+            assert!(fonts.contains("+LiberationSerifBold "), "{fonts}");
+        }
+        let r = export_rich_docx(&typography_doc("Times New Roman"), &tmp("tnr.docx"));
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let styles = docx_part(&tmp("tnr.docx"), "word/styles.xml");
+        assert!(styles.contains(r#"w:ascii="Times New Roman""#), "{styles}");
+        let r = export_rich_pdf(&typography_doc("Arial"), &tmp("arial.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        if let Some(fonts) = pdf_fonts(&tmp("arial.pdf")) {
+            assert!(fonts.contains("+LiberationSans"), "{fonts}");
+        }
+    }
+
     /// The fonts a PDF's pages use, via poppler's `pdffonts` (every
     /// registered font is written to the file, used or not).
     fn pdf_fonts(path: &str) -> Option<String> {
@@ -1024,7 +1050,7 @@ mod tests {
         assert!(serif.contains("+EBGaramond "), "{serif}");
         assert!(serif.contains("+EBGaramondBold "), "{serif}");
         let sans = pdf_fonts(&tmp("sans.pdf")).unwrap();
-        assert!(sans.contains("+HankenGroteskSemiBold "), "{sans}");
+        assert!(sans.contains("+HankenGroteskBold "), "{sans}");
         assert!(!sans.contains("+EBGaramond"), "{sans}");
         // Every used font embedded, subset and with a Unicode map (the
         // emb, sub and uni columns of pdffonts).

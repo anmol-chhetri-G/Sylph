@@ -14,7 +14,7 @@ use gpui::{
     anchored, deferred, div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels,
     Rgba, Stateful, Window,
 };
-use sylph_core::format::Alignment;
+use sylph_core::format::{Alignment, Emphasis};
 
 pub(crate) const UI_FONT: &str = "Hanken Grotesk";
 pub(crate) const PROSE_FONT: &str = "EB Garamond";
@@ -797,6 +797,7 @@ impl SylphApp {
                 vec![
                     Item("Bold", Box::new(BoldText), None),
                     Item("Italic", Box::new(ItalicText), None),
+                    Item("Underline", Box::new(crate::UnderlineText), None),
                     Item("Clear formatting", Box::new(crate::ClearFormatting), None),
                     Separator,
                     Item("Align left", Box::new(crate::AlignLeft), None),
@@ -1459,51 +1460,27 @@ impl SylphApp {
             )
             .child(divider(border));
 
+        // B / I / U / S: character formatting, so they work with Markdown
+        // on or off; lit when the selection / caret already has it.
         let mut emphasis = div().flex().items_center().gap(px(2.0));
-        for (glyph, id, action, active, tip) in [
-            ("B", "emph-bold", 0, false, "Bold"),
-            ("I", "emph-italic", 1, false, "Italic"),
+        for (glyph, id, kind, tip) in [
+            ("B", "emph-bold", Emphasis::Bold, "Bold (Ctrl+B)"),
+            ("I", "emph-italic", Emphasis::Italic, "Italic (Ctrl+I)"),
             (
                 "U",
                 "emph-underline",
-                2,
-                false,
-                "Underline — not supported in Markdown v1",
+                Emphasis::Underline,
+                "Underline (Ctrl+U)",
             ),
-            ("S", "emph-strike", 3, false, "Strikethrough"),
+            ("S", "emph-strike", Emphasis::Strike, "Strikethrough"),
         ] {
-            // Markdown OFF = literal text, so B/I/S would only insert raw
-            // markers: dim them and say why. Underline is unwired either
-            // way, so it keeps its own honest tip.
-            let enabled = action == 2 || markdown_on;
-            let button = if enabled {
-                self.compact_button(glyph, active)
-            } else {
-                self.compact_button(glyph, false).opacity(0.45)
-            };
-            let tip = if enabled {
-                tip
-            } else {
-                "Formatting needs Markdown mode"
-            };
-            let button = with_tip(button, id, tip);
-            emphasis = emphasis.child(match action {
-                0 => button.on_mouse_down(
+            let active = self.editor.read(cx).emphasis_active(kind);
+            emphasis = emphasis.child(
+                with_tip(self.compact_button(glyph, active), id, tip).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.bold_text(&BoldText, window, cx)),
+                    cx.listener(move |this, _, _, cx| this.toggle_emphasis(kind, cx)),
                 ),
-                1 => button.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.italic_text(&ItalicText, window, cx)),
-                ),
-                3 => button.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.strikethrough_text(&StrikethroughText, window, cx)
-                    }),
-                ),
-                _ => button,
-            });
+            );
         }
 
         let mut align = div().flex().items_center().gap(px(2.0));
@@ -2142,7 +2119,7 @@ impl SylphApp {
             .bg(self.ui_page())
             .text_color(self.ui_text())
             // The document's own typeface, like the body text below it.
-            .font_family(self.document.body_font.clone())
+            .font_family(crate::fonts::render_family(&self.document.body_font).to_string())
             .shadow_md()
             .relative()
             .child(self.cover_fields(cover, cx))
@@ -2211,7 +2188,7 @@ impl SylphApp {
             .right(margin_right)
             .h(editor_h)
             .overflow_hidden()
-            .font_family(self.document.body_font.clone())
+            .font_family(crate::fonts::render_family(&self.document.body_font).to_string())
             .text_size(text_size)
             .line_height(line_height)
             .text_color(text)
@@ -2287,7 +2264,7 @@ impl SylphApp {
             .h(editor_h)
             .flex_shrink_0()
             .overflow_hidden()
-            .font_family(self.document.body_font.clone())
+            .font_family(crate::fonts::render_family(&self.document.body_font).to_string())
             .text_size(text_size)
             .line_height(line_height)
             .text_color(text)
@@ -2856,6 +2833,48 @@ impl SylphApp {
                 .child(label(format!("{modifier}{key}"), muted, 11.0))
         };
         let separator = || div().h(px(1.0)).my(px(4.0)).bg(border);
+        // Table commands when the caret is in a table (right-click moved
+        // it there).
+        let in_table = {
+            let editor = self.editor.read(cx);
+            editor.table_line_at(editor.cursor_offset()).is_some()
+        };
+        let mut table_items = div().flex().flex_col();
+        if in_table {
+            use crate::table_view::TableCommand::*;
+            for (name, command) in [
+                ("Insert row above", InsertRowAbove),
+                ("Insert row below", InsertRowBelow),
+                ("Insert column left", InsertColumnLeft),
+                ("Insert column right", InsertColumnRight),
+                ("Delete row", DeleteRow),
+                ("Delete column", DeleteColumn),
+                ("Delete table", DeleteTable),
+            ] {
+                table_items = table_items.child(
+                    div()
+                        .h(px(28.0))
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(move |r| r.bg(hover))
+                        .child(label(name, text, 12.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu.visible = false;
+                                this.editor.update(cx, |editor, cx| {
+                                    editor.table_command(command, cx);
+                                });
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
+            table_items = table_items.child(separator());
+        }
         let menu = div()
             .w(px(220.0))
             .p(px(4.0))
@@ -2867,6 +2886,7 @@ impl SylphApp {
             .rounded(px(6.0))
             .shadow_lg()
             .font_family(UI_FONT)
+            .child(table_items)
             .child(row("Cut", "X").on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -3608,6 +3628,7 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::new_document))
             .on_action(cx.listener(Self::rename_document))
             .on_action(cx.listener(Self::clear_formatting))
+            .on_action(cx.listener(Self::underline_text))
             .on_action(cx.listener(Self::align_left))
             .on_action(cx.listener(Self::align_center))
             .on_action(cx.listener(Self::align_right))

@@ -17,11 +17,57 @@ pub struct CharFormat {
     /// Font family.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
+    /// Bold, italic, underline, strikethrough: `Some(true)` on,
+    /// `Some(false)` explicitly off (e.g. un-bolding a heading's words or
+    /// `**`-bold text), `None` as the style / Markdown says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strike: Option<bool>,
+}
+
+/// The on/off character attributes that the B / I / U / S buttons toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emphasis {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+}
+
+impl CharFormat {
+    /// This format's setting for `emphasis` (`None`: not set here).
+    pub fn emphasis(&self, emphasis: Emphasis) -> Option<bool> {
+        match emphasis {
+            Emphasis::Bold => self.bold,
+            Emphasis::Italic => self.italic,
+            Emphasis::Underline => self.underline,
+            Emphasis::Strike => self.strike,
+        }
+    }
+
+    pub fn set_emphasis(&mut self, emphasis: Emphasis, value: Option<bool>) {
+        match emphasis {
+            Emphasis::Bold => self.bold = value,
+            Emphasis::Italic => self.italic = value,
+            Emphasis::Underline => self.underline = value,
+            Emphasis::Strike => self.strike = value,
+        }
+    }
 }
 
 impl SpanFormat for CharFormat {
     fn is_empty(&self) -> bool {
-        self.size.is_none() && self.font.is_none()
+        self.size.is_none()
+            && self.font.is_none()
+            && self.bold.is_none()
+            && self.italic.is_none()
+            && self.underline.is_none()
+            && self.strike.is_none()
     }
 }
 

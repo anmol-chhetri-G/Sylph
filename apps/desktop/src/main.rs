@@ -21,6 +21,7 @@ use sylph_core::{
 use sylph_storage::Storage;
 
 mod char_export;
+mod emphasis;
 mod pagination;
 mod rich_row;
 mod table_view;
@@ -153,6 +154,11 @@ struct TextInput {
     /// headings): what the canvas lays rows out with. Kept in step by
     /// `SylphApp::sync_editor_styles`.
     styles: [doc::ResolvedStyle; 7],
+    /// A table column border being dragged (see `table_view`).
+    column_drag: Option<table_view::ColumnDrag>,
+    /// B / I / U / S chosen with only a caret, for the text typed next
+    /// (cleared when the caret moves), as in Word.
+    pending_emphasis: Vec<(sylph_core::format::Emphasis, bool)>,
     /// Paragraph formatting over whole lines of `content` (alignment,
     /// this-paragraph spacing), moved along by every edit.
     para_formats: ParagraphSpans,
@@ -181,6 +187,7 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = snap_to_char_boundary(&self.content, offset.min(self.content.len()));
+        self.pending_emphasis.clear();
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         self.preferred_column = None;
@@ -190,6 +197,7 @@ impl TextInput {
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = snap_to_char_boundary(&self.content, offset.min(self.content.len()));
+        self.pending_emphasis.clear();
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -254,7 +262,7 @@ impl TextInput {
             .iter()
             .rposition(|m| m.box_top <= local_y)
             .unwrap_or(0);
-        let meta = self.row_metas[row_idx];
+        let meta = &self.row_metas[row_idx];
         let local_x = (position.x - bounds.left()).max(px(0.0));
         // The shaped line is display text; map back through the source→
         // display transform so clicks land on real source offsets.
@@ -941,6 +949,11 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        // On a table's column border: resize the column, not the caret.
+        if let Some(drag) = self.column_border_at(event.position) {
+            self.column_drag = Some(drag);
+            return cx.notify();
+        }
         let pos = self.index_for_mouse_position(event.position);
         if event.click_count == 2 {
             let start = self.previous_word_boundary(pos);
@@ -979,11 +992,17 @@ impl TextInput {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_selecting = false;
+        if self.column_drag.is_some() {
+            self.finish_column_drag(cx);
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.column_drag.is_some() {
+            return self.drag_column_to(event.position, cx);
+        }
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -1255,6 +1274,8 @@ impl TextInput {
         let paras_before = self.para_formats.clone();
 
         self.apply_edit(start, end, new_text, cx);
+        // Bold / italic chosen with only a caret apply to typed text.
+        self.apply_pending_emphasis(start..start + new_text.len());
         self.redo_stack.clear();
         let now = std::time::Instant::now();
         // Typing and runs of Backspace/Delete join the previous step, so
@@ -1585,11 +1606,13 @@ struct PrepRow {
 }
 
 /// A table row's grid on the canvas.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TableRowGeom {
-    columns: usize,
-    col_w: gpui::Pixels,
+    /// Column edges, left to right, relative to the row's left (first 0).
+    boundaries: Vec<gpui::Pixels>,
     header: bool,
+    /// Display line index of the table's header row.
+    header_line: usize,
 }
 
 /// Padding inside a table cell, in px: above/below the text, and left.
@@ -1598,7 +1621,7 @@ const TABLE_CELL_PAD_X: f32 = 6.0;
 
 /// Persisted half of `PrepRow` — layout metrics the input needs for
 /// hit-testing, scroll clamping and caret visibility between frames.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RowMeta {
     box_top: gpui::Pixels,
     text_top: gpui::Pixels,
@@ -1606,6 +1629,8 @@ struct RowMeta {
     src_start: usize,
     disp_start: usize,
     line_idx: usize,
+    /// A table row's header line and column edges (for resizing).
+    table: Option<(usize, Vec<gpui::Pixels>)>,
 }
 
 struct PrepaintState {
@@ -1615,6 +1640,7 @@ struct PrepaintState {
     gutter_width: gpui::Pixels,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    resize_hitboxes: Vec<gpui::Hitbox>,
 }
 
 impl IntoElement for TextElement {
@@ -1672,6 +1698,7 @@ impl Element for TextElement {
         let markdown_on = input.markdown_mode;
         let styles = input.styles.clone();
         let char_formats = input.formats.clone();
+        let column_drag = input.column_drag.clone();
         let para_formats = input.para_formats.clone();
         let flow = input.page_flow;
         let input_rev = input.content_rev;
@@ -1730,7 +1757,8 @@ impl Element for TextElement {
         let mut y = px(0.0);
 
         // Columns of the table being laid out (set by its header row).
-        let mut table_cols = 1usize;
+        let mut table_fractions: Vec<f32> = vec![1.0];
+        let mut table_header_line = 0usize;
         for (i, dl) in display_lines.iter().enumerate() {
             let heading_style = (1..=6)
                 .contains(&dl.heading)
@@ -1779,7 +1807,21 @@ impl Element for TextElement {
             // the header's rule and takes no height.
             if dl.table {
                 if dl.table_header {
-                    table_cols = dl.cells.len().max(1);
+                    // Column shares from the delimiter row (or the drag
+                    // resizing them now).
+                    table_header_line = i;
+                    let columns = dl.cells.len().max(1);
+                    table_fractions = match &column_drag {
+                        Some(drag) if drag.header_line == i => drag.fractions(),
+                        _ => lines
+                            .get(i + 1)
+                            .filter(|l| is_table_delimiter(l))
+                            .map(|l| table_view::column_fractions(l))
+                            .unwrap_or_default(),
+                    };
+                    if table_fractions.len() != columns {
+                        table_fractions = vec![1.0 / columns as f32; columns];
+                    }
                 }
                 let pad = if dl.table_rule { 0.0 } else { TABLE_CELL_PAD_Y };
                 line_before = pad;
@@ -1788,7 +1830,7 @@ impl Element for TextElement {
             let mut font = if dl.mono {
                 gpui::font(ui::MONO_FONT)
             } else if let Some(style) = heading_style {
-                gpui::font(style.font.clone())
+                gpui::font(fonts::render_family(&style.font).to_string())
             } else {
                 base_font.clone()
             };
@@ -1901,14 +1943,24 @@ impl Element for TextElement {
                 let row_formats = line_formats(dl, d0..d1, &char_formats);
                 // Justify spreads every row but a paragraph's last.
                 let justify = align == Alignment::Justify && r + 1 < row_count;
-                let columns = table_cols.max(dl.cells.len()).max(1);
-                let col_w = available_width / columns as f32;
+                let mut boundaries = vec![px(0.0)];
+                for fraction in &table_fractions {
+                    let last = *boundaries.last().unwrap_or(&px(0.0));
+                    boundaries.push(last + available_width * *fraction);
+                }
                 let shaped = if dl.table && !dl.table_rule {
+                    let end = *boundaries.last().unwrap_or(&px(0.0));
                     let cells: Vec<(Range<usize>, gpui::Pixels, gpui::Pixels)> = dl
                         .cells
                         .iter()
                         .enumerate()
-                        .map(|(k, range)| (range.clone(), col_w * k as f32, col_w))
+                        .map(
+                            |(k, range)| match (boundaries.get(k), boundaries.get(k + 1)) {
+                                (Some(&left), Some(&right)) => (range.clone(), left, right - left),
+                                // Cells past the header's columns: no room.
+                                _ => (range.clone(), end, px(0.0)),
+                            },
+                        )
                         .collect();
                     RowText::shape_cells(
                         window,
@@ -1993,10 +2045,10 @@ impl Element for TextElement {
                     disp_start: d0,
                     line_idx: i,
                     rule_color,
-                    table: (dl.table && !dl.table_rule).then_some(TableRowGeom {
-                        columns,
-                        col_w,
+                    table: (dl.table && !dl.table_rule).then(|| TableRowGeom {
+                        boundaries: boundaries.clone(),
                         header: dl.table_header,
+                        header_line: table_header_line,
                     }),
                 });
             }
@@ -2151,7 +2203,31 @@ impl Element for TextElement {
                 src_start: r.src_start,
                 disp_start: r.disp_start,
                 line_idx: r.line_idx,
+                table: r
+                    .table
+                    .as_ref()
+                    .map(|t| (t.header_line, t.boundaries.clone())),
             })
+            .collect();
+        // The resize cursor over the inner column borders of tables.
+        let resize_hitboxes: Vec<gpui::Hitbox> = rows
+            .iter()
+            .filter_map(|r| r.table.as_ref().map(|t| (r, t)))
+            .flat_map(|(r, t)| {
+                let inner = t.boundaries.len().saturating_sub(2);
+                t.boundaries[1..1 + inner].iter().map(move |&x| {
+                    Bounds::new(
+                        point(
+                            bounds.left() + gutter_width + x - px(3.0),
+                            bounds.top() + r.box_top - scroll_offset_y,
+                        ),
+                        size(px(6.0), r.box_height),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|b| window.insert_hitbox(b, gpui::HitboxBehavior::Normal))
             .collect();
         let cursor_row_idx = cursor_row;
         // After an edit or a caret move, scroll the canvas just enough to
@@ -2206,6 +2282,7 @@ impl Element for TextElement {
             gutter_width,
             cursor: cursor_quad,
             selection,
+            resize_hitboxes,
         }
     }
 
@@ -2221,6 +2298,9 @@ impl Element for TextElement {
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
         let scroll_offset_y = self.input.read(cx).scroll_offset_y;
+        for hitbox in &prepaint.resize_hitboxes {
+            window.set_cursor_style(gpui::CursorStyle::ResizeColumn, hitbox);
+        }
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
@@ -2244,12 +2324,12 @@ impl Element for TextElement {
         }
 
         for row in prepaint.rows.iter() {
-            if let Some(table) = row.table {
+            if let Some(table) = &row.table {
                 // The row's cells: shaded if it is the header, then each
                 // cell's outline (neighbours share their edges).
                 let top = bounds.top() + row.box_top - scroll_offset_y;
                 let left = bounds.left() + gutter_width;
-                let width = table.col_w * table.columns as f32;
+                let width = *table.boundaries.last().unwrap_or(&px(0.0));
                 if table.header {
                     window.paint_quad(fill(
                         Bounds::new(point(left, top), size(width, row.box_height)),
@@ -2258,8 +2338,8 @@ impl Element for TextElement {
                 }
                 let line = hsla(0.0, 0.0, 0.45, 0.6);
                 let edge = px(1.0);
-                for k in 0..=table.columns {
-                    let x = left + table.col_w * k as f32;
+                for &edge_x in &table.boundaries {
+                    let x = left + edge_x;
                     window.paint_quad(fill(
                         Bounds::new(point(x, top), size(edge, row.box_height)),
                         line,
@@ -2562,6 +2642,7 @@ actions!(
         NewDocument,
         RenameDocument,
         ClearFormatting,
+        UnderlineText,
         AlignLeft,
         AlignCenter,
         AlignRight,
@@ -2923,6 +3004,14 @@ impl SylphApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Like Word: a right-click outside the selection moves the caret
+        // there first, so the menu (e.g. table commands) acts on that spot.
+        self.editor.update(cx, |editor, cx| {
+            let at = editor.index_for_mouse_position(event.position);
+            if !editor.selected_range.contains(&at) {
+                editor.move_to(at, cx);
+            }
+        });
         self.context_menu.visible = true;
         self.context_menu.position = event.position;
         cx.notify();
@@ -3633,34 +3722,36 @@ impl SylphApp {
         }
     }
 
-    /// Wrap the selection in `marker` markdown (the same source-level
-    /// syntax the export parser reads back).
-    fn wrap_selection(&mut self, marker: &str, cx: &mut Context<Self>) {
-        self.editor.update(cx, |editor, cx| {
-            let text = editor.content.clone();
-            let sel = editor.selected_range.clone();
-            if sel.start < sel.end && sel.end <= text.len() {
-                let selected = &text[sel.clone()];
-                let new_text = format!("{marker}{}{marker}", selected);
-                editor.replace_text_in_range(Some(sel), &new_text, cx);
-            }
-        });
+    /// Toggle B / I / U / S like Word (see `emphasis`): character
+    /// formatting, so it works with Markdown on or off.
+    pub(crate) fn toggle_emphasis(
+        &mut self,
+        emphasis: sylph_core::format::Emphasis,
+        cx: &mut Context<Self>,
+    ) {
+        let on = self
+            .editor
+            .update(cx, |editor, cx| editor.toggle_emphasis(emphasis, cx));
+        let name = match emphasis {
+            sylph_core::format::Emphasis::Bold => "Bold",
+            sylph_core::format::Emphasis::Italic => "Italic",
+            sylph_core::format::Emphasis::Underline => "Underline",
+            sylph_core::format::Emphasis::Strike => "Strikethrough",
+        };
+        self.set_status(format!("{name} {}", if on { "on" } else { "off" }), cx);
+        cx.notify();
     }
 
     fn bold_text(&mut self, _: &BoldText, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.require_markdown(cx) {
-            return;
-        }
-        self.wrap_selection("**", cx);
-        cx.notify();
+        self.toggle_emphasis(sylph_core::format::Emphasis::Bold, cx);
     }
 
     fn italic_text(&mut self, _: &ItalicText, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.require_markdown(cx) {
-            return;
-        }
-        self.wrap_selection("*", cx);
-        cx.notify();
+        self.toggle_emphasis(sylph_core::format::Emphasis::Italic, cx);
+    }
+
+    fn underline_text(&mut self, _: &UnderlineText, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_emphasis(sylph_core::format::Emphasis::Underline, cx);
     }
 
     fn strikethrough_text(
@@ -3669,11 +3760,7 @@ impl SylphApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.require_markdown(cx) {
-            return;
-        }
-        self.wrap_selection("~~", cx);
-        cx.notify();
+        self.toggle_emphasis(sylph_core::format::Emphasis::Strike, cx);
     }
 
     fn set_heading(&mut self, level: u8, _window: &mut Window, cx: &mut Context<Self>) {
@@ -5115,6 +5202,34 @@ impl DisplayLine {
 
     /// Display byte offset (line-local) → source byte offset. Clicks on a
     /// replaced marker (`• `) land on its source (`- `).
+    /// The source byte of the *character* starting at display byte
+    /// `disp` (`disp_to_src` places a caret, which at the start of text
+    /// after hidden syntax sits before that syntax). Replaced text maps to
+    /// the syntax it stands for.
+    fn char_src(&self, disp: usize) -> usize {
+        self.segments
+            .iter()
+            .find(|seg| seg.disp_start <= disp && disp < seg.disp_end)
+            .map_or_else(
+                || self.disp_to_src(disp),
+                |seg| {
+                    if seg.identity {
+                        seg.src_start + (disp - seg.disp_start)
+                    } else {
+                        seg.src_start
+                    }
+                },
+            )
+    }
+
+    /// Whether source byte `src` of the line is displayed as itself (not
+    /// hidden or replaced Markdown syntax).
+    fn shows_src(&self, src: usize) -> bool {
+        self.segments
+            .iter()
+            .any(|seg| seg.identity && seg.src_start <= src && src < seg.src_end)
+    }
+
     fn disp_to_src(&self, disp: usize) -> usize {
         for (i, seg) in self.segments.iter().enumerate() {
             if disp <= seg.disp_end {
@@ -5897,6 +6012,9 @@ fn parse_content_blocks_with(text: &str, line_spacing: f32, fmt: &RunFormat) -> 
             flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             let mut raw_rows: Vec<Vec<String>> = vec![split_table_row(line)];
+            // Column widths from the delimiter's dash counts (resized on
+            // the page), as percentages.
+            let fractions = table_view::column_fractions(lines[i + 1]);
             i += 2; // skip delimiter
             while i < lines.len() {
                 let body = lines[i].trim_end();
@@ -5925,7 +6043,11 @@ fn parse_content_blocks_with(text: &str, line_spacing: f32, fmt: &RunFormat) -> 
                 data: doc::TableData {
                     rows,
                     caption: None,
-                    column_widths: vec![100.0 / num_cols as f32; num_cols],
+                    column_widths: if fractions.len() == num_cols {
+                        fractions.iter().map(|f| f * 100.0).collect()
+                    } else {
+                        vec![100.0 / num_cols as f32; num_cols]
+                    },
                 },
             });
             continue; // i already advanced past consumed rows
@@ -6303,6 +6425,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         // ── Formatting (the Word/Docs shortcuts) ──
         KeyBinding::new("secondary-b", BoldText, None),
         KeyBinding::new("secondary-i", ItalicText, None),
+        KeyBinding::new("secondary-u", UnderlineText, None),
         KeyBinding::new("secondary-shift-x", StrikethroughText, None),
         KeyBinding::new("secondary-alt-0", NormalText, None),
         KeyBinding::new("secondary-alt-1", Heading1, None),
@@ -6411,6 +6534,8 @@ fn main() {
                         content_rev: 0,
                         formats: initial_formats,
                         para_formats: initial_paras,
+                        pending_emphasis: Vec::new(),
+                        column_drag: None,
                         styles: document.resolved_styles(),
                         save_state: opened_state(&read_only, &unpersisted),
                         unpersisted,

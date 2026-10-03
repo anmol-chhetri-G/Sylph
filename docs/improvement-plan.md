@@ -39,6 +39,10 @@ editing.
 | Roadmap M4 (part) paragraph layout | done | every Enter is a paragraph in export too; alignment left/centre/right/justify (Ctrl+L/E/R/J, toolbar, Format menu) as paragraph ranges; Spacing dropdown applies to "This paragraph" or the style; PDF/DOCX follow |
 | Lists like Word | done | Enter continues a list / ends it on an empty item; Tab / Shift+Tab change the level; wrapped items hang under their text; toolbar bullet/numbered buttons |
 | Roadmap M2 (part) tables on the page | done | Markdown tables drawn as grids (header shaded, cells clipped, equal columns as exported); click into cells; Tab / Shift+Tab move between cells, Tab in the last cell adds a row; typed `|` escaped; Backspace/Delete stop at cell borders. Open: column resizing, add/remove column, cell wrapping |
+| Bold / italic / underline / strike as formatting | done | Word-style toggles (selection, word at caret, or next typed text), work with Markdown on or off, Ctrl+B/I/U; `Some(false)` can un-bold `**` or heading text; exported as run styles |
+| Tables: resize and columns | done | drag column borders (widths stored as delimiter dash counts, exported to PDF/DOCX); right-click: insert/delete rows and columns, delete table; right-click moves the caret like Word |
+| Bold / italic in every body font | done | Hanken Grotesk had no bold or italic face and JetBrains Mono no italic, so Ctrl+B/I did nothing visible in those fonts; all body fonts now ship regular/italic/bold/bold-italic (test enforces it), PDF uses the real faces |
+| Bold/italic edge cases + Word fonts | done | first letter after hidden `**` now gets its formatting (char vs caret mapping); Ctrl+B on Markdown-bold text un-bolds it (hidden syntax ignored); scenario tests in `emphasis.rs`; Times New Roman / Arial / Courier New offered, drawn and embedded with metric-compatible Liberation fonts, DOCX keeps Word names |
 | everything else | open | |
 
 ## University-ready roadmap (adopted 2026-10-03; personal use first)
@@ -260,6 +264,63 @@ match selection"); all as `CharFormat` fields, same pipeline as size/font.
 **M10 Core rebuild (plan Phases 2–5)** — one layout engine for canvas and
 PDF (exact page parity), true footnote placement, equations, comments,
 track changes, columns.
+
+### Research: tables in Google Docs and Word (2026-10-03)
+
+**Google Docs**
+- *Selecting:* drag across cells selects a rectangle of cells (blue
+  highlight); Shift+click / Shift+arrows extend it; dragging past a row's end
+  selects whole rows. Formatting then applies to every selected cell.
+- *Right-click:* insert row above/below, column left/right; delete
+  row/column/table; merge cells (with 2+ selected) / unmerge; distribute
+  rows / columns; sort table by the column; table properties; pin header row.
+- *Table properties panel:* column width, minimum row height, cell vertical
+  alignment (top/middle/bottom), table alignment and indent, border colour
+  and width, **cell background colour**, **cell padding** (pt), pin header
+  row (repeats on each page), let rows break across pages.
+- *Toolbar, when in a table:* background colour (paint bucket), border
+  colour, border width, border dash, applied to the selected cells.
+- Tab / Shift+Tab move between cells; Tab in the last cell adds a row.
+  A cell holds any content: several paragraphs, lists, images.
+
+**Word**
+- *Selecting:* a small arrow at a cell's left edge selects the cell; left of
+  a row selects the row; above a column selects the column; the handle at
+  the top-left selects (and moves) the whole table; drag selects a range.
+- *Table Design tab:* style gallery (header row, banded rows), **Shading**
+  (cell background), borders (style, weight, colour, border painter).
+- *Layout tab:* insert/delete, **merge / split cells**, split table, AutoFit
+  (to contents / window / fixed), cell height & width, distribute, text
+  alignment in the cell (9 positions), **cell margins**, repeat header rows,
+  sort, convert to text, cell properties.
+
+**What this means for Sylph.** A Markdown pipe table holds only one line
+of text per cell (plus column widths, which we now keep in the `|---|`
+dashes). It cannot hold cell colours, padding, borders, merged cells,
+vertical alignment or several paragraphs in a cell. Two ways forward:
+
+1. *Table properties beside the text (next, small):* a `TableProps`
+   record anchored to the table's range in the text (like paragraph
+   spans): cell background per (row, column), cell padding, border colour
+   and width, vertical alignment, header repeat. Sylph's own row/column
+   commands update it; exports draw it (fpdf2 cell fill / python-docx
+   shading and margins). Plus **cell-range selection**: drag across cells
+   or Shift+click selects a rectangle, highlighted on the canvas;
+   background colour, clear contents, copy (as tab-separated text) act on
+   it. Merging cells and multi-paragraph cells stay out of reach here.
+2. *Tables as objects (with the M10 kernel):* the table lives in the model
+   as rows × cells, each cell its own rich text (paragraphs, lists,
+   images), with merges; the text holds only an anchor. This is the
+   Docs/Word model and the long-term answer.
+
+```text
+TableProps { anchor: header line, fills: {(row, col): colour}, padding_pt, border: (colour, width_pt), valign, repeat_header }
+CellSelection { table: header line, from: (row, col), to: (row, col) }   // drag / Shift+click
+on drag(from cell a to cell b): selection = rectangle(a, b); paint highlight over those cells
+set_fill(colour): for cell in selection: props.fills[cell] = colour   // one undo step with the text
+insert/delete row or column: shift the (row, col) keys in props the same way
+export: Table { …, fills, padding, border } → fpdf2 FontFace(fill_color) per cell / docx w:shd, w:tcMar
+```
 
 ### UX rules for every card
 

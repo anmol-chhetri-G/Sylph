@@ -450,11 +450,14 @@ _SERIF, _SANS, _MONO = 'EBGaramond', 'HankenGrotesk', 'JetBrainsMono'
 # no true italic or bold uses its nearest face rather than failing.
 _PDF_FONTS = {
     _SERIF: {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
-    _SANS: {'': 'Regular', 'I': 'Regular', 'B': 'SemiBold', 'BI': 'SemiBold'},
-    _MONO: {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
+    _SANS: {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    _MONO: {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
     'SourceSerif4': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
     'Lora': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
     'Inter': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    'LiberationSerif': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    'LiberationSans': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
+    'LiberationMono': {'': 'Regular', 'I': 'Italic', 'B': 'Bold', 'BI': 'BoldItalic'},
     'NotoSerifDevanagari': {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
     'NotoSansDevanagari': {'': 'Regular', 'I': 'Regular', 'B': 'Bold', 'BI': 'Bold'},
 }
@@ -873,6 +876,13 @@ def _pdf_family(font_name: str) -> str:
     bundled ("Source Serif 4" -> SourceSerif4); otherwise serif faces map
     to EB Garamond, monospace to JetBrains Mono and everything else to
     Hanken Grotesk (fonts that are not bundled cannot be embedded)."""
+    # Word's standard fonts are drawn with their metric-compatible OFL
+    # stand-ins (the DOCX keeps the Word name), as on the canvas.
+    aliases = {'times new roman': 'LiberationSerif', 'arial': 'LiberationSans',
+               'courier new': 'LiberationMono'}
+    alias = aliases.get((font_name or '').strip().lower())
+    if alias:
+        return alias
     bundled = {family.lower(): family for family in _PDF_FONTS}
     exact = bundled.get((font_name or '').replace(' ', '').lower())
     if exact:
@@ -1007,6 +1017,17 @@ def _render_block_docx(doc, block: dict):
             num_cols = max(len(r) for r in rows)
             table = doc.add_table(rows=len(rows), cols=num_cols)
             table.style = 'Table Grid'
+            # Column widths (percentages of the text width), as on the page.
+            widths = table_data.get('column_widths') or []
+            if len(widths) == num_cols:
+                section = doc.sections[-1]
+                text_width = section.page_width - section.left_margin - section.right_margin
+                table.autofit = False
+                for j, pct in enumerate(widths):
+                    width = int(text_width * float(pct) / 100.0)
+                    table.columns[j].width = width
+                    for row_cells in table.rows:
+                        row_cells.cells[j].width = width
             for i, row in enumerate(rows):
                 for j, cell in enumerate(row):
                     if j < num_cols:
@@ -1287,6 +1308,8 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
             for run_data in runs:
                 styles = run_data.get('styles', [])
                 strike = 'S' if 'Strikethrough' in styles else ''
+                if 'Underline' in styles:
+                    strike += 'U'
                 url = _link_url(styles)
                 # Character formatting on selected words overrides the
                 # paragraph's size and family.

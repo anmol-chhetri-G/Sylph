@@ -115,13 +115,46 @@ impl<'a> RunFormat<'a> {
             (Some(formats), Some(offset)) => formats
                 .runs(offset..offset + line.len())
                 .into_iter()
-                .map(|(range, format)| doc::TextRun {
-                    text: line[range.start - offset..range.end - offset].to_string(),
-                    styles: Vec::new(),
-                    format,
+                .map(|(range, format)| {
+                    let mut run = doc::TextRun {
+                        text: line[range.start - offset..range.end - offset].to_string(),
+                        styles: Vec::new(),
+                        format,
+                    };
+                    emphasis_into_styles(&mut run);
+                    run
                 })
                 .collect(),
             _ => vec![doc::TextRun::plain(line)],
+        }
+    }
+}
+
+/// Bold / italic / underline / strikethrough set as character formatting
+/// become the run's style flags (what the exporters read), overriding what
+/// Markdown gave it; the run's format then keeps only size and font.
+fn emphasis_into_styles(run: &mut doc::TextRun) {
+    use doc::SpanStyle::{Bold, BoldItalic, Italic, Strikethrough, Underline};
+    let had_bold = run.styles.iter().any(|s| matches!(s, Bold | BoldItalic));
+    let had_italic = run.styles.iter().any(|s| matches!(s, Italic | BoldItalic));
+    let bold = run.format.bold.take().unwrap_or(had_bold);
+    let italic = run.format.italic.take().unwrap_or(had_italic);
+    run.styles
+        .retain(|s| !matches!(s, Bold | Italic | BoldItalic));
+    match (bold, italic) {
+        (true, true) => run.styles.push(BoldItalic),
+        (true, false) => run.styles.push(Bold),
+        (false, true) => run.styles.push(Italic),
+        (false, false) => {}
+    }
+    for (setting, style) in [
+        (run.format.underline.take(), Underline),
+        (run.format.strike.take(), Strikethrough),
+    ] {
+        match setting {
+            Some(true) if !run.styles.contains(&style) => run.styles.push(style),
+            Some(false) => run.styles.retain(|s| *s != style),
+            _ => {}
         }
     }
 }
@@ -137,6 +170,8 @@ fn runs_mapped(
     // The inline piece each run came from: text of the same piece and the
     // same formatting continues one run, as in `parse_inline_runs`.
     let mut run_ids: Vec<usize> = Vec::new();
+    // Each run's formatting as set (its emphasis then moves into styles).
+    let mut run_formats: Vec<CharFormat> = Vec::new();
     let mut pos = 0;
     for piece in inline_pieces(text) {
         match piece {
@@ -155,14 +190,19 @@ fn runs_mapped(
                 for (start, end, format) in pieces {
                     let part = &chunk[start..end];
                     match (runs.last_mut(), run_ids.last()) {
-                        (Some(last), Some(&id)) if id == run && last.format == format => {
+                        (Some(last), Some(&id))
+                            if id == run && run_formats.last() == Some(&format) =>
+                        {
                             last.text.push_str(part);
                         }
                         _ => {
                             let mut new_run = doc::TextRun::styled(part, styles.clone());
+                            let new_run_format = format.clone();
                             new_run.format = format;
+                            emphasis_into_styles(&mut new_run);
                             runs.push(new_run);
                             run_ids.push(run);
+                            run_formats.push(new_run_format);
                         }
                     }
                 }
@@ -309,6 +349,35 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn bold_and_italic_from_formatting_become_style_flags() {
+        use sylph_core::document::SpanStyle;
+        let text = "plain **was bold** both";
+        let mut spans = FormatSpans::new();
+        // Bold + italic on "plain"; un-bold the Markdown bold; underline "both".
+        spans.apply(0..5, |f| {
+            f.bold = Some(true);
+            f.italic = Some(true);
+        });
+        let was = text.find("was").unwrap();
+        spans.apply(was..was + 3, |f| f.bold = Some(false));
+        let both = text.find("both").unwrap();
+        spans.apply(both..both + 4, |f| f.underline = Some(true));
+        let runs = RunFormat::with(text, &spans).runs(text);
+        let find = |t: &str| runs.iter().find(|r| r.text == t).expect(t);
+        assert_eq!(find("plain").styles, [SpanStyle::BoldItalic]);
+        assert!(find("was").styles.is_empty(), "explicit off beats **");
+        assert_eq!(find(" bold").styles, [SpanStyle::Bold]);
+        assert_eq!(find("both").styles, [SpanStyle::Underline]);
+        // Only size/font stay in the format (the exporters' JSON shape).
+        assert!(runs
+            .iter()
+            .all(|r| r.format.bold.is_none() && r.format.underline.is_none()));
+        // Literal (Markdown off) lines get the same flags.
+        let literal = RunFormat::with(text, &spans).literal_runs(text);
+        assert_eq!(literal[0].styles, [SpanStyle::BoldItalic]);
     }
 
     #[test]

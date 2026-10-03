@@ -336,7 +336,7 @@ impl SylphApp {
         let open = self.open_picker == Some(picker);
         let mut shown = label(value, if enabled { text } else { muted }, 12.0).truncate();
         if let Some(font) = value_font {
-            shown = shown.font_family(font);
+            shown = shown.font_family(crate::fonts::render_family(&font).to_string());
         }
         let field = div()
             .relative()
@@ -775,7 +775,7 @@ impl SylphApp {
     ) -> AnyElement {
         let mut name = label(text, self.ui_text(), 13.0).flex_1();
         if let Some(font) = font {
-            name = name.font_family(font);
+            name = name.font_family(crate::fonts::render_family(&font).to_string());
         }
         let hover = self.ui_panel_low();
         div()
