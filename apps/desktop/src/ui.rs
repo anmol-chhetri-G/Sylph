@@ -3073,7 +3073,16 @@ impl SylphApp {
             .child(
                 label(format!("{} words", word_count), text, 11.0)
                     .font_weight(gpui::FontWeight(500.0))
-                    .flex_shrink_0(),
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    // Word's Word Count dialog: details and the selection.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.overlay = WorkspaceOverlay::WordCount;
+                            cx.notify();
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -3245,7 +3254,7 @@ impl SylphApp {
 
     /// A centred dialog over the dimmed workspace. Clicking outside it (or
     /// Escape) closes it; clicks inside stay inside.
-    fn modal(&self, title: &str, width: f32, body: Div, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn modal(&self, title: &str, width: f32, body: Div, cx: &mut Context<Self>) -> Div {
         let text = self.ui_text();
         let muted = self.ui_muted();
         let hover = self.ui_panel_low();
@@ -3651,6 +3660,9 @@ impl Render for SylphApp {
         });
         root = root.when(self.overlay == WorkspaceOverlay::Shortcuts, |this| {
             this.child(self.shortcuts_dialog(cx))
+        });
+        root = root.when(self.overlay == WorkspaceOverlay::WordCount, |this| {
+            this.child(self.word_count_dialog(cx))
         });
         root
     }

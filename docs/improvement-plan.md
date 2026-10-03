@@ -34,38 +34,239 @@ editing.
 | Style size and paragraph spacing (author request) | done | size box, Space before/after act on the caret's style; canvas spaces Normal paragraphs where the export does |
 | Print-layout pagination (author request) | done | rows flow page to page (overflow and `\newpage`); click any page to put the caret there; Ctrl+Enter breaks at the caret; the canvas follows the caret |
 | Page breaks like Word (author request) | done | Backspace/Delete remove a break whole; old break blocks move into the text on load; break marker drawn in both modes; Pages tab jumps to a page; cover page has a Remove button |
+| Character formatting (author request) | done | size and font on selected text as ranges over the text (Google Docs model); mixed sizes on one line; PDF/DOCX carry them |
+| Roadmap M0 everyday basics | done | undo groups typing (word / Backspace runs / 1 s pause); new documents start with Markdown on; Word count dialog (click the count) with selection counts |
 | everything else | open | |
 
-## Next: formatting on a paragraph or a selection (proposed, needs the author's go-ahead)
+## University-ready roadmap (adopted 2026-10-03; personal use first)
 
-Word and Docs resolve formatting in three layers, each overriding the one
-before: **style** (Normal, Heading 1…) → **paragraph formatting** (this
-paragraph's spacing, alignment, indent) → **character formatting** (the
-selected words' size, font, colour, bold). Layer 1 is done. Layers 2 and 3
-cannot be stored in the Markdown text buffer (Markdown has no "14 pt" and
-no per-paragraph spacing), and the canvas draws each line at one size
-(GPUI `shape_line` takes one font size per line). They need the plan's
-kernel and layout work, in this order:
+Goal: Sylph can produce a proper university document — report, essay,
+dissertation chapter — without leaving the app: title page, numbered
+headings, table of contents, figures and tables with captions, citations
+and a bibliography, footnotes, page numbers, and a PDF/DOCX that matches
+the page. Extensive text styling (colour, highlight, super/subscript)
+comes last, as the author asked.
 
-1. **Block model (plan 2.x).** The document becomes a list of blocks with
-   stable ids: `Paragraph { id, style, props: ParagraphProps, runs }`,
-   where `ParagraphProps` holds optional overrides (spacing before/after,
-   line spacing, alignment, indent) and each `Run { text, marks }` holds
-   optional character marks (bold, italic, size, font, colour, link).
-   Resolution is `style → props → marks`, as in Word. Edits are
-   transactions on blocks (insert text, split, merge, set marks on a
-   range), so undo and later collaboration work on the same operations.
-2. **Markdown stays an import/export and a typing shortcut** (`# ` makes a
-   Heading 1, `**` toggles bold), not the storage format. Existing
-   documents convert once on load, losslessly for what Markdown can say.
-3. **Canvas with mixed runs (plan 4.x).** Lines are laid out from runs of
-   different sizes and fonts (shape each run, place them on a shared
-   baseline, line height from the tallest run), replacing the one-size
-   row layout.
-4. **Controls.** With a selection, the size/font/colour controls set
-   character marks on it; with only a caret, the Spacing dropdown gets a
-   "This paragraph only" section next to "every Normal paragraph", plus
-   "Update Normal to match" as Word has.
+### Where Sylph stands against Word / Google Docs
+
+| Capability a university document needs | Word / Docs | Sylph today |
+| --- | --- | --- |
+| Styles (Normal, Heading 1–6) with font, size, spacing | yes | yes |
+| Size / font on selected words | yes | yes (character formatting spans) |
+| Pages, page breaks, click any page | yes | yes |
+| Cover / title page | yes | yes (templates) |
+| Images at the cursor, resize, caption | yes | **no**: inserted images go after all text; typed `![]()` shows as text |
+| Tables drawn as grids, edit cells, add rows | yes | **no**: pipe tables show as raw `|` text; inserted tables go after all text |
+| Header / footer, page numbers, different first page | yes | **partial**: PDF footer "Page n/N" only |
+| Alignment (centre, justify), first-line / hanging indent | yes | **no** |
+| Table of contents with page numbers | yes | **no** |
+| Heading numbering (1, 1.1), figure/table numbering, cross-refs | yes | **no** |
+| Footnotes | yes | **no** |
+| Citations + bibliography (APA, Harvard, IEEE) | yes (built in / add-ons) | **no** |
+| Spell check | yes | **no** |
+| Undo that groups typing | yes | **no** (one step per key) |
+| Word count of selection, details | yes | **partial** (whole document) |
+| Open / import DOCX, Markdown | yes | **no** (export only) |
+| Word-standard fonts (Times New Roman, Arial, Calibri) | yes | **no** (6 bundled OFL families) |
+| Underline, colour, highlight, super/subscript | yes | **no** (last) |
+| Equations, comments, track changes, columns | yes | **no** (later) |
+
+### Model decision: text + ranges + anchors (the Google Docs model)
+
+Keep what works and extend it instead of a big-bang rewrite:
+
+- **Text** stays one string. Markdown syntax keeps meaning what it means
+  today (headings, lists, quotes, code, pipe tables, `![]()`, `\newpage`),
+  hidden by the WYSIWYG canvas, so the exporters keep working.
+- **Character ranges** (`FormatSpans`, done) carry what Markdown cannot:
+  size, font — later underline, colour, highlight, super/subscript.
+- **Paragraph ranges** (`ParagraphSpans`, M4) carry alignment, indents and
+  per-paragraph spacing; same edit-shifting code as character ranges.
+- **Objects are lines in the text** (an image line, a table, `[[toc]]`,
+  `[^1]` footnote refs, `[@key]` citations), so they sit where the caret
+  put them and undo/copy/delete work for free. The canvas draws each one
+  as the real thing.
+- The user never has to type Markdown: every object comes from the Insert
+  menu, toolbar or palette, which writes the syntax for them.
+
+```text
+resolve(position) = style(paragraph) ← paragraph_spans(paragraph) ← char_spans(position)
+render(line)      = object? draw_object(line) : rows(text, char_spans, paragraph_spans)
+export(text)      = parse(text) → blocks with runs carrying char + paragraph formatting
+```
+
+### Mind map
+
+```mermaid
+mindmap
+  root((University-ready Sylph))
+    M0 Everyday basics
+      Undo groups typing
+      Word count details
+      Markdown on by default
+    M1 Images
+      Insert at caret
+      Drawn inline
+      Resize and align
+      Figure captions
+    M2 Tables
+      Drawn as grids
+      Click to edit cells
+      Add or remove rows and columns
+      Table captions
+    M3 Page furniture
+      Header and footer text
+      Page numbers and formats
+      Different first page
+    M4 Paragraph layout
+      Alignment
+      First line and hanging indent
+      This paragraph only spacing
+    M5 Structure
+      Table of contents
+      Heading numbering
+      Caption numbering and cross refs
+      PDF bookmarks
+    M6 Notes and references
+      Footnotes
+      Citations via hayagriva
+      Bibliography styles APA Harvard IEEE
+    M7 Writing aids
+      Spell check via spellbook
+      Autocorrect quotes and dashes
+      Find options
+      Zoom
+    M8 Compatibility
+      Word metric fonts
+      Templates APA Harvard IEEE
+      Import DOCX and Markdown
+    M9 Text styling last
+      Underline colour highlight
+      Superscript subscript
+      Format painter
+    M10 Core rebuild
+      Shared layout canvas and PDF
+      True footnotes and equations
+      Comments track changes columns
+```
+
+### Milestones in order (pseudocode and UX per card)
+
+**M0 Everyday basics (1 weekend)**
+- Undo groups typing like Word: consecutive single-character inserts (or
+  deletes) at the caret merge into one step until a word boundary, a caret
+  jump or a 1 s pause.
+  ```text
+  on edit(e): last = undo.top
+    if e.is_typing && last.is_typing && e.start == last.end && !boundary(e) && now - last.at < 1s
+        last.extend(e) else undo.push(e)
+  ```
+- Word count dialog (click the count): words, characters with/without
+  spaces, paragraphs, pages; with a selection, the selection's counts.
+- New documents start with Markdown (formatting) on.
+
+**M1 Images in the flow (1–2 weekends)**
+- UX: Insert → Image (or paste) puts the image *at the caret* on its own
+  line; click selects it (handles + Image inspector: width %, alignment,
+  caption, alt text); drag a corner to resize; Delete removes it.
+- Text: `![caption](path){width=60%}` (pandoc attribute syntax).
+  ```text
+  insert_image(path): text.insert(caret_line_end, "\n![](path){width=100%}\n")
+  display_line(image line) → DisplayKind::Image { path, width, caption }
+  prepaint: image row height = natural_height * width_px / natural_width (decoded off-thread, cached)
+  paint: paint_image(row bounds); caption row under it ("Figure n: caption")
+  export: parse attrs → Block::Image { width, caption } (exporters already take both)
+  ```
+- Tests: attribute parsing, insertion at caret, export width/caption.
+
+**M2 Tables on the page (2–3 weekends)**
+- UX: Insert → Table (grid picker) at the caret; the canvas draws a grid;
+  click a cell and type; Tab / Shift+Tab move between cells; right-click:
+  insert/delete row/column; Table inspector: header row, column widths,
+  caption.
+- Text stays a pipe table; each cell maps to a source range.
+  ```text
+  table_layout(lines) → rows[cells{src_range, display_text}], col_widths
+  click(x, y) → cell → caret = cell.src_range.start + index_in_cell(x)
+  type in cell → edit inside src_range only (`|` typed is escaped as \|)
+  Tab → caret to next cell (append a row at the end, like Word)
+  ```
+
+**M3 Page furniture (1–2 weekends)**
+- Model: `header { left, center, right }`, `footer { … }` with fields
+  `{page} {pages} {title} {date}`, `different_first_page`, page number
+  format (1, i, I) and start number.
+- UX: double-click the top/bottom margin to edit (Word), or Insert →
+  Page numbers (position presets).
+- Canvas draws them per page; PDF via fpdf2 header()/footer(); DOCX via
+  section header/footer with PAGE/NUMPAGES fields.
+
+**M4 Paragraph layout (2 weekends)** — uses `ParagraphSpans`
+- Alignment left/centre/right/justify (Ctrl+L/E/R/J), first-line and
+  hanging indent, "This paragraph only" spacing in the Spacing dropdown,
+  ruler indent handles.
+  ```text
+  ParagraphSpans = FormatSpans over whole lines (start of first line .. end of last)
+  format_paragraphs(selection_lines, change) like format_selection
+  prepaint: x0 = indent(first row ? first_line : rest); align: shift each row by (width - row_width) * k
+  justify: distribute extra space over the row's spaces (not on the last row)
+  export: ParagraphStyle { alignment, indent_first, indent_left } → fpdf2 align, python-docx paragraph_format
+  ```
+
+**M5 Structure (2–3 weekends)**
+- Table of contents: Insert → Table of contents writes `[[toc]]`; the
+  canvas draws entries with dotted leaders and page numbers (from canvas
+  layout); click jumps. PDF: fpdf2 `insert_toc_placeholder` +
+  `start_section` (also gives PDF bookmarks). DOCX: TOC field prefilled.
+- Heading numbering (document option 1 / 1.1 / 1.1.1), figure/table
+  numbering in captions, cross-references `@fig:label` → "Figure 3",
+  List of figures/tables (`[[lof]]`, `[[lot]]`).
+
+**M6 Notes and references (3–4 weekends)**
+- Footnotes: Insert → Footnote (Ctrl+Alt+F) writes `[^n]` at the caret and
+  `[^n]: text` at the end; canvas shows a superscript number and the note
+  text at the page bottom (pagination reserves its height). PDF/DOCX: real
+  footnotes (DOCX footnotes part); interim fallback: endnotes.
+- Citations: a References panel (add manually, import BibTeX, edit); Insert
+  → Citation writes `[@key, p. 4]`; the `hayagriva` crate (MIT/Apache,
+  used by Typst) formats in-text citations and the bibliography in APA 7 /
+  Harvard / IEEE (document setting); `[[bibliography]]` or automatic at
+  the end. Exports receive pre-formatted text runs.
+
+**M7 Writing aids (2–3 weekends)**
+- Spell check: `spellbook` crate (MPL-2.0, Hunspell-compatible) with
+  bundled en-GB/en-US dictionaries, checked off the UI thread per changed
+  paragraph; wavy underline (GPUI `UnderlineStyle { wavy }`); right-click
+  suggestions, "Add to dictionary" (stored in app_state).
+- Autocorrect: smart quotes, `--` → —, auto-capitalise sentence starts.
+- Find options: match case, whole words. Zoom (Ctrl+scroll, status bar).
+
+**M8 Compatibility (2–3 weekends)**
+- Word-metric fonts under their Word names: Liberation Serif/Sans/Mono
+  and Carlito/Caladea (all OFL) render "Times New Roman", "Arial",
+  "Courier New", "Calibri", "Cambria"; DOCX keeps the Word names.
+- Templates: APA 7 student paper, Harvard report, IEEE — styles, margins,
+  title page, header/page numbers in one click (File → New from template).
+- File → Open/Import: DOCX (python-docx reader → text + spans + styles)
+  and Markdown files.
+
+**M9 Text styling (last)** — underline (Ctrl+U), colour, highlight,
+superscript/subscript, format painter, custom styles ("Update style to
+match selection"); all as `CharFormat` fields, same pipeline as size/font.
+
+**M10 Core rebuild (plan Phases 2–5)** — one layout engine for canvas and
+PDF (exact page parity), true footnote placement, equations, comments,
+track changes, columns.
+
+### UX rules for every card
+
+- Word/Docs conventions first: same menu names, same shortcuts, same
+  right-click items. No feature may require typing Markdown.
+- Contextual inspector: what is selected (image, table, heading, text)
+  decides the right panel.
+- Every action is undoable and reports in the status bar.
+- Nothing the UI shows may be fake: unfinished controls are hidden, not
+  drawn.
 
 Manual checks still owed by the author are listed in each task's VR boxes.
 For `--release` runs from `target/`, link the trusted folders once:

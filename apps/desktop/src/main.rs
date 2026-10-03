@@ -23,6 +23,8 @@ use sylph_storage::Storage;
 mod char_export;
 mod pagination;
 mod rich_row;
+mod undo_group;
+mod word_count;
 use char_export::RunFormat;
 use rich_row::{line_formats, RowText};
 mod save_state;
@@ -92,6 +94,8 @@ struct EditAction {
     /// and redo (undoing a delete brings its formatting back).
     formats_before: FormatSpans,
     formats_after: FormatSpans,
+    /// When the step was last extended (typing joins it within a pause).
+    at: std::time::Instant,
 }
 
 struct TextInput {
@@ -1181,6 +1185,46 @@ impl TextInput {
         let formats_before = self.formats.clone();
 
         self.apply_edit(start, end, new_text, cx);
+        self.redo_stack.clear();
+        let now = std::time::Instant::now();
+        // Typing and runs of Backspace/Delete join the previous step, so
+        // undo takes back a word, as in Word.
+        if let Some(last) = self.undo_stack.last_mut() {
+            let joined = undo_group::merge(
+                undo_group::Edit {
+                    start: last.start,
+                    old: &last.old_text,
+                    new: &last.new_text,
+                },
+                undo_group::Edit {
+                    start,
+                    old: &old_text,
+                    new: new_text,
+                },
+                undo_group::elapsed(last.at, now),
+            );
+            let merged = match joined {
+                undo_group::Merge::Typing => {
+                    last.new_text.push_str(new_text);
+                    true
+                }
+                undo_group::Merge::Backspace => {
+                    last.old_text.insert_str(0, &old_text);
+                    last.start = start;
+                    true
+                }
+                undo_group::Merge::ForwardDelete => {
+                    last.old_text.push_str(&old_text);
+                    true
+                }
+                undo_group::Merge::No => false,
+            };
+            if merged {
+                last.formats_after = self.formats.clone();
+                last.at = now;
+                return;
+            }
+        }
         self.undo_stack.push(EditAction {
             start,
             old_text,
@@ -1188,8 +1232,8 @@ impl TextInput {
             selection_before,
             formats_before,
             formats_after: self.formats.clone(),
+            at: now,
         });
-        self.redo_stack.clear();
     }
 
     /// Change the character formatting of the selection (size, font) as
@@ -1212,6 +1256,7 @@ impl TextInput {
             selection_before: range,
             formats_before,
             formats_after: self.formats.clone(),
+            at: std::time::Instant::now(),
         });
         self.redo_stack.clear();
         self.content_rev += 1;
@@ -2120,6 +2165,7 @@ enum WorkspaceOverlay {
     PageSetup,
     InsertTable,
     Shortcuts,
+    WordCount,
 }
 
 /// Where `export_document` writes: same merged model, three renderers.
@@ -2935,6 +2981,10 @@ impl SylphApp {
             return;
         };
         self.load_document_by_id(doc_id, cx);
+        // New documents format as you type (headings, lists, bold), like
+        // Word and Docs. Older documents keep the mode they were saved in.
+        self.document.markdown = true;
+        self.sync_markdown_mode(cx);
         self.load_documents(cx);
         cx.notify();
     }
