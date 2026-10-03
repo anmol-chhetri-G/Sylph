@@ -889,6 +889,44 @@ mod tests {
         assert!(h1.contains("<w:b/>"), "{h1}");
     }
 
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_character_formatting_reaches_both_exports() {
+        // "Big" is 20 pt Lora on selected words; the link keeps its colour
+        // and gets 14 pt.
+        let doc = r#"{"body_font": "EB Garamond", "blocks": [
+            {"Paragraph": {"runs": [
+                {"text": "Normal ", "styles": []},
+                {"text": "Big", "styles": [], "size": 20.0, "font": "Lora"},
+                {"text": " link", "styles": [{"Link": "https://example.com"}], "size": 14.0}
+            ], "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}
+        ]}"#;
+        let r = export_rich_docx(doc, &tmp("chars.docx"));
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let body = docx_part(&tmp("chars.docx"), "word/document.xml");
+        assert!(body.contains(r#"w:ascii="Lora""#), "{body}");
+        assert!(body.contains(r#"<w:sz w:val="40"/>"#), "{body}");
+        assert!(body.contains(r#"<w:sz w:val="28"/>"#), "link size: {body}");
+        // Run properties in schema order inside the hyperlink run.
+        let link = &body[body.find("<w:hyperlink").unwrap()..];
+        let color = link.find("<w:color").unwrap();
+        assert!(color < link.find("<w:sz").unwrap(), "{link}");
+        assert!(
+            link.find("<w:sz").unwrap() < link.find("<w:u ").unwrap(),
+            "{link}"
+        );
+
+        let r = export_rich_pdf(doc, &tmp("chars.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        if let Some(fonts) = pdf_fonts(&tmp("chars.pdf")) {
+            assert!(fonts.contains("+Lora "), "{fonts}");
+            assert!(fonts.contains("+EBGaramond "), "{fonts}");
+        }
+    }
+
     /// The fonts a PDF's pages use, via poppler's `pdffonts` (every
     /// registered font is written to the file, used or not).
     fn pdf_fonts(path: &str) -> Option<String> {

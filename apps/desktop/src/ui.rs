@@ -758,6 +758,7 @@ impl SylphApp {
                 vec![
                     Item("Bold", Box::new(BoldText), None),
                     Item("Italic", Box::new(ItalicText), None),
+                    Item("Clear formatting", Box::new(crate::ClearFormatting), None),
                     Item("Strikethrough", Box::new(StrikethroughText), None),
                     Separator,
                     Item("Normal text", Box::new(NormalText), Some(level == 0)),
@@ -1300,7 +1301,6 @@ impl SylphApp {
     fn format_bar(&self, cx: &mut Context<Self>) -> Div {
         let border = self.ui_border();
         let muted = self.ui_muted();
-        let text = self.ui_text();
         let mut bar = div()
             .h(px(40.0))
             .w_full()
@@ -1314,7 +1314,8 @@ impl SylphApp {
 
         let caret_style = self.caret_style(cx);
         let markdown_on = self.markdown_mode;
-        let font_size_display = self.document.resolved_style(caret_style).size.round() as i32;
+        let font_size_display = crate::style_controls::size_label(self.effective_size(cx));
+        let selected = self.has_selection(cx);
         let controls = div()
             .flex()
             .items_center()
@@ -1341,18 +1342,24 @@ impl SylphApp {
                 }),
             )
             .child({
-                let font = self.document.style_font(caret_style).to_string();
+                let font = self.effective_font(cx);
                 self.picker_field(Picker::Font, 150.0, font.clone(), Some(font), true, cx)
                     .id("body-font")
-                    .tooltip(|_, cx| {
-                        cx.new(|_| ToolbarTip("Font of every paragraph in this style"))
-                            .into()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| {
+                            ToolbarTip(if selected {
+                                "Font of the selected text"
+                            } else {
+                                "Font of every paragraph in this style (select text to change just it)"
+                            })
+                        })
+                        .into()
                     })
             })
             .child(
                 div()
                     .h(px(28.0))
-                    .w(px(72.0))
+                    .w(px(100.0))
                     .px(px(4.0))
                     .flex()
                     .items_center()
@@ -1373,10 +1380,23 @@ impl SylphApp {
                                 }),
                             )
                             .id("font-size-down")
-                            .tooltip(|_, cx| cx.new(|_| ToolbarTip("Decrease body size")).into())
+                            .tooltip(|_, cx| cx.new(|_| ToolbarTip("Decrease size")).into())
                             .child(icon("−", muted, 12.0)),
                     )
-                    .child(label(font_size_display.to_string(), text, 12.0))
+                    .child(
+                        self.picker_field(Picker::Size, 44.0, font_size_display, None, true, cx)
+                            .id("font-size")
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| {
+                                    ToolbarTip(if selected {
+                                        "Size of the selected text"
+                                    } else {
+                                        "Size of every paragraph in this style (select text to change just it)"
+                                    })
+                                })
+                                .into()
+                            }),
+                    )
                     .child(
                         div()
                             .px(px(4.0))
@@ -1389,7 +1409,7 @@ impl SylphApp {
                                 }),
                             )
                             .id("font-size-up")
-                            .tooltip(|_, cx| cx.new(|_| ToolbarTip("Increase body size")).into())
+                            .tooltip(|_, cx| cx.new(|_| ToolbarTip("Increase size")).into())
                             .child(icon("＋", muted, 12.0)),
                     ),
             )
@@ -1397,7 +1417,7 @@ impl SylphApp {
 
         let mut emphasis = div().flex().items_center().gap(px(2.0));
         for (glyph, id, action, active, tip) in [
-            ("B", "emph-bold", 0, true, "Bold"),
+            ("B", "emph-bold", 0, false, "Bold"),
             ("I", "emph-italic", 1, false, "Italic"),
             (
                 "U",
@@ -3512,6 +3532,7 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::cancel_title))
             .on_action(cx.listener(Self::new_document))
             .on_action(cx.listener(Self::rename_document))
+            .on_action(cx.listener(Self::clear_formatting))
             .on_action(cx.listener(Self::toggle_dark_mode))
             .on_action(cx.listener(Self::export_docx))
             .on_action(cx.listener(Self::export_pdf))

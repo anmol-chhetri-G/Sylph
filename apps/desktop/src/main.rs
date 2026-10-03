@@ -13,13 +13,18 @@ use gpui::{
     WindowOptions,
 };
 
+use sylph_core::format::{CharFormat, FormatSpans};
 use sylph_core::{
     byte_offset_from_utf16, next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
     previous_word_boundary, snap_to_char_boundary, utf16_offset_from_byte, utf8_range_from_utf16,
 };
 use sylph_storage::Storage;
 
+mod char_export;
 mod pagination;
+mod rich_row;
+use char_export::RunFormat;
+use rich_row::{line_formats, RowText};
 mod save_state;
 mod style_controls;
 use pagination::{caret_scroll_offset, page_break_insertion, PageFlow};
@@ -83,6 +88,10 @@ struct EditAction {
     old_text: String,
     new_text: String,
     selection_before: Range<usize>,
+    /// Character formatting before and after, restored exactly by undo
+    /// and redo (undoing a delete brings its formatting back).
+    formats_before: FormatSpans,
+    formats_after: FormatSpans,
 }
 
 struct TextInput {
@@ -92,9 +101,9 @@ struct TextInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     preferred_column: Option<usize>,
-    last_layout: Option<ShapedLine>,
+    last_layout: Option<RowText>,
     last_bounds: Option<Bounds<gpui::Pixels>>,
-    all_lines: Vec<ShapedLine>,
+    all_lines: Vec<RowText>,
     line_char_offsets: Vec<usize>,
     /// Markdown mode ON: the canvas shows the WYSIWYG transform of
     /// `content` (block syntax hidden, heading type scale applied); OFF
@@ -136,6 +145,9 @@ struct TextInput {
     /// headings): what the canvas lays rows out with. Kept in step by
     /// `SylphApp::sync_editor_styles`.
     styles: [doc::ResolvedStyle; 7],
+    /// Character formatting over `content` (size, font on selected words),
+    /// moved along by every edit. The document model keeps a copy.
+    formats: FormatSpans,
     /// Bumped by every change to `content`, so values derived from the
     /// text are computed once per edit instead of once per frame.
     content_rev: u64,
@@ -1166,16 +1178,46 @@ impl TextInput {
 
         let old_text = self.content[start..end].to_string();
         let selection_before = self.selected_range.clone();
+        let formats_before = self.formats.clone();
 
+        self.apply_edit(start, end, new_text, cx);
         self.undo_stack.push(EditAction {
             start,
             old_text,
             new_text: new_text.to_string(),
             selection_before,
+            formats_before,
+            formats_after: self.formats.clone(),
         });
         self.redo_stack.clear();
+    }
 
-        self.apply_edit(start, end, new_text, cx);
+    /// Change the character formatting of the selection (size, font) as
+    /// one undoable step. `false` when nothing is selected.
+    fn format_selection(
+        &mut self,
+        change: impl Fn(&mut CharFormat),
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let range = self.selected_range.clone();
+        if range.is_empty() || self.read_only.is_some() {
+            return false;
+        }
+        let formats_before = self.formats.clone();
+        self.formats.apply(range.clone(), change);
+        self.undo_stack.push(EditAction {
+            start: range.start,
+            old_text: String::new(),
+            new_text: String::new(),
+            selection_before: range,
+            formats_before,
+            formats_after: self.formats.clone(),
+        });
+        self.redo_stack.clear();
+        self.content_rev += 1;
+        self.schedule_save(cx);
+        cx.notify();
+        true
     }
 
     fn apply_edit(&mut self, start: usize, end: usize, new_text: &str, cx: &mut Context<Self>) {
@@ -1188,6 +1230,7 @@ impl TextInput {
         }
 
         self.content.replace_range(start..end, new_text);
+        self.formats.edit(start, end - start, new_text.len());
         self.content_rev += 1;
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.selection_reversed = false;
@@ -1201,6 +1244,7 @@ impl TextInput {
         if let Some(action) = self.undo_stack.pop() {
             let replace_end = action.start + action.new_text.len();
             self.apply_edit(action.start, replace_end, &action.old_text, cx);
+            self.formats = action.formats_before.clone();
             self.selected_range = action.selection_before.clone();
             self.redo_stack.push(action);
             cx.notify();
@@ -1211,6 +1255,7 @@ impl TextInput {
         if let Some(action) = self.redo_stack.pop() {
             let replace_end = action.start + action.old_text.len();
             self.apply_edit(action.start, replace_end, &action.new_text, cx);
+            self.formats = action.formats_after.clone();
             self.selected_range =
                 action.start + action.new_text.len()..action.start + action.new_text.len();
             self.undo_stack.push(action);
@@ -1349,7 +1394,7 @@ struct TextElement {
 /// have their own box/text metrics so headings can be taller than body
 /// text and carry space before/after.
 struct PrepRow {
-    shaped: ShapedLine,
+    shaped: RowText,
     /// Top of the row's full box, relative to the element (space-before
     /// included); rows are stacked contiguously.
     box_top: gpui::Pixels,
@@ -1442,6 +1487,7 @@ impl Element for TextElement {
         let word_wrap = input.word_wrap;
         let markdown_on = input.markdown_mode;
         let styles = input.styles.clone();
+        let char_formats = input.formats.clone();
         let flow = input.page_flow;
         let input_rev = input.content_rev;
         let input_followed = input.followed;
@@ -1560,13 +1606,16 @@ impl Element for TextElement {
                         underline: None,
                         strikethrough: None,
                     };
-                    let measured = window.text_system().shape_line(
-                        remaining.to_string().into(),
-                        row_font_size,
+                    // Measured with the row's real sizes: bigger words wrap
+                    // sooner.
+                    let measured = RowText::shape(
+                        window,
+                        remaining,
                         &[check_run],
-                        None,
+                        row_font_size,
+                        &line_formats(dl, d0..dl.text.len(), &char_formats),
                     );
-                    if measured.width > available_width && remaining.len() > 1 {
+                    if measured.width() > available_width && remaining.len() > 1 {
                         let break_idx = measured.closest_index_for_x(available_width);
                         let mut actual_break = if break_idx > 0 {
                             remaining[..break_idx]
@@ -1607,6 +1656,26 @@ impl Element for TextElement {
             for (r, &(d0, d1)) in ranges.iter().enumerate() {
                 let mut space_before = if r == 0 { line_before } else { 0.0 };
                 let space_after = if r + 1 == row_count { line_after } else { 0.0 };
+                let slice = &dl.text[d0..d1];
+                let runs = if markdown_on {
+                    display_runs(dl, d0..d1, font.clone(), text_color)
+                } else {
+                    TextInput::markdown_runs(slice, font.clone(), text_color, dl.fenced)
+                };
+                let shaped = RowText::shape(
+                    window,
+                    slice,
+                    &runs,
+                    row_font_size,
+                    &line_formats(dl, d0..d1, &char_formats),
+                );
+                // A row holding bigger words grows to fit them, keeping
+                // the line spacing's proportion.
+                let text_height = if shaped.max_font_size() > row_font_size {
+                    text_height * (shaped.max_font_size() / row_font_size)
+                } else {
+                    text_height
+                };
                 let mut box_top = y;
                 if let Some(flow) = flow {
                     // Print layout: a row that does not fit on the rest of
@@ -1623,19 +1692,6 @@ impl Element for TextElement {
                 let text_top = box_top + px(space_before);
                 let box_height = px(space_before) + text_height + px(space_after);
                 y = box_top + box_height;
-
-                let slice = &dl.text[d0..d1];
-                let runs = if markdown_on {
-                    display_runs(dl, d0..d1, font.clone(), text_color)
-                } else {
-                    TextInput::markdown_runs(slice, font.clone(), text_color, dl.fenced)
-                };
-                let shaped = window.text_system().shape_line(
-                    slice.to_string().into(),
-                    row_font_size,
-                    &runs,
-                    None,
-                );
                 let rule_color = match dl.kind {
                     DisplayKind::Rule => {
                         let mut color = text_color;
@@ -1799,7 +1855,7 @@ impl Element for TextElement {
         };
 
         let last_layout = rows.last().map(|r| r.shaped.clone());
-        let all_lines: Vec<ShapedLine> = rows.iter().map(|r| r.shaped.clone()).collect();
+        let all_lines: Vec<RowText> = rows.iter().map(|r| r.shaped.clone()).collect();
         let line_char_offsets: Vec<usize> = rows.iter().map(|r| r.src_start).collect();
         let row_metas: Vec<RowMeta> = rows
             .iter()
@@ -1918,17 +1974,15 @@ impl Element for TextElement {
                     color,
                 ));
             }
-            row.shaped
-                .paint(
-                    point(
-                        bounds.left() + gutter_width,
-                        bounds.top() + row.text_top - scroll_offset_y,
-                    ),
-                    row.text_height,
-                    window,
-                    cx,
-                )
-                .ok();
+            row.shaped.paint(
+                point(
+                    bounds.left() + gutter_width,
+                    bounds.top() + row.text_top - scroll_offset_y,
+                ),
+                row.text_height,
+                window,
+                cx,
+            );
         }
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
@@ -2161,6 +2215,9 @@ struct SylphApp {
     selected_revision: Option<i64>,
     _keystroke_subscription: Subscription,
     _model_observer: Subscription,
+    _editor_observer: Subscription,
+    /// Pending save of a character-formatting-only model change.
+    formats_save_task: Option<Task<()>>,
 }
 
 actions!(
@@ -2191,6 +2248,7 @@ actions!(
         CancelTitle,
         NewDocument,
         RenameDocument,
+        ClearFormatting,
         ToggleDarkMode,
         ExportDocx,
         ExportPdf,
@@ -2718,6 +2776,37 @@ impl SylphApp {
         if self.document == self.persisted_model || self.editor.read(cx).read_only.is_some() {
             return;
         }
+        // Character formatting shifts with every keystroke typed before
+        // formatted text; writing the model (with a disk sync) per key
+        // would slow typing. Such changes are saved after a pause, like
+        // the text; everything else is saved at once.
+        let only_formats = {
+            let mut with_formats = self.persisted_model.clone();
+            with_formats.char_formats = self.document.char_formats.clone();
+            with_formats == self.document
+        };
+        if only_formats {
+            if self.formats_save_task.is_none() {
+                self.formats_save_task = Some(cx.spawn(
+                    async move |this: WeakEntity<SylphApp>, cx: &mut AsyncApp| {
+                        gpui::Timer::after(std::time::Duration::from_millis(750)).await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.formats_save_task = None;
+                            this.persist_model_now(cx);
+                        });
+                    },
+                ));
+            }
+            return;
+        }
+        self.persist_model_now(cx);
+    }
+
+    /// Write the model if it differs from the saved copy.
+    fn persist_model_now(&mut self, cx: &mut Context<Self>) {
+        if self.document == self.persisted_model {
+            return;
+        }
         let result = {
             let editor = self.editor.read(cx);
             serde_json::to_string(&self.document)
@@ -2795,8 +2884,11 @@ impl SylphApp {
         // New and switched-to documents are what the next launch reopens.
         let _ = self.editor.read(cx).storage.set_last_opened(doc_id);
 
+        let mut formats = model.char_formats.clone();
+        formats.clamp_to(&saved);
         self.editor.update(cx, |editor, cx| {
             editor.doc_id = doc_id;
+            editor.formats = formats;
             editor.content = saved.clone();
             editor.content_rev += 1;
             editor.selected_range = 0..0;
@@ -2812,6 +2904,7 @@ impl SylphApp {
         });
         self.persisted_model = model.clone();
         self.document = model;
+        self.document.char_formats = self.editor.read(cx).formats.clone();
         self.sync_markdown_mode(cx);
         self.model_save_error = None;
         self.revisions.clear();
@@ -3692,22 +3785,20 @@ impl SylphApp {
         cx.notify();
     }
 
-    /// Font size of every paragraph in the caret's style (Normal or a
-    /// heading), like changing the size in a Word style.
+    /// −/+ beside the size: the selected text's size, or with only a
+    /// caret, every paragraph in the caret's style (like a Word style).
     fn adjust_body_font_size(&mut self, delta: i8, _window: &mut Window, cx: &mut Context<Self>) {
-        let level = self.caret_style(cx);
-        let size = self.document.resolved_style(level).size + delta as f32;
-        self.document.set_style_size(level, size);
-        let size = self.document.resolved_style(level).size;
-        self.set_status(
-            format!(
-                "Size {} pt for every {} paragraph",
-                size.round() as i32,
-                style_controls::style_name(level)
-            ),
-            cx,
-        );
-        cx.notify();
+        let size = self.effective_size(cx) + delta as f32;
+        self.set_size(size, cx);
+    }
+
+    fn clear_formatting(
+        &mut self,
+        _: &ClearFormatting,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_char_format(cx);
     }
 
     /// Heading level at the caret — `0` (Normal) unless Markdown mode is
@@ -5092,7 +5183,10 @@ fn display_runs(
 /// detection (`[ ]`/`[x]`). Returns (raw_indent, ordered, checked, runs);
 /// the scanner converts indent into a nesting level relative to the list
 /// base so both 2-space and 4-space nesting styles work.
-fn parse_list_item(line: &str) -> Option<(usize, bool, Option<bool>, Vec<doc::TextRun>)> {
+fn parse_list_item(
+    line: &str,
+    fmt: &RunFormat,
+) -> Option<(usize, bool, Option<bool>, Vec<doc::TextRun>)> {
     let b = line.as_bytes();
     let mut idx = 0usize;
     let mut indent = 0usize;
@@ -5121,7 +5215,7 @@ fn parse_list_item(line: &str) -> Option<(usize, bool, Option<bool>, Vec<doc::Te
         if content.trim().is_empty() && checked.is_none() {
             return None; // "- " with nothing: not an item yet
         }
-        return Some((indent, false, checked, parse_inline_runs(content.trim())));
+        return Some((indent, false, checked, fmt.runs(content.trim())));
     }
 
     // Ordered: digits + `.` or `)` + space.
@@ -5136,7 +5230,7 @@ fn parse_list_item(line: &str) -> Option<(usize, bool, Option<bool>, Vec<doc::Te
             if content.trim().is_empty() && checked.is_none() {
                 return None;
             }
-            return Some((indent, true, checked, parse_inline_runs(content.trim())));
+            return Some((indent, true, checked, fmt.runs(content.trim())));
         }
     }
     None
@@ -5214,13 +5308,17 @@ fn standalone_image(line: &str) -> Option<(String, String)> {
     Some((alt.to_string(), url.to_string()))
 }
 
-fn flush_para(para: &mut Vec<&str>, blocks: &mut Vec<doc::Block>, line_spacing: f32) {
+fn flush_para(
+    para: &mut Vec<&str>,
+    blocks: &mut Vec<doc::Block>,
+    line_spacing: f32,
+    fmt: &RunFormat,
+) {
     if para.is_empty() {
         return;
     }
-    let joined = para.join(" ");
+    let runs = fmt.joined_runs(para);
     para.clear();
-    let runs = parse_inline_runs(&joined);
     if !runs.is_empty() {
         blocks.push(doc::Block::Paragraph {
             runs,
@@ -5233,13 +5331,17 @@ fn flush_para(para: &mut Vec<&str>, blocks: &mut Vec<doc::Block>, line_spacing: 
     }
 }
 
-fn flush_quote(quote: &mut Vec<&str>, quote_level: &mut u8, blocks: &mut Vec<doc::Block>) {
+fn flush_quote(
+    quote: &mut Vec<&str>,
+    quote_level: &mut u8,
+    blocks: &mut Vec<doc::Block>,
+    fmt: &RunFormat,
+) {
     if quote.is_empty() {
         return;
     }
-    let joined = quote.join(" ");
+    let runs = fmt.joined_runs(quote);
     quote.clear();
-    let runs = parse_inline_runs(&joined);
     if !runs.is_empty() {
         blocks.push(doc::Block::Quote {
             level: *quote_level,
@@ -5261,6 +5363,12 @@ fn flush_list(items: &mut Vec<doc::ListItem>, blocks: &mut Vec<doc::Block>) {
 /// tables, headings, thematic breaks, standalone images, then paragraphs
 /// (consecutive lines join with a space — soft wrap).
 fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
+    parse_content_blocks_with(text, line_spacing, &RunFormat::none(text))
+}
+
+/// `parse_content_blocks`, with character formatting over `text` carried
+/// into the runs (`fmt`).
+fn parse_content_blocks_with(text: &str, line_spacing: f32, fmt: &RunFormat) -> Vec<doc::Block> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut blocks: Vec<doc::Block> = Vec::new();
     let mut para: Vec<&str> = Vec::new();
@@ -5300,8 +5408,8 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
 
         // ── Fence open ──
         if line.trim_start().starts_with("```") {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             in_fence = true;
             fence_lang = line.trim_start()[3..]
@@ -5315,8 +5423,8 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
 
         // ── Blank line: every pending construct ends ──
         if line.trim().is_empty() {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             i += 1;
             continue;
@@ -5327,8 +5435,8 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
         //    the directive keeps rich exports a byte-identical fixed
         //    point and lets authors type a real page break. ──
         if line.trim() == "\\newpage" {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             blocks.push(doc::Block::page_break());
             i += 1;
@@ -5337,11 +5445,11 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
 
         // ── Blockquote ──
         if let Some((lvl, content)) = strip_quote(line) {
-            flush_para(&mut para, &mut blocks, line_spacing);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
             flush_list(&mut items, &mut blocks);
             if content.is_empty() {
                 // `>` alone: paragraph break inside/after the quote.
-                flush_quote(&mut quote, &mut quote_level, &mut blocks);
+                flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             } else {
                 if !quote.is_empty() {
                     quote_level = quote_level.max(lvl);
@@ -5355,17 +5463,17 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
         }
         if !quote.is_empty() {
             // Non-quote line ends the quote; keep processing this line.
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
         }
 
         // ── Heading (≤3 leading spaces tolerated via trim_start) ──
         if let Some((level, content)) = heading_level_and_text(line.trim_start()) {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             blocks.push(doc::Block::Heading {
                 level,
-                runs: parse_inline_runs(content),
+                runs: fmt.runs(content),
             });
             i += 1;
             continue;
@@ -5374,8 +5482,8 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
         // ── Thematic break (checked before list: `* * *` is a rule, not
         //    a bullet whose content is `* *`) ──
         if is_horizontal_rule(line) {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             blocks.push(doc::Block::HorizontalRule);
             i += 1;
@@ -5383,9 +5491,9 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
         }
 
         // ── List item ──
-        if let Some((indent, ordered, checked, runs)) = parse_list_item(line) {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+        if let Some((indent, ordered, checked, runs)) = parse_list_item(line, fmt) {
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             // Nesting depth is relative to the list's base indent; the step
             // is the first observed deeper indent (2- or 4-space style).
             if items.is_empty() {
@@ -5412,8 +5520,8 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
 
         // ── Standalone image ──
         if let Some((alt, path)) = standalone_image(line) {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             let mut data = doc::ImageData::new(path);
             data.alt_text = alt;
@@ -5424,8 +5532,8 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
 
         // ── Pipe table: row + delimiter row + body rows ──
         if line.contains('|') && i + 1 < lines.len() && is_table_delimiter(lines[i + 1]) {
-            flush_para(&mut para, &mut blocks, line_spacing);
-            flush_quote(&mut quote, &mut quote_level, &mut blocks);
+            flush_para(&mut para, &mut blocks, line_spacing, fmt);
+            flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
             flush_list(&mut items, &mut blocks);
             let mut raw_rows: Vec<Vec<String>> = vec![split_table_row(line)];
             i += 2; // skip delimiter
@@ -5466,21 +5574,21 @@ fn parse_content_blocks(text: &str, line_spacing: f32) -> Vec<doc::Block> {
         if !items.is_empty() && (line.starts_with(' ') || line.starts_with('\t')) {
             if let Some(last) = items.last_mut() {
                 last.runs.push(doc::TextRun::plain(" "));
-                last.runs.extend(parse_inline_runs(line.trim()));
+                last.runs.extend(fmt.runs(line.trim()));
             }
             i += 1;
             continue;
         }
 
         // ── Plain paragraph line ──
-        flush_quote(&mut quote, &mut quote_level, &mut blocks);
+        flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
         flush_list(&mut items, &mut blocks);
         para.push(line.trim());
         i += 1;
     }
 
-    flush_para(&mut para, &mut blocks, line_spacing);
-    flush_quote(&mut quote, &mut quote_level, &mut blocks);
+    flush_para(&mut para, &mut blocks, line_spacing, fmt);
+    flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
     flush_list(&mut items, &mut blocks);
     // Unclosed fence at EOF still renders its content (never drop text).
     if in_fence {
@@ -5579,7 +5687,8 @@ fn load_model_or_default(
 /// OFF = what you see is what you export: one paragraph per nonblank
 /// source line, verbatim — no `parse_inline_runs`, so `#`, `**` and
 /// `\newpage` stay literal. Styling matches `flush_para` exactly.
-fn literal_blocks(content: &str, line_spacing: f32) -> Vec<doc::Block> {
+/// Character formatting over `content` (`fmt`) is carried into the runs.
+fn literal_blocks_with(content: &str, line_spacing: f32, fmt: &RunFormat) -> Vec<doc::Block> {
     let mut out = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -5593,7 +5702,7 @@ fn literal_blocks(content: &str, line_spacing: f32) -> Vec<doc::Block> {
             continue;
         }
         out.push(doc::Block::Paragraph {
-            runs: vec![doc::TextRun::plain(line)],
+            runs: fmt.literal_runs(line),
             style: doc::ParagraphStyle {
                 line_spacing,
                 space_before: 0.0,
@@ -5619,9 +5728,17 @@ fn export_model(structured: &doc::Document, content: &str, markdown_on: bool) ->
         }
     }
     let text_blocks = if markdown_on {
-        parse_content_blocks(content, structured.line_spacing)
+        parse_content_blocks_with(
+            content,
+            structured.line_spacing,
+            &RunFormat::with(content, &structured.char_formats),
+        )
     } else {
-        literal_blocks(content, structured.line_spacing)
+        literal_blocks_with(
+            content,
+            structured.line_spacing,
+            &RunFormat::with(content, &structured.char_formats),
+        )
     };
     // The typed paragraphs take the Normal style's spacing.
     blocks.extend(text_blocks.into_iter().map(|mut block| {
@@ -5811,6 +5928,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         // ── File ──
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-n", NewDocument, None),
+        // Google Docs' Clear formatting.
+        KeyBinding::new("secondary-\\", ClearFormatting, None),
         // ── Undo/Redo ──
         KeyBinding::new("secondary-z", Undo, None),
         KeyBinding::new("secondary-shift-z", Redo, None),
@@ -5888,6 +6007,8 @@ fn main() {
                         migrate_page_breaks(&storage, doc_id, &mut document, &mut saved);
                     }
 
+                    let mut initial_formats = document.char_formats.clone();
+                    initial_formats.clamp_to(&saved);
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
                         content: saved,
@@ -5920,6 +6041,7 @@ fn main() {
                         word_wrap: true,
                         save_task: None,
                         content_rev: 0,
+                        formats: initial_formats,
                         styles: document.resolved_styles(),
                         save_state: opened_state(&read_only, &unpersisted),
                         unpersisted,
@@ -5941,6 +6063,19 @@ fn main() {
                         );
                         // Any notify may follow a model change; this one hook
                         // saves it, so no handler has to remember to.
+                        // Character formatting is edited in the editor (it
+                        // moves with the text); the model keeps the copy
+                        // that is saved.
+                        let editor_observer = cx.observe(
+                            &editor,
+                            |this: &mut SylphApp, editor: Entity<TextInput>, cx| {
+                                let formats = &editor.read(cx).formats;
+                                if this.document.char_formats != *formats {
+                                    this.document.char_formats = formats.clone();
+                                    cx.notify();
+                                }
+                            },
+                        );
                         let model_observer = cx.observe_self(|this: &mut SylphApp, cx| {
                             this.sync_editor_styles(cx);
                             this.persist_model_if_changed(cx)
@@ -6006,6 +6141,8 @@ fn main() {
                             status_clear_task: None,
                             _keystroke_subscription: keystroke_subscription,
                             _model_observer: model_observer,
+                            _editor_observer: editor_observer,
+                            formats_save_task: None,
                         }
                     })
                 },

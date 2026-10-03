@@ -246,7 +246,7 @@ def _link_url(styles):
 
 
 def _add_hyperlink_docx(paragraph, text, url, *, bold=False, italic=False,
-                        code=False, strike=False):
+                        code=False, strike=False, size=None, font=None):
     """Append a real OOXML hyperlink run to a paragraph."""
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
@@ -258,26 +258,31 @@ def _add_hyperlink_docx(paragraph, text, url, *, bold=False, italic=False,
 
     run_el = OxmlElement('w:r')
     r_pr = OxmlElement('w:rPr')
-    color = OxmlElement('w:color')
-    color.set(qn('w:val'), '0563C1')
-    r_pr.append(color)
-    underline = OxmlElement('w:u')
-    underline.set(qn('w:val'), 'single')
-    r_pr.append(underline)
+    # Children in the order the OOXML schema (CT_RPr) requires: Word
+    # reports "unreadable content" for out-of-order run properties.
+    if code or font:
+        family = 'Courier New' if code else font
+        fonts = OxmlElement('w:rFonts')
+        fonts.set(qn('w:ascii'), family)
+        fonts.set(qn('w:hAnsi'), family)
+        r_pr.append(fonts)
     if bold:
         r_pr.append(OxmlElement('w:b'))
     if italic:
         r_pr.append(OxmlElement('w:i'))
     if strike:
         r_pr.append(OxmlElement('w:strike'))
-    if code:
-        fonts = OxmlElement('w:rFonts')
-        fonts.set(qn('w:ascii'), 'Courier New')
-        fonts.set(qn('w:hAnsi'), 'Courier New')
-        r_pr.append(fonts)
-        size = OxmlElement('w:sz')
-        size.set(qn('w:val'), '20')
-        r_pr.append(size)
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), '0563C1')
+    r_pr.append(color)
+    if code or size:
+        size_el = OxmlElement('w:sz')
+        # Half-points; code keeps its 10 pt.
+        size_el.set(qn('w:val'), '20' if code else str(int(round(float(size) * 2))))
+        r_pr.append(size_el)
+    underline = OxmlElement('w:u')
+    underline.set(qn('w:val'), 'single')
+    r_pr.append(underline)
     run_el.append(r_pr)
     text_el = OxmlElement('w:t')
     text_el.set(qn('xml:space'), 'preserve')
@@ -301,6 +306,8 @@ def _add_styled_run_docx(paragraph, run_data):
             italic='Italic' in styles or 'BoldItalic' in styles,
             code='Code' in styles,
             strike='Strikethrough' in styles,
+            size=run_data.get('size'),
+            font=run_data.get('font'),
         )
         return
     run = paragraph.add_run(text)
@@ -315,6 +322,11 @@ def _add_styled_run_docx(paragraph, run_data):
         run.font.strike = True
     if 'Underline' in styles:
         run.font.underline = True
+    # Character formatting on selected words (size, font) over the style's.
+    if run_data.get('size'):
+        run.font.size = Pt(float(run_data['size']))
+    if run_data.get('font'):
+        run.font.name = run_data['font']
 
 
 def markdown_to_html(text: str) -> str:
@@ -1257,8 +1269,12 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
                 styles = run_data.get('styles', [])
                 strike = 'S' if 'Strikethrough' in styles else ''
                 url = _link_url(styles)
+                # Character formatting on selected words overrides the
+                # paragraph's size and family.
+                run_size = float(run_data.get('size') or size)
+                run_family = _pdf_family(run_data['font']) if run_data.get('font') else family
                 if 'Code' in styles:
-                    pdf.set_font(_MONO, strike, size - 1)
+                    pdf.set_font(_MONO, strike, run_size - 1)
                     pdf.set_text_color(200, 50, 50)
                 else:
                     if 'BoldItalic' in styles or ('Bold' in styles and 'Italic' in styles):
@@ -1269,7 +1285,7 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
                         emphasis = 'I'
                     else:
                         emphasis = default_style
-                    pdf.set_font(family, emphasis + strike, size)
+                    pdf.set_font(run_family, emphasis + strike, run_size)
                     pdf.set_text_color(*(default_color if emphasis == default_style else (0, 0, 0)))
                 if url is not None:
                     pdf.set_text_color(0, 90, 180)

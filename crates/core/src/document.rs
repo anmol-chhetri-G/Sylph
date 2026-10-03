@@ -17,6 +17,10 @@ pub enum SpanStyle {
 pub struct TextRun {
     pub text: String,
     pub styles: Vec<SpanStyle>,
+    /// Direct character formatting (size, font) over the style's; in the
+    /// JSON its fields sit beside `text` ("size": 14.0), only when set.
+    #[serde(flatten, default)]
+    pub format: crate::format::CharFormat,
 }
 
 impl TextRun {
@@ -24,6 +28,7 @@ impl TextRun {
         Self {
             text: text.into(),
             styles: Vec::new(),
+            format: Default::default(),
         }
     }
 
@@ -31,6 +36,7 @@ impl TextRun {
         Self {
             text: text.into(),
             styles,
+            format: Default::default(),
         }
     }
 
@@ -487,6 +493,9 @@ pub struct Document {
     /// Normal style: space above and below each paragraph, in points.
     pub space_before: f32,
     pub space_after: f32,
+    /// Character formatting (size, font on selected words) as ranges over
+    /// the editor's text.
+    pub char_formats: crate::format::FormatSpans,
 }
 
 /// The Heading 1–6 defaults, in points: (size, space before, space after).
@@ -556,6 +565,7 @@ impl Document {
             heading_styles: Default::default(),
             space_before: 0.0,
             space_after: NORMAL_SPACE_AFTER,
+            char_formats: Default::default(),
         }
     }
 
@@ -573,6 +583,7 @@ impl Document {
             heading_styles: Default::default(),
             space_before: 0.0,
             space_after: NORMAL_SPACE_AFTER,
+            char_formats: Default::default(),
         }
     }
 
@@ -795,6 +806,7 @@ impl Document {
             heading_styles: Default::default(),
             space_before: 0.0,
             space_after: NORMAL_SPACE_AFTER,
+            char_formats: Default::default(),
         }
     }
 

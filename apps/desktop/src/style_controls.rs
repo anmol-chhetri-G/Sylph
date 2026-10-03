@@ -1,11 +1,13 @@
-//! Paragraph styles in the format bar: the Style, Font and Line spacing
-//! dropdowns. Font and spacing act on the style at the caret (Normal or
-//! Heading 1–6), so changing them changes every paragraph of that style,
-//! as Word's styles do.
+//! Paragraph styles and character formatting in the format bar: the
+//! Style, Font, Size and Spacing dropdowns. Like Word, formatting works on
+//! two levels: with text selected, font and size change just that text
+//! (character formatting); with only a caret, they change the style at the
+//! caret (Normal or Heading 1–6), so every paragraph of that style follows.
 
 use gpui::prelude::*;
 use gpui::{deferred, div, px, AnyElement, Context, Div, MouseButton, Window};
 use sylph_core::document::{LINE_SPACING_CHOICES, PARAGRAPH_SPACING_CHOICES};
+use sylph_core::format::CharFormat;
 
 use crate::fonts::BODY_FONTS;
 use crate::ui::{icon, label};
@@ -16,7 +18,22 @@ use crate::SylphApp;
 pub(crate) enum Picker {
     Style,
     Font,
+    Size,
     LineSpacing,
+}
+
+/// Font sizes the size dropdown offers, in points (Word's list).
+pub(crate) const FONT_SIZE_CHOICES: [f32; 16] = [
+    8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0, 48.0, 72.0,
+];
+
+/// "11", "10.5".
+pub(crate) fn size_label(points: f32) -> String {
+    if (points - points.round()).abs() < 0.01 {
+        format!("{}", points.round() as i32)
+    } else {
+        format!("{points:.1}")
+    }
 }
 
 /// "Normal", "Heading 1" … "Heading 6".
@@ -41,6 +58,92 @@ impl SylphApp {
     /// Without Markdown mode every line is Normal text.
     pub(crate) fn caret_style(&self, cx: &mut Context<Self>) -> u8 {
         self.current_heading_level(cx)
+    }
+
+    /// Whether text is selected (font and size then act on it alone).
+    pub(crate) fn has_selection(&self, cx: &mut Context<Self>) -> bool {
+        !self.editor.read(cx).selected_range.is_empty()
+    }
+
+    /// The character formatting the controls show: at the start of the
+    /// selection, or of the character before the caret (what typing there
+    /// continues), as Word's font and size boxes do.
+    pub(crate) fn caret_char_format(&self, cx: &mut Context<Self>) -> CharFormat {
+        let editor = self.editor.read(cx);
+        let range = &editor.selected_range;
+        let at = if range.is_empty() {
+            let cursor = editor.cursor_offset();
+            editor.content[..cursor]
+                .chars()
+                .next_back()
+                .map_or(0, |c| cursor - c.len_utf8())
+        } else {
+            range.start
+        };
+        editor.formats.format_at(at)
+    }
+
+    /// The size (points) at the caret or selection: its own, else its
+    /// style's.
+    pub(crate) fn effective_size(&self, cx: &mut Context<Self>) -> f32 {
+        let level = self.caret_style(cx);
+        self.caret_char_format(cx)
+            .size
+            .unwrap_or_else(|| self.document.resolved_style(level).size)
+    }
+
+    /// The font at the caret or selection: its own, else its style's.
+    pub(crate) fn effective_font(&self, cx: &mut Context<Self>) -> String {
+        let level = self.caret_style(cx);
+        self.caret_char_format(cx)
+            .font
+            .unwrap_or_else(|| self.document.style_font(level).to_string())
+    }
+
+    /// Set the size: of the selected text when there is a selection, else
+    /// of every paragraph in the caret's style.
+    pub(crate) fn set_size(&mut self, points: f32, cx: &mut Context<Self>) {
+        let points = points.clamp(6.0, 96.0);
+        self.open_picker = None;
+        if self.has_selection(cx) {
+            self.editor.update(cx, |editor, cx| {
+                editor.format_selection(|f| f.size = Some(points), cx)
+            });
+            self.set_status(
+                format!("Size {} pt for the selected text", size_label(points)),
+                cx,
+            );
+        } else {
+            let level = self.caret_style(cx);
+            self.document.set_style_size(level, points);
+            self.set_status(
+                format!(
+                    "Size {} pt for every {} paragraph",
+                    size_label(points),
+                    style_name(level)
+                ),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Remove the character formatting (size, font) of the selection, so
+    /// it follows its paragraph style again.
+    pub(crate) fn clear_char_format(&mut self, cx: &mut Context<Self>) {
+        self.open_picker = None;
+        let cleared = self.editor.update(cx, |editor, cx| {
+            editor.format_selection(|f| *f = CharFormat::default(), cx)
+        });
+        self.set_status(
+            if cleared {
+                "Formatting cleared: the text follows its style again"
+            } else {
+                "Select text to clear its formatting"
+            },
+            cx,
+        );
+        cx.notify();
     }
 
     /// Give the editor the document's heading styles when they differ
@@ -116,8 +219,18 @@ impl SylphApp {
         cx.notify();
     }
 
-    /// Font for every paragraph of the caret's style.
+    /// Font of the selected text, or with only a caret, of every
+    /// paragraph of the caret's style.
     pub(crate) fn set_style_font(&mut self, font: &str, cx: &mut Context<Self>) {
+        if self.has_selection(cx) {
+            let family = font.to_string();
+            self.editor.update(cx, |editor, cx| {
+                editor.format_selection(|f| f.font = Some(family.clone()), cx)
+            });
+            self.set_status(format!("{font} for the selected text"), cx);
+            self.open_picker = None;
+            return cx.notify();
+        }
         let level = self.caret_style(cx);
         self.document.set_style_font(level, font);
         self.set_status(
@@ -209,7 +322,8 @@ impl SylphApp {
                     .collect(),
             ),
             Picker::Font => {
-                let current = self.document.style_font(level).to_string();
+                let current = self.effective_font(cx);
+                let selected = self.has_selection(cx);
                 let mut rows: Vec<AnyElement> = BODY_FONTS
                     .iter()
                     .map(|&font| {
@@ -223,15 +337,55 @@ impl SylphApp {
                     })
                     .collect();
                 rows.push(self.picker_separator());
-                let everywhere = current.clone();
-                rows.push(self.picker_row(
-                    format!("Use {current} for the whole document"),
-                    None,
-                    false,
-                    cx,
-                    move |this, cx| this.set_font_everywhere(&everywhere, cx),
-                ));
-                (format!("Font · every {style} paragraph"), rows)
+                if selected {
+                    rows.push(self.picker_row(
+                        "Clear formatting (follow the style)".to_string(),
+                        None,
+                        false,
+                        cx,
+                        |this, cx| this.clear_char_format(cx),
+                    ));
+                    ("Font · selected text".to_string(), rows)
+                } else {
+                    let everywhere = current.clone();
+                    rows.push(self.picker_row(
+                        format!("Use {current} for the whole document"),
+                        None,
+                        false,
+                        cx,
+                        move |this, cx| this.set_font_everywhere(&everywhere, cx),
+                    ));
+                    (format!("Font · every {style} paragraph"), rows)
+                }
+            }
+            Picker::Size => {
+                let current = self.effective_size(cx);
+                let mut rows: Vec<AnyElement> = FONT_SIZE_CHOICES
+                    .iter()
+                    .map(|&points| {
+                        self.picker_row(
+                            size_label(points),
+                            None,
+                            (current - points).abs() < 0.01,
+                            cx,
+                            move |this, cx| this.set_size(points, cx),
+                        )
+                    })
+                    .collect();
+                let header = if self.has_selection(cx) {
+                    rows.push(self.picker_separator());
+                    rows.push(self.picker_row(
+                        "Clear formatting (follow the style)".to_string(),
+                        None,
+                        false,
+                        cx,
+                        |this, cx| this.clear_char_format(cx),
+                    ));
+                    "Size · selected text".to_string()
+                } else {
+                    format!("Size · every {style} paragraph")
+                };
+                (header, rows)
             }
             Picker::LineSpacing => {
                 let current = self.document.style_line_spacing(level);

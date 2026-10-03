@@ -1,4 +1,5 @@
 pub mod document;
+pub mod format;
 pub mod text;
 
 pub use text::{
