@@ -4,12 +4,16 @@
 //! split where the formatting changes and carries it in `TextRun::format`.
 
 use crate::{doc, inline_pieces, parse_inline_runs, InlinePiece};
-use sylph_core::format::{CharFormat, FormatSpans};
+use sylph_core::format::{CharFormat, FormatSpans, ParaFormat, ParagraphSpans};
 
 /// Where the parser's text came from, and the formatting over it.
 pub(crate) struct RunFormat<'a> {
     base: &'a str,
     formats: Option<&'a FormatSpans>,
+    paras: Option<&'a ParagraphSpans>,
+    /// The Normal style's space before/after (points), for paragraphs
+    /// without their own.
+    normal_spacing: (f32, f32),
 }
 
 impl<'a> RunFormat<'a> {
@@ -18,6 +22,8 @@ impl<'a> RunFormat<'a> {
         Self {
             base,
             formats: None,
+            paras: None,
+            normal_spacing: (0.0, sylph_core::document::NORMAL_SPACE_AFTER),
         }
     }
 
@@ -26,6 +32,43 @@ impl<'a> RunFormat<'a> {
         Self {
             base,
             formats: (!formats.is_empty()).then_some(formats),
+            paras: None,
+            normal_spacing: (0.0, sylph_core::document::NORMAL_SPACE_AFTER),
+        }
+    }
+
+    /// Also carry paragraph formatting (`paras`, over `base`) and the
+    /// Normal style's spacing into the blocks.
+    pub(crate) fn with_paragraphs(
+        mut self,
+        paras: &'a ParagraphSpans,
+        normal_spacing: (f32, f32),
+    ) -> Self {
+        self.paras = (!paras.is_empty()).then_some(paras);
+        self.normal_spacing = normal_spacing;
+        self
+    }
+
+    /// The paragraph formatting of the line `chunk` (a slice of the text)
+    /// starts on.
+    pub(crate) fn para_at(&self, chunk: &str) -> ParaFormat {
+        match (self.paras, self.offset_of(chunk)) {
+            (Some(paras), Some(offset)) => {
+                let line_start = self.base[..offset].rfind('\n').map_or(0, |p| p + 1);
+                paras.format_at(line_start)
+            }
+            _ => ParaFormat::default(),
+        }
+    }
+
+    /// A paragraph's style: its own formatting over the Normal style's.
+    pub(crate) fn paragraph_style(&self, chunk: &str, line_spacing: f32) -> doc::ParagraphStyle {
+        let para = self.para_at(chunk);
+        doc::ParagraphStyle {
+            line_spacing: para.line_spacing.unwrap_or(line_spacing),
+            space_before: para.space_before.unwrap_or(self.normal_spacing.0),
+            space_after: para.space_after.unwrap_or(self.normal_spacing.1),
+            alignment: para.align.unwrap_or_default(),
         }
     }
 
@@ -216,6 +259,56 @@ mod tests {
                 (" a heading **raw**", None)
             ]
         );
+    }
+
+    #[test]
+    fn paragraph_formatting_reaches_the_blocks() {
+        use sylph_core::document::{Block, Document};
+        use sylph_core::format::{paragraph_range, Alignment};
+        let text = "# Title\nCentred line\nPlain line";
+        let mut model = Document::new();
+        model.para_formats.apply(paragraph_range(text, 0, 0), |p| {
+            p.align = Some(Alignment::Center)
+        });
+        let second = text.find("Centred").unwrap();
+        model
+            .para_formats
+            .apply(paragraph_range(text, second, second), |p| {
+                p.align = Some(Alignment::Justify);
+                p.line_spacing = Some(2.0);
+                p.space_after = Some(20.0);
+            });
+        for markdown in [true, false] {
+            let blocks = crate::export_model(&model, text, markdown).blocks;
+            let plain = blocks.last().unwrap();
+            match plain {
+                Block::Paragraph { style, .. } => {
+                    assert_eq!(style.alignment, Alignment::Left);
+                    assert_eq!(style.space_after, model.space_after, "Normal's spacing");
+                }
+                b => panic!("{b:?}"),
+            }
+            let centred = blocks
+                .iter()
+                .find(|b| b.plain_text() == "Centred line")
+                .unwrap();
+            match centred {
+                Block::Paragraph { style, .. } => {
+                    assert_eq!(style.alignment, Alignment::Justify);
+                    assert_eq!((style.line_spacing, style.space_after), (2.0, 20.0));
+                }
+                b => panic!("{b:?}"),
+            }
+            if markdown {
+                assert!(matches!(
+                    blocks[0],
+                    Block::Heading {
+                        alignment: Alignment::Center,
+                        ..
+                    }
+                ));
+            }
+        }
     }
 
     #[test]

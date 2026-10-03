@@ -6,7 +6,7 @@
 
 use gpui::{point, px, App, Pixels, Point, ShapedLine, TextRun, Window};
 use std::ops::Range;
-use sylph_core::format::CharFormat;
+use sylph_core::format::{CharFormat, SpanFormat};
 
 /// Points to canvas pixels (96 dpi).
 const PX_PER_PT: f32 = 4.0 / 3.0;
@@ -18,6 +18,9 @@ struct Segment {
     /// Left edge within the row.
     x: Pixels,
     shaped: ShapedLine,
+    /// A table cell's horizontal extent: clicks anywhere in it land in
+    /// this segment, and painting is clipped to it.
+    cell: Option<(Pixels, Pixels)>,
 }
 
 #[derive(Clone)]
@@ -47,6 +50,7 @@ impl RowText {
                     start: 0,
                     x: px(0.0),
                     shaped,
+                    cell: None,
                 }],
             };
         }
@@ -74,9 +78,118 @@ impl RowText {
                 None,
             );
             let width = shaped.width;
-            segments.push(Segment { start, x, shaped });
+            segments.push(Segment {
+                start,
+                x,
+                shaped,
+                cell: None,
+            });
             x += width;
             i = j;
+        }
+        Self { segments }
+    }
+
+    /// The row moved right by `dx` (alignment). Positions reported by
+    /// `x_for_index` and taken by `closest_index_for_x` include it.
+    pub(crate) fn offset_by(mut self, dx: Pixels) -> Self {
+        for seg in &mut self.segments {
+            seg.x += dx;
+        }
+        self
+    }
+
+    /// Shape a justified row: words spread so the row's last visible
+    /// character reaches `target` (Word's justify; not used for a
+    /// paragraph's last row). Falls back to a normal row with one word.
+    pub(crate) fn shape_justified(
+        window: &Window,
+        text: &str,
+        runs: &[TextRun],
+        base_size: Pixels,
+        formats: &[(Range<usize>, CharFormat)],
+        target: Pixels,
+    ) -> Self {
+        // Word pieces: each ends after its run of spaces.
+        let mut cuts = vec![0];
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len() {
+            if bytes[i] == b' ' && bytes.get(i + 1).is_some_and(|&b| b != b' ') {
+                cuts.push(i + 1);
+            }
+        }
+        cuts.push(text.len());
+        if cuts.len() < 3 {
+            return Self::shape(window, text, runs, base_size, formats);
+        }
+        let pieces: Vec<RowText> = cuts
+            .windows(2)
+            .map(|w| {
+                let range = w[0]..w[1];
+                Self::shape(
+                    window,
+                    &text[range.clone()],
+                    &slice_runs(runs, range.clone()),
+                    base_size,
+                    &slice_formats(formats, range),
+                )
+            })
+            .collect();
+        // The last piece's trailing spaces are invisible: justify to its
+        // last visible character.
+        let last = pieces.last().expect("at least two pieces");
+        let last_text = &text[cuts[cuts.len() - 2]..];
+        let natural: Pixels = pieces[..pieces.len() - 1]
+            .iter()
+            .map(RowText::width)
+            .fold(px(0.0), |a, b| a + b)
+            + last.x_for_index(last_text.trim_end().len());
+        let gaps = (pieces.len() - 1) as f32;
+        let extra = ((target - natural) / gaps).max(px(0.0));
+        let mut segments = Vec::new();
+        let mut x = px(0.0);
+        for (k, piece) in pieces.into_iter().enumerate() {
+            let width = piece.width();
+            for mut seg in piece.segments {
+                seg.start += cuts[k];
+                seg.x += x;
+                segments.push(seg);
+            }
+            x += width + extra;
+        }
+        Self { segments }
+    }
+
+    /// A table row: each cell's display range shaped on its own and placed
+    /// at its column (`left`, `width`), text inset by `pad`. Separators
+    /// between cells are not drawn.
+    pub(crate) fn shape_cells(
+        window: &Window,
+        text: &str,
+        runs: &[TextRun],
+        base_size: Pixels,
+        formats: &[(Range<usize>, CharFormat)],
+        cells: &[(Range<usize>, Pixels, Pixels)],
+        pad: Pixels,
+    ) -> Self {
+        let mut segments = Vec::new();
+        for (range, left, width) in cells {
+            let piece = Self::shape(
+                window,
+                &text[range.clone()],
+                &slice_runs(runs, range.clone()),
+                base_size,
+                &slice_formats(formats, range.clone()),
+            );
+            for mut seg in piece.segments {
+                seg.start += range.start;
+                seg.x += *left + pad;
+                seg.cell = Some((*left, *left + *width));
+                segments.push(seg);
+            }
+        }
+        if segments.is_empty() {
+            return Self::shape(window, text, runs, base_size, formats);
         }
         Self { segments }
     }
@@ -106,7 +219,7 @@ impl RowText {
     fn segment_for_x(&self, x: Pixels) -> &Segment {
         self.segments
             .iter()
-            .find(|s| x < s.x + s.shaped.width)
+            .find(|s| x < s.cell.map_or(s.x + s.shaped.width, |(_, right)| right))
             .unwrap_or_else(|| self.segments.last().expect("a row has a segment"))
     }
 
@@ -151,7 +264,23 @@ impl RowText {
             let own =
                 (line_height - seg.shaped.ascent - seg.shaped.descent) / 2.0 + seg.shaped.ascent;
             let at = point(origin.x + seg.x, origin.y + baseline - own);
-            let _ = seg.shaped.paint(at, line_height, window, cx);
+            match seg.cell {
+                // A table cell's text never spills into its neighbour.
+                Some((left, right)) => {
+                    let mask = gpui::ContentMask {
+                        bounds: gpui::Bounds::from_corners(
+                            point(origin.x + left, origin.y),
+                            point(origin.x + right, origin.y + line_height),
+                        ),
+                    };
+                    window.with_content_mask(Some(mask), |window| {
+                        let _ = seg.shaped.paint(at, line_height, window, cx);
+                    });
+                }
+                None => {
+                    let _ = seg.shaped.paint(at, line_height, window, cx);
+                }
+            }
         }
     }
 }
@@ -223,4 +352,34 @@ pub(crate) fn line_formats(
         }
     }
     out
+}
+
+/// The runs covering `range` of the text, cut to it.
+fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for run in runs {
+        let (start, end) = (pos.max(range.start), (pos + run.len).min(range.end));
+        if start < end {
+            let mut piece = run.clone();
+            piece.len = end - start;
+            out.push(piece);
+        }
+        pos += run.len;
+    }
+    out
+}
+
+/// `formats` (row-relative) cut to `range` and made relative to it.
+fn slice_formats(
+    formats: &[(Range<usize>, CharFormat)],
+    range: Range<usize>,
+) -> Vec<(Range<usize>, CharFormat)> {
+    formats
+        .iter()
+        .filter_map(|(r, f)| {
+            let (start, end) = (r.start.max(range.start), r.end.min(range.end));
+            (start < end).then(|| (start - range.start..end - range.start, f.clone()))
+        })
+        .collect()
 }

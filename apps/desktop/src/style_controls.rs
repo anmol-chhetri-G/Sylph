@@ -7,7 +7,7 @@
 use gpui::prelude::*;
 use gpui::{deferred, div, px, AnyElement, Context, Div, MouseButton, Window};
 use sylph_core::document::{LINE_SPACING_CHOICES, PARAGRAPH_SPACING_CHOICES};
-use sylph_core::format::CharFormat;
+use sylph_core::format::{Alignment, CharFormat, ParaFormat};
 
 use crate::fonts::BODY_FONTS;
 use crate::ui::{icon, label};
@@ -34,6 +34,15 @@ pub(crate) fn size_label(points: f32) -> String {
     } else {
         format!("{points:.1}")
     }
+}
+
+/// What the Spacing dropdown changes: the paragraphs at the caret (Word's
+/// line spacing button) or every paragraph of the caret's style.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum SpacingScope {
+    #[default]
+    ThisParagraph,
+    Style,
 }
 
 /// "Normal", "Heading 1" … "Heading 6".
@@ -146,6 +155,33 @@ impl SylphApp {
         cx.notify();
     }
 
+    /// The paragraph formatting at the caret (its own, not the style's).
+    pub(crate) fn caret_para_format(&self, cx: &mut Context<Self>) -> ParaFormat {
+        let editor = self.editor.read(cx);
+        let start = editor.content[..editor.selected_range.start.min(editor.content.len())]
+            .rfind('\n')
+            .map_or(0, |p| p + 1);
+        editor.para_formats.format_at(start)
+    }
+
+    /// Align the paragraphs at the caret or selection.
+    pub(crate) fn set_alignment(&mut self, align: Alignment, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            editor.format_paragraphs(
+                |p| p.align = (align != Alignment::Left).then_some(align),
+                cx,
+            )
+        });
+        let name = match align {
+            Alignment::Left => "Aligned left",
+            Alignment::Center => "Centred",
+            Alignment::Right => "Aligned right",
+            Alignment::Justify => "Justified",
+        };
+        self.set_status(name, cx);
+        cx.notify();
+    }
+
     /// Give the editor the document's heading styles when they differ
     /// (the canvas lays heading rows out with them).
     pub(crate) fn sync_editor_styles(&mut self, cx: &mut Context<Self>) {
@@ -170,6 +206,15 @@ impl SylphApp {
 
     /// Line spacing for every paragraph of the caret's style.
     pub(crate) fn set_style_spacing(&mut self, spacing: Option<f32>, cx: &mut Context<Self>) {
+        if self.spacing_scope == SpacingScope::ThisParagraph {
+            self.editor.update(cx, |editor, cx| {
+                editor.format_paragraphs(|p| p.line_spacing = spacing, cx)
+            });
+            let value = spacing.map_or("as its style".to_string(), spacing_label);
+            self.set_status(format!("Line spacing {value} for this paragraph"), cx);
+            self.open_picker = None;
+            return cx.notify();
+        }
         let level = self.caret_style(cx);
         match (level, spacing) {
             (1..=6, None) => self.document.heading_styles[level as usize - 1].line_spacing = None,
@@ -196,6 +241,33 @@ impl SylphApp {
         points: f32,
         cx: &mut Context<Self>,
     ) {
+        if self.spacing_scope == SpacingScope::ThisParagraph {
+            self.editor.update(cx, |editor, cx| {
+                editor.format_paragraphs(
+                    |p| {
+                        if before {
+                            p.space_before = Some(points);
+                        } else {
+                            p.space_after = Some(points);
+                        }
+                    },
+                    cx,
+                )
+            });
+            self.set_status(
+                format!(
+                    "{} {points} pt for this paragraph",
+                    if before {
+                        "Space before"
+                    } else {
+                        "Space after"
+                    }
+                ),
+                cx,
+            );
+            self.open_picker = None;
+            return cx.notify();
+        }
         let level = self.caret_style(cx);
         if before {
             self.document.set_style_space_before(level, points);
@@ -388,13 +460,24 @@ impl SylphApp {
                 (header, rows)
             }
             Picker::LineSpacing => {
-                let current = self.document.style_line_spacing(level);
+                let resolved = self.document.resolved_style(level);
+                let style_spacing = self.document.style_line_spacing(level);
                 let explicit = match level {
                     1..=6 => self.document.heading_styles[level as usize - 1].line_spacing,
                     _ => Some(self.document.line_spacing),
                 };
-                let mut rows: Vec<AnyElement> = Vec::new();
-                if level > 0 {
+                let para = self.caret_para_format(cx);
+                let this_paragraph = self.spacing_scope == SpacingScope::ThisParagraph;
+                let mut rows: Vec<AnyElement> = vec![self.scope_switch(&style, cx)];
+                if this_paragraph {
+                    rows.push(self.picker_row(
+                        format!("Same as {style} ({})", spacing_label(style_spacing)),
+                        None,
+                        para.line_spacing.is_none(),
+                        cx,
+                        |this, cx| this.set_style_spacing(None, cx),
+                    ));
+                } else if level > 0 {
                     rows.push(self.picker_row(
                         format!(
                             "Automatic ({})",
@@ -407,24 +490,40 @@ impl SylphApp {
                     ));
                 }
                 rows.extend(LINE_SPACING_CHOICES.iter().map(|&choice| {
-                    self.picker_row(
-                        spacing_label(choice),
-                        None,
-                        explicit.is_some() && (current - choice).abs() < 0.01,
-                        cx,
-                        move |this, cx| this.set_style_spacing(Some(choice), cx),
-                    )
+                    let checked = if this_paragraph {
+                        para.line_spacing
+                            .is_some_and(|ls| (ls - choice).abs() < 0.01)
+                    } else {
+                        explicit.is_some() && (style_spacing - choice).abs() < 0.01
+                    };
+                    self.picker_row(spacing_label(choice), None, checked, cx, move |this, cx| {
+                        this.set_style_spacing(Some(choice), cx)
+                    })
                 }));
-                let resolved = self.document.resolved_style(level);
-                for (before, title, current) in [
-                    (true, "Space before", resolved.space_before),
-                    (false, "Space after", resolved.space_after),
+                for (before, title, style_value, own) in [
+                    (
+                        true,
+                        "Space before",
+                        resolved.space_before,
+                        para.space_before,
+                    ),
+                    (false, "Space after", resolved.space_after, para.space_after),
                 ] {
+                    let current = if this_paragraph {
+                        own.unwrap_or(style_value)
+                    } else {
+                        style_value
+                    };
                     rows.push(self.picker_separator());
                     rows.push(self.picker_heading(&format!("{title} (pt)")));
                     rows.push(self.spacing_chips(before, current, cx));
                 }
-                (format!("Spacing · every {style} paragraph"), rows)
+                let header = if this_paragraph {
+                    "Spacing · this paragraph".to_string()
+                } else {
+                    format!("Spacing · every {style} paragraph")
+                };
+                (header, rows)
             }
         };
         let panel = div()
@@ -613,6 +712,41 @@ impl SylphApp {
                     .child(label(format!("{value:.0} pt"), text, 12.0))
                     .child(step("+", 2.0, cx)),
             )
+    }
+
+    /// "Apply to: This paragraph | Every <style>" at the top of Spacing.
+    fn scope_switch(&self, style: &str, cx: &mut Context<Self>) -> AnyElement {
+        let (text, primary) = (self.ui_text(), self.ui_primary());
+        let mut row = div().px(px(6.0)).py(px(4.0)).flex().gap(px(4.0));
+        for (scope, name) in [
+            (SpacingScope::ThisParagraph, "This paragraph".to_string()),
+            (SpacingScope::Style, format!("Every {style}")),
+        ] {
+            let active = self.spacing_scope == scope;
+            row = row.child(
+                div()
+                    .flex_1()
+                    .h(px(26.0))
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(if active { primary } else { self.ui_border() })
+                    .cursor_pointer()
+                    .child(label(name, if active { primary } else { text }, 12.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _: &mut Window, cx| {
+                            cx.stop_propagation();
+                            this.spacing_scope = scope;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        row.into_any_element()
     }
 
     fn picker_heading(&self, title: &str) -> AnyElement {

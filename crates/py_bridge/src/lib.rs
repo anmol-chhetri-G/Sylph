@@ -927,6 +927,32 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_alignment_reaches_both_exports() {
+        let long = "word ".repeat(60);
+        let doc = format!(
+            r#"{{"blocks": [
+            {{"Heading": {{"level": 1, "runs": [{{"text": "Centred title", "styles": []}}], "alignment": "Center"}}}},
+            {{"Paragraph": {{"runs": [{{"text": "{long}", "styles": []}}],
+              "style": {{"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0, "alignment": "Justify"}}}}}},
+            {{"Paragraph": {{"runs": [{{"text": "Right", "styles": []}}],
+              "style": {{"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0, "alignment": "Right"}}}}}}
+        ]}}"#
+        );
+        let r = export_rich_docx(&doc, &tmp("align.docx"));
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let body = docx_part(&tmp("align.docx"), "word/document.xml");
+        assert!(body.contains(r#"<w:jc w:val="center"/>"#), "{body}");
+        assert!(body.contains(r#"<w:jc w:val="both"/>"#), "{body}");
+        assert!(body.contains(r#"<w:jc w:val="right"/>"#), "{body}");
+        let r = export_rich_pdf(&doc, &tmp("align.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+    }
+
     /// The fonts a PDF's pages use, via poppler's `pdffonts` (every
     /// registered font is written to the file, used or not).
     fn pdf_fonts(path: &str) -> Option<String> {

@@ -36,6 +36,9 @@ editing.
 | Page breaks like Word (author request) | done | Backspace/Delete remove a break whole; old break blocks move into the text on load; break marker drawn in both modes; Pages tab jumps to a page; cover page has a Remove button |
 | Character formatting (author request) | done | size and font on selected text as ranges over the text (Google Docs model); mixed sizes on one line; PDF/DOCX carry them |
 | Roadmap M0 everyday basics | done | undo groups typing (word / Backspace runs / 1 s pause); new documents start with Markdown on; Word count dialog (click the count) with selection counts |
+| Roadmap M4 (part) paragraph layout | done | every Enter is a paragraph in export too; alignment left/centre/right/justify (Ctrl+L/E/R/J, toolbar, Format menu) as paragraph ranges; Spacing dropdown applies to "This paragraph" or the style; PDF/DOCX follow |
+| Lists like Word | done | Enter continues a list / ends it on an empty item; Tab / Shift+Tab change the level; wrapped items hang under their text; toolbar bullet/numbered buttons |
+| Roadmap M2 (part) tables on the page | done | Markdown tables drawn as grids (header shaded, cells clipped, equal columns as exported); click into cells; Tab / Shift+Tab move between cells, Tab in the last cell adds a row; typed `|` escaped; Backspace/Delete stop at cell borders. Open: column resizing, add/remove column, cell wrapping |
 | everything else | open | |
 
 ## University-ready roadmap (adopted 2026-10-03; personal use first)

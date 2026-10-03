@@ -58,6 +58,13 @@ pub struct ParagraphStyle {
     pub line_spacing: f32,
     pub space_before: f32,
     pub space_after: f32,
+    /// Left unless the paragraph was aligned (JSON omits Left).
+    #[serde(default, skip_serializing_if = "is_left")]
+    pub alignment: crate::format::Alignment,
+}
+
+fn is_left(alignment: &crate::format::Alignment) -> bool {
+    *alignment == crate::format::Alignment::Left
 }
 
 impl Default for ParagraphStyle {
@@ -66,6 +73,7 @@ impl Default for ParagraphStyle {
             line_spacing: 1.5,
             space_before: 0.0,
             space_after: 8.0,
+            alignment: Default::default(),
         }
     }
 }
@@ -266,6 +274,9 @@ pub enum Block {
     Heading {
         level: u8,
         runs: Vec<TextRun>,
+        /// Left unless the heading was aligned (JSON omits Left).
+        #[serde(default, skip_serializing_if = "is_left")]
+        alignment: crate::format::Alignment,
     },
     Image {
         data: ImageData,
@@ -310,6 +321,7 @@ impl Block {
         Self::Heading {
             level: level.clamp(1, 5),
             runs: vec![TextRun::plain(text)],
+            alignment: Default::default(),
         }
     }
 
@@ -496,6 +508,9 @@ pub struct Document {
     /// Character formatting (size, font on selected words) as ranges over
     /// the editor's text.
     pub char_formats: crate::format::FormatSpans,
+    /// Paragraph formatting (alignment, this-paragraph spacing) as ranges
+    /// over whole lines of the editor's text.
+    pub para_formats: crate::format::ParagraphSpans,
 }
 
 /// The Heading 1–6 defaults, in points: (size, space before, space after).
@@ -566,6 +581,7 @@ impl Document {
             space_before: 0.0,
             space_after: NORMAL_SPACE_AFTER,
             char_formats: Default::default(),
+            para_formats: Default::default(),
         }
     }
 
@@ -584,6 +600,7 @@ impl Document {
             space_before: 0.0,
             space_after: NORMAL_SPACE_AFTER,
             char_formats: Default::default(),
+            para_formats: Default::default(),
         }
     }
 
@@ -807,6 +824,7 @@ impl Document {
             space_before: 0.0,
             space_after: NORMAL_SPACE_AFTER,
             char_formats: Default::default(),
+            para_formats: Default::default(),
         }
     }
 
@@ -1161,6 +1179,7 @@ mod tests {
             line_spacing: 2.0,
             space_before: 10.0,
             space_after: 20.0,
+            alignment: Default::default(),
         };
         block.set_paragraph_style(style);
         if let Block::Paragraph { style: s, .. } = block {

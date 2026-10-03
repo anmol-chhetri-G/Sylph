@@ -956,6 +956,8 @@ def _render_block_docx(doc, block: dict):
         h = block['Heading']
         level = min(h['level'], 9)
         heading = doc.add_heading('', level=level)
+        if _docx_alignment(h.get('alignment')) is not None:
+            heading.alignment = _docx_alignment(h.get('alignment'))
         for run_data in h.get('runs', []):
             _add_styled_run_docx(heading, run_data)
     elif 'Paragraph' in block:
@@ -967,6 +969,8 @@ def _render_block_docx(doc, block: dict):
         para.paragraph_format.space_before = Pt(style_data.get('space_before', 0.0))
         para.paragraph_format.space_after = Pt(style_data.get('space_after', 8.0))
         para.paragraph_format.line_spacing = style_data.get('line_spacing', 1.15)
+        if _docx_alignment(style_data.get('alignment')) is not None:
+            para.alignment = _docx_alignment(style_data.get('alignment'))
         for run_data in p.get('runs', []):
             _add_styled_run_docx(para, run_data)
     elif 'Image' in block:
@@ -1237,8 +1241,22 @@ def rich_pdf(doc_json: str, output_path: str) -> List[str]:
     return _pdf_output(pdf, output_path, doc_data)
 
 
+# sylph-core Alignment (JSON omits Left) to fpdf2's text_align.
+_PDF_ALIGN = {'Left': 'LEFT', 'Center': 'CENTER', 'Right': 'RIGHT', 'Justify': 'JUSTIFY'}
+
+
+def _docx_alignment(name):
+    """sylph-core Alignment to python-docx's, or None for Left (inherit)."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    return {
+        'Center': WD_ALIGN_PARAGRAPH.CENTER,
+        'Right': WD_ALIGN_PARAGRAPH.RIGHT,
+        'Justify': WD_ALIGN_PARAGRAPH.JUSTIFY,
+    }.get(name)
+
+
 def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0, 0, 0),
-                    indent=0.0, bullet=''):
+                    indent=0.0, bullet='', align='Left'):
     """Write inline runs as one wrapped paragraph and move below it.
 
     The runs go into a single fpdf2 text-flow paragraph, so lines wrap
@@ -1260,6 +1278,7 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
         skip_leading_spaces=False,
     ) as columns:
         with columns.paragraph(
+            text_align=_PDF_ALIGN.get(align, 'LEFT'),
             bullet_string=bullet,
             bullet_r_margin=1.5 if bullet else None,
         ) as paragraph:
@@ -1314,7 +1333,8 @@ def _render_block_pdf(pdf, block: dict):
         pdf.set_text_color(0, 0, 0)
         text = ''.join(r['text'] for r in h.get('runs', []))
         pdf.multi_cell(
-            pdf.epw, _pdf_line_height(size, heading_spacing or _HEADING_LINE_FACTOR), text
+            pdf.epw, _pdf_line_height(size, heading_spacing or _HEADING_LINE_FACTOR), text,
+            align={'Center': 'C', 'Right': 'R', 'Justify': 'J'}.get(h.get('alignment'), 'L'),
         )
         pdf.ln(after * _MM_PER_PT)
     elif 'Paragraph' in block:
@@ -1328,7 +1348,10 @@ def _render_block_pdf(pdf, block: dict):
         # No space above a paragraph that starts a page, as in Word.
         if space_before and pdf.get_y() > pdf.t_margin + 0.01:
             pdf.ln(space_before * _MM_PER_PT)
-        _write_pdf_runs(pdf, p.get('runs', []), spacing=spacing)
+        _write_pdf_runs(
+            pdf, p.get('runs', []), spacing=spacing,
+            align=style_data.get('alignment', 'Left'),
+        )
         pdf.ln(space_after * _MM_PER_PT)
     elif 'Image' in block:
         img_data = block['Image']['data']

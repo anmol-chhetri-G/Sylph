@@ -13,7 +13,7 @@ use gpui::{
     WindowOptions,
 };
 
-use sylph_core::format::{CharFormat, FormatSpans};
+use sylph_core::format::{Alignment, CharFormat, FormatSpans, ParaFormat, ParagraphSpans};
 use sylph_core::{
     byte_offset_from_utf16, next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
     previous_word_boundary, snap_to_char_boundary, utf16_offset_from_byte, utf8_range_from_utf16,
@@ -23,6 +23,7 @@ use sylph_storage::Storage;
 mod char_export;
 mod pagination;
 mod rich_row;
+mod table_view;
 mod undo_group;
 mod word_count;
 use char_export::RunFormat;
@@ -94,6 +95,9 @@ struct EditAction {
     /// and redo (undoing a delete brings its formatting back).
     formats_before: FormatSpans,
     formats_after: FormatSpans,
+    /// Paragraph formatting before and after, likewise.
+    paras_before: ParagraphSpans,
+    paras_after: ParagraphSpans,
     /// When the step was last extended (typing joins it within a pause).
     at: std::time::Instant,
 }
@@ -149,6 +153,9 @@ struct TextInput {
     /// headings): what the canvas lays rows out with. Kept in step by
     /// `SylphApp::sync_editor_styles`.
     styles: [doc::ResolvedStyle; 7],
+    /// Paragraph formatting over whole lines of `content` (alignment,
+    /// this-paragraph spacing), moved along by every edit.
+    para_formats: ParagraphSpans,
     /// Character formatting over `content` (size, font on selected words),
     /// moved along by every edit. The document model keeps a copy.
     formats: FormatSpans,
@@ -845,6 +852,10 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        // A table cell's border is not deleted from inside the cell.
+        if self.at_cell_border(true) {
+            return;
+        }
         // A page break is one unit, as in Word: removed whole, never
         // merged into the next line as text.
         if self.selected_range.is_empty() {
@@ -865,6 +876,9 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.at_cell_border(false) {
+            return;
+        }
         if self.selected_range.is_empty() {
             if let Some(range) = pagination::delete_page_break(&self.content, self.cursor_offset())
             {
@@ -1020,10 +1034,62 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        // In a list, Enter continues it (or ends it on an empty item), as
+        // in Word.
+        if self.markdown_mode && self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            let (start, end) = (self.line_start(cursor), self.line_end(cursor));
+            match md_edit::list_enter(&self.content[start..end], cursor - start) {
+                Some(md_edit::ListEnter::Continue(text)) => {
+                    return self.replace_text_in_range(None, &text, cx);
+                }
+                Some(md_edit::ListEnter::End {
+                    marker_len,
+                    replacement,
+                }) => {
+                    return self.replace_text_in_range(
+                        Some(start..start + marker_len),
+                        &replacement,
+                        cx,
+                    );
+                }
+                None => {}
+            }
+        }
         self.replace_text_in_range(None, "\n", cx);
     }
 
+    /// Tab / Shift+Tab on a list item (no selection) changes its level,
+    /// wherever the caret is in it, as in Word. `false` when not a list.
+    fn shift_list_level(&mut self, deeper: bool, cx: &mut Context<Self>) -> bool {
+        if !self.markdown_mode || !self.selected_range.is_empty() {
+            return false;
+        }
+        let cursor = self.cursor_offset();
+        let (start, end) = (self.line_start(cursor), self.line_end(cursor));
+        let line = self.content[start..end].to_string();
+        if md_edit::list_marker(&line).is_none() {
+            return false;
+        }
+        let new_line = if deeper {
+            md_edit::indent_list_line(&line)
+        } else {
+            match md_edit::outdent_list_line(&line) {
+                Some(line) => line,
+                None => return true,
+            }
+        };
+        let shift = new_line.len() as isize - line.len() as isize;
+        self.replace_text_in_range(Some(start..end), &new_line, cx);
+        let caret = (cursor as isize + shift).max(start as isize) as usize;
+        self.move_to(caret, cx);
+        true
+    }
+
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.table_tab(true, cx) || self.shift_list_level(true, cx) {
+            return;
+        }
         let indent_str = "    ";
         let start = self.selected_range.start;
         let end = self.selected_range.end;
@@ -1050,6 +1116,9 @@ impl TextInput {
     }
 
     fn dedent(&mut self, _: &Dedent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.table_tab(false, cx) || self.shift_list_level(false, cx) {
+            return;
+        }
         let indent_str = "    ";
         let start = self.selected_range.start;
         let end = self.selected_range.end;
@@ -1183,6 +1252,7 @@ impl TextInput {
         let old_text = self.content[start..end].to_string();
         let selection_before = self.selected_range.clone();
         let formats_before = self.formats.clone();
+        let paras_before = self.para_formats.clone();
 
         self.apply_edit(start, end, new_text, cx);
         self.redo_stack.clear();
@@ -1221,6 +1291,7 @@ impl TextInput {
             };
             if merged {
                 last.formats_after = self.formats.clone();
+                last.paras_after = self.para_formats.clone();
                 last.at = now;
                 return;
             }
@@ -1232,6 +1303,8 @@ impl TextInput {
             selection_before,
             formats_before,
             formats_after: self.formats.clone(),
+            paras_before,
+            paras_after: self.para_formats.clone(),
             at: now,
         });
     }
@@ -1249,20 +1322,60 @@ impl TextInput {
         }
         let formats_before = self.formats.clone();
         self.formats.apply(range.clone(), change);
-        self.undo_stack.push(EditAction {
-            start: range.start,
-            old_text: String::new(),
-            new_text: String::new(),
-            selection_before: range,
-            formats_before,
-            formats_after: self.formats.clone(),
-            at: std::time::Instant::now(),
-        });
+        self.push_format_step(range, formats_before, self.para_formats.clone());
         self.redo_stack.clear();
         self.content_rev += 1;
         self.schedule_save(cx);
         cx.notify();
         true
+    }
+
+    /// Record a formatting-only change as one undoable step.
+    fn push_format_step(
+        &mut self,
+        selection_before: Range<usize>,
+        formats_before: FormatSpans,
+        paras_before: ParagraphSpans,
+    ) {
+        self.undo_stack.push(EditAction {
+            start: selection_before.start,
+            old_text: String::new(),
+            new_text: String::new(),
+            selection_before,
+            formats_before,
+            formats_after: self.formats.clone(),
+            paras_before,
+            paras_after: self.para_formats.clone(),
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// Change the paragraph formatting (alignment, spacing) of every
+    /// paragraph the selection or caret touches, as one undoable step.
+    fn format_paragraphs(&mut self, change: impl Fn(&mut ParaFormat), cx: &mut Context<Self>) {
+        if self.read_only.is_some() {
+            return;
+        }
+        let range = sylph_core::format::paragraph_range(
+            &self.content,
+            self.selected_range.start,
+            self.selected_range.end,
+        );
+        if range.is_empty() {
+            // An empty last line has no byte to carry formatting yet.
+            return;
+        }
+        let paras_before = self.para_formats.clone();
+        self.para_formats.apply(range, change);
+        self.push_format_step(
+            self.selected_range.clone(),
+            self.formats.clone(),
+            paras_before,
+        );
+        self.redo_stack.clear();
+        self.content_rev += 1;
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     fn apply_edit(&mut self, start: usize, end: usize, new_text: &str, cx: &mut Context<Self>) {
@@ -1276,6 +1389,7 @@ impl TextInput {
 
         self.content.replace_range(start..end, new_text);
         self.formats.edit(start, end - start, new_text.len());
+        self.para_formats.edit(start, end - start, new_text.len());
         self.content_rev += 1;
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.selection_reversed = false;
@@ -1290,6 +1404,7 @@ impl TextInput {
             let replace_end = action.start + action.new_text.len();
             self.apply_edit(action.start, replace_end, &action.old_text, cx);
             self.formats = action.formats_before.clone();
+            self.para_formats = action.paras_before.clone();
             self.selected_range = action.selection_before.clone();
             self.redo_stack.push(action);
             cx.notify();
@@ -1301,6 +1416,7 @@ impl TextInput {
             let replace_end = action.start + action.old_text.len();
             self.apply_edit(action.start, replace_end, &action.new_text, cx);
             self.formats = action.formats_after.clone();
+            self.para_formats = action.paras_after.clone();
             self.selected_range =
                 action.start + action.new_text.len()..action.start + action.new_text.len();
             self.undo_stack.push(action);
@@ -1368,6 +1484,14 @@ impl EntityInputHandler for TextInput {
         cx: &mut Context<Self>,
     ) {
         let range = range_utf16.map(|range| utf8_range_from_utf16(&self.content, range));
+        // Typing a `|` in a table cell must not split the cell.
+        let at = range
+            .as_ref()
+            .map_or(self.selected_range.start, |r| r.start);
+        if new_text.contains('|') && self.table_line_at(at).is_some() {
+            let escaped = table_view::escape_cell_text(new_text);
+            return TextInput::replace_text_in_range(self, range, &escaped, cx);
+        }
         TextInput::replace_text_in_range(self, range, new_text, cx);
     }
 
@@ -1455,7 +1579,22 @@ struct PrepRow {
     line_idx: usize,
     /// Draw the row as a horizontal rule (Markdown mode ON).
     rule_color: Option<gpui::Hsla>,
+    /// Draw the row as a table row: its cells' borders (and a header's
+    /// shading) around the box.
+    table: Option<TableRowGeom>,
 }
+
+/// A table row's grid on the canvas.
+#[derive(Clone, Copy)]
+struct TableRowGeom {
+    columns: usize,
+    col_w: gpui::Pixels,
+    header: bool,
+}
+
+/// Padding inside a table cell, in px: above/below the text, and left.
+const TABLE_CELL_PAD_Y: f32 = 4.0;
+const TABLE_CELL_PAD_X: f32 = 6.0;
 
 /// Persisted half of `PrepRow` — layout metrics the input needs for
 /// hit-testing, scroll clamping and caret visibility between frames.
@@ -1533,6 +1672,7 @@ impl Element for TextElement {
         let markdown_on = input.markdown_mode;
         let styles = input.styles.clone();
         let char_formats = input.formats.clone();
+        let para_formats = input.para_formats.clone();
         let flow = input.page_flow;
         let input_rev = input.content_rev;
         let input_followed = input.followed;
@@ -1589,6 +1729,8 @@ impl Element for TextElement {
         let mut rows: Vec<PrepRow> = Vec::new();
         let mut y = px(0.0);
 
+        // Columns of the table being laid out (set by its header row).
+        let mut table_cols = 1usize;
         for (i, dl) in display_lines.iter().enumerate() {
             let heading_style = (1..=6)
                 .contains(&dl.heading)
@@ -1599,9 +1741,17 @@ impl Element for TextElement {
             // Body rows keep the layout's line height (Normal's spacing);
             // heading rows use their style's spacing, or by default a box
             // that fits their glyphs.
-            let text_height = match (heading_size, heading_style.and_then(|s| s.line_spacing)) {
+            // This paragraph's own formatting (alignment, spacing) over
+            // its style's, as Word's paragraph formatting.
+            let para = para_formats.format_at(dl.src_offset);
+            let text_height = match (
+                heading_size,
+                para.line_spacing
+                    .or_else(|| heading_style.and_then(|s| s.line_spacing)),
+            ) {
                 (Some(size), Some(spacing)) => px(size * spacing),
                 (Some(size), None) => line_height.max(px(size * doc::HEADING_LINE_SPACING)),
+                (None, Some(spacing)) if para.line_spacing.is_some() => row_font_size * spacing,
                 (None, _) => line_height,
             };
             let (line_before, line_after) = match heading_style {
@@ -1622,6 +1772,19 @@ impl Element for TextElement {
                     )
                 }
             };
+            let mut line_before = para.space_before.map_or(line_before, |pt| pt * PT);
+            let mut line_after = para.space_after.map_or(line_after, |pt| pt * PT);
+            let align = para.align.unwrap_or_default();
+            // Table rows: cells padded inside a grid; the `|---|` row is
+            // the header's rule and takes no height.
+            if dl.table {
+                if dl.table_header {
+                    table_cols = dl.cells.len().max(1);
+                }
+                let pad = if dl.table_rule { 0.0 } else { TABLE_CELL_PAD_Y };
+                line_before = pad;
+                line_after = pad;
+            }
             let mut font = if dl.mono {
                 gpui::font(ui::MONO_FONT)
             } else if let Some(style) = heading_style {
@@ -1639,10 +1802,38 @@ impl Element for TextElement {
             // Wrap the *display* text (Markdown ON wraps rendered text,
             // not source), recording each row's display range.
             let mut ranges: Vec<(usize, usize)> = Vec::new();
-            if word_wrap && available_width > px(0.0) && !dl.text.is_empty() {
+            // A list item's wrapped lines hang under its text, not under
+            // its bullet (Word's hanging indent).
+            let hang = if dl.kind == DisplayKind::List {
+                let prefix = md_edit::list_hang_prefix(&dl.text);
+                window
+                    .text_system()
+                    .shape_line(
+                        dl.text[..prefix].to_string().into(),
+                        row_font_size,
+                        &[TextRun {
+                            len: prefix,
+                            font: font.clone(),
+                            color: text_color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                    .width
+            } else {
+                px(0.0)
+            };
+            if word_wrap && available_width > px(0.0) && !dl.text.is_empty() && !dl.table {
                 let mut d0 = 0usize;
                 while d0 < dl.text.len() {
                     let remaining = &dl.text[d0..];
+                    let limit = if d0 == 0 {
+                        available_width
+                    } else {
+                        (available_width - hang).max(px(1.0))
+                    };
                     let check_run = TextRun {
                         len: remaining.len(),
                         font: font.clone(),
@@ -1660,8 +1851,8 @@ impl Element for TextElement {
                         row_font_size,
                         &line_formats(dl, d0..dl.text.len(), &char_formats),
                     );
-                    if measured.width() > available_width && remaining.len() > 1 {
-                        let break_idx = measured.closest_index_for_x(available_width);
+                    if measured.width() > limit && remaining.len() > 1 {
+                        let break_idx = measured.closest_index_for_x(limit);
                         let mut actual_break = if break_idx > 0 {
                             remaining[..break_idx]
                                 .rfind(' ')
@@ -1707,16 +1898,60 @@ impl Element for TextElement {
                 } else {
                     TextInput::markdown_runs(slice, font.clone(), text_color, dl.fenced)
                 };
-                let shaped = RowText::shape(
-                    window,
-                    slice,
-                    &runs,
-                    row_font_size,
-                    &line_formats(dl, d0..d1, &char_formats),
-                );
+                let row_formats = line_formats(dl, d0..d1, &char_formats);
+                // Justify spreads every row but a paragraph's last.
+                let justify = align == Alignment::Justify && r + 1 < row_count;
+                let columns = table_cols.max(dl.cells.len()).max(1);
+                let col_w = available_width / columns as f32;
+                let shaped = if dl.table && !dl.table_rule {
+                    let cells: Vec<(Range<usize>, gpui::Pixels, gpui::Pixels)> = dl
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .map(|(k, range)| (range.clone(), col_w * k as f32, col_w))
+                        .collect();
+                    RowText::shape_cells(
+                        window,
+                        slice,
+                        &runs,
+                        row_font_size,
+                        &row_formats,
+                        &cells,
+                        px(TABLE_CELL_PAD_X),
+                    )
+                } else if justify {
+                    RowText::shape_justified(
+                        window,
+                        slice,
+                        &runs,
+                        row_font_size,
+                        &row_formats,
+                        available_width,
+                    )
+                } else {
+                    RowText::shape(window, slice, &runs, row_font_size, &row_formats)
+                };
+                // Centre and right alignment move the row's visible text
+                // (its trailing spaces do not count).
+                let visible = shaped.x_for_index(slice.trim_end().len());
+                let shaped = if r > 0 {
+                    shaped.offset_by(hang)
+                } else {
+                    shaped
+                };
+                let shaped = match align {
+                    _ if dl.table => shaped,
+                    Alignment::Center => {
+                        shaped.offset_by(((available_width - visible) / 2.0).max(px(0.0)))
+                    }
+                    Alignment::Right => shaped.offset_by((available_width - visible).max(px(0.0))),
+                    _ => shaped,
+                };
                 // A row holding bigger words grows to fit them, keeping
                 // the line spacing's proportion.
-                let text_height = if shaped.max_font_size() > row_font_size {
+                let text_height = if dl.table_rule {
+                    px(0.0)
+                } else if shaped.max_font_size() > row_font_size {
                     text_height * (shaped.max_font_size() / row_font_size)
                 } else {
                     text_height
@@ -1758,6 +1993,11 @@ impl Element for TextElement {
                     disp_start: d0,
                     line_idx: i,
                     rule_color,
+                    table: (dl.table && !dl.table_rule).then_some(TableRowGeom {
+                        columns,
+                        col_w,
+                        header: dl.table_header,
+                    }),
                 });
             }
             // A page-break line ends its page: what follows starts the next.
@@ -2004,6 +2244,31 @@ impl Element for TextElement {
         }
 
         for row in prepaint.rows.iter() {
+            if let Some(table) = row.table {
+                // The row's cells: shaded if it is the header, then each
+                // cell's outline (neighbours share their edges).
+                let top = bounds.top() + row.box_top - scroll_offset_y;
+                let left = bounds.left() + gutter_width;
+                let width = table.col_w * table.columns as f32;
+                if table.header {
+                    window.paint_quad(fill(
+                        Bounds::new(point(left, top), size(width, row.box_height)),
+                        hsla(0.0, 0.0, 0.5, 0.12),
+                    ));
+                }
+                let line = hsla(0.0, 0.0, 0.45, 0.6);
+                let edge = px(1.0);
+                for k in 0..=table.columns {
+                    let x = left + table.col_w * k as f32;
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, top), size(edge, row.box_height)),
+                        line,
+                    ));
+                }
+                for y in [top, top + row.box_height] {
+                    window.paint_quad(fill(Bounds::new(point(left, y), size(width, edge)), line));
+                }
+            }
             if let Some(color) = row.rule_color {
                 // Markdown mode ON hides `---` and draws the rule instead.
                 let mid_y = bounds.top() + row.text_top + px(f32::from(row.text_height) / 2.0)
@@ -2217,6 +2482,8 @@ struct SylphApp {
     palette: PaletteState,
     /// The open format-bar dropdown (Style, Font, Line spacing).
     open_picker: Option<Picker>,
+    /// What the Spacing dropdown changes (this paragraph or the style).
+    spacing_scope: style_controls::SpacingScope,
     /// Pages the export produces, keyed by (text revision, Markdown mode,
     /// model): a full parse, so not once per frame.
     page_count_memo: Memo<(u64, bool, doc::Document), usize>,
@@ -2295,6 +2562,10 @@ actions!(
         NewDocument,
         RenameDocument,
         ClearFormatting,
+        AlignLeft,
+        AlignCenter,
+        AlignRight,
+        AlignJustify,
         ToggleDarkMode,
         ExportDocx,
         ExportPdf,
@@ -2829,6 +3100,7 @@ impl SylphApp {
         let only_formats = {
             let mut with_formats = self.persisted_model.clone();
             with_formats.char_formats = self.document.char_formats.clone();
+            with_formats.para_formats = self.document.para_formats.clone();
             with_formats == self.document
         };
         if only_formats {
@@ -2932,9 +3204,12 @@ impl SylphApp {
 
         let mut formats = model.char_formats.clone();
         formats.clamp_to(&saved);
+        let mut paras = model.para_formats.clone();
+        paras.clamp_to(&saved);
         self.editor.update(cx, |editor, cx| {
             editor.doc_id = doc_id;
             editor.formats = formats;
+            editor.para_formats = paras;
             editor.content = saved.clone();
             editor.content_rev += 1;
             editor.selected_range = 0..0;
@@ -2951,6 +3226,7 @@ impl SylphApp {
         self.persisted_model = model.clone();
         self.document = model;
         self.document.char_formats = self.editor.read(cx).formats.clone();
+        self.document.para_formats = self.editor.read(cx).para_formats.clone();
         self.sync_markdown_mode(cx);
         self.model_save_error = None;
         self.revisions.clear();
@@ -3849,6 +4125,22 @@ impl SylphApp {
         cx: &mut Context<Self>,
     ) {
         self.clear_char_format(cx);
+    }
+
+    fn align_left(&mut self, _: &AlignLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_alignment(Alignment::Left, cx);
+    }
+
+    fn align_center(&mut self, _: &AlignCenter, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_alignment(Alignment::Center, cx);
+    }
+
+    fn align_right(&mut self, _: &AlignRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_alignment(Alignment::Right, cx);
+    }
+
+    fn align_justify(&mut self, _: &AlignJustify, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_alignment(Alignment::Justify, cx);
     }
 
     /// Heading level at the caret — `0` (Normal) unless Markdown mode is
@@ -4763,6 +5055,12 @@ struct DisplayLine {
     fenced: bool,
     /// The line is a pipe-table row (Markdown mode), not a paragraph.
     table: bool,
+    /// A table row's cells as display ranges (empty for other lines).
+    cells: Vec<Range<usize>>,
+    /// The first row of its table (drawn as the header).
+    table_header: bool,
+    /// The table's `|---|` delimiter row (drawn as the header's rule).
+    table_rule: bool,
 }
 
 impl DisplayLine {
@@ -4793,6 +5091,9 @@ impl DisplayLine {
             mono: false,
             fenced,
             table: false,
+            cells: Vec::new(),
+            table_header: false,
+            table_rule: false,
         }
     }
 
@@ -4815,13 +5116,28 @@ impl DisplayLine {
     /// Display byte offset (line-local) → source byte offset. Clicks on a
     /// replaced marker (`• `) land on its source (`- `).
     fn disp_to_src(&self, disp: usize) -> usize {
-        for seg in &self.segments {
+        for (i, seg) in self.segments.iter().enumerate() {
             if disp <= seg.disp_end {
-                return if seg.identity {
-                    seg.src_start + (disp - seg.disp_start).min(seg.src_end - seg.src_start)
-                } else {
-                    seg.src_start
-                };
+                if seg.identity {
+                    return seg.src_start
+                        + (disp - seg.disp_start).min(seg.src_end - seg.src_start);
+                }
+                if disp == seg.disp_end {
+                    // At the end of hidden or replaced syntax, the caret
+                    // belongs to the visible text after it (typing after a
+                    // "• " goes into the item, not before its `- `), and
+                    // after a replaced marker to the marker's end (an
+                    // empty table cell's place).
+                    if let Some(next) = self.segments.get(i + 1) {
+                        if next.identity && next.disp_start == disp {
+                            return next.src_start;
+                        }
+                    }
+                    if seg.disp_end > seg.disp_start {
+                        return seg.src_end;
+                    }
+                }
+                return seg.src_start;
             }
         }
         self.segments.last().map(|s| s.src_end).unwrap_or(0)
@@ -5041,6 +5357,9 @@ fn display_line(line: &str, in_fence: bool, markdown_on: bool) -> DisplayLine {
         mono,
         fenced: false,
         table: false,
+        cells: Vec::new(),
+        table_header: false,
+        table_rule: false,
     }
 }
 
@@ -5061,13 +5380,16 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
         out.push(dl);
     }
     if markdown_on {
-        for (i, row) in table_rows(lines, &out).into_iter().enumerate() {
-            if row && out[i].kind == DisplayKind::Paragraph {
-                // Pipe tables stay raw text until the canvas draws real
-                // grids: the export reads their cells one by one, so
-                // styling a whole row could hide markers the export keeps.
-                out[i] = DisplayLine::identity(out[i].src_offset, &lines[i], false);
-                out[i].table = true;
+        let rows = table_rows(lines, &out);
+        for i in 0..rows.len() {
+            if rows[i] && out[i].kind == DisplayKind::Paragraph {
+                // Drawn as a grid: each cell's text, its pipes hidden.
+                let header = i == 0 || !rows[i - 1];
+                let rule =
+                    !header && i > 0 && (i == 1 || !rows[i - 2]) && is_table_delimiter(&lines[i]);
+                let src_offset = out[i].src_offset;
+                out[i] = table_view::display_row(&lines[i], header, rule);
+                out[i].src_offset = src_offset;
             }
         }
     }
@@ -5075,10 +5397,9 @@ fn build_display_lines(lines: &[String], markdown_on: bool) -> Vec<DisplayLine> 
 }
 
 /// For each display line, whether it starts and whether it ends a Normal
-/// paragraph as the export forms them: with Markdown mode ON, a run of
-/// consecutive plain paragraph lines is one paragraph; OFF, every
-/// non-blank line is its own. Other lines (blank, headings, lists,
-/// quotes, code, tables) are `(false, false)`.
+/// paragraph as the export forms them: every non-blank plain line is its
+/// own paragraph (each Enter starts one, as in Word). Other lines (blank,
+/// headings, lists, quotes, code, tables) are `(false, false)`.
 fn paragraph_edges(lines: &[DisplayLine], markdown_on: bool) -> Vec<(bool, bool)> {
     let is_para = |dl: &DisplayLine| {
         !dl.text.trim().is_empty()
@@ -5089,12 +5410,7 @@ fn paragraph_edges(lines: &[DisplayLine], markdown_on: bool) -> Vec<(bool, bool)
             if !is_para(&lines[i]) {
                 return (false, false);
             }
-            if !markdown_on {
-                return (true, true);
-            }
-            let first = i == 0 || !is_para(&lines[i - 1]);
-            let last = i + 1 == lines.len() || !is_para(&lines[i + 1]);
-            (first, last)
+            (true, true)
         })
         .collect()
 }
@@ -5368,16 +5684,10 @@ fn flush_para(
         return;
     }
     let runs = fmt.joined_runs(para);
+    let style = fmt.paragraph_style(para[0], line_spacing);
     para.clear();
     if !runs.is_empty() {
-        blocks.push(doc::Block::Paragraph {
-            runs,
-            style: doc::ParagraphStyle {
-                line_spacing,
-                space_before: 0.0,
-                space_after: 8.0,
-            },
-        });
+        blocks.push(doc::Block::Paragraph { runs, style });
     }
 }
 
@@ -5524,6 +5834,7 @@ fn parse_content_blocks_with(text: &str, line_spacing: f32, fmt: &RunFormat) -> 
             blocks.push(doc::Block::Heading {
                 level,
                 runs: fmt.runs(content),
+                alignment: fmt.para_at(content).align.unwrap_or_default(),
             });
             i += 1;
             continue;
@@ -5631,9 +5942,12 @@ fn parse_content_blocks_with(text: &str, line_spacing: f32, fmt: &RunFormat) -> 
         }
 
         // ── Plain paragraph line ──
+        // Every line is its own paragraph, as every Enter is in Word and
+        // as the page shows it (Markdown would join consecutive lines).
         flush_quote(&mut quote, &mut quote_level, &mut blocks, fmt);
         flush_list(&mut items, &mut blocks);
         para.push(line.trim());
+        flush_para(&mut para, &mut blocks, line_spacing, fmt);
         i += 1;
     }
 
@@ -5753,11 +6067,7 @@ fn literal_blocks_with(content: &str, line_spacing: f32, fmt: &RunFormat) -> Vec
         }
         out.push(doc::Block::Paragraph {
             runs: fmt.literal_runs(line),
-            style: doc::ParagraphStyle {
-                line_spacing,
-                space_before: 0.0,
-                space_after: 8.0,
-            },
+            style: fmt.paragraph_style(line, line_spacing),
         });
     }
     out
@@ -5781,23 +6091,24 @@ fn export_model(structured: &doc::Document, content: &str, markdown_on: bool) ->
         parse_content_blocks_with(
             content,
             structured.line_spacing,
-            &RunFormat::with(content, &structured.char_formats),
+            &RunFormat::with(content, &structured.char_formats).with_paragraphs(
+                &structured.para_formats,
+                (structured.space_before, structured.space_after),
+            ),
         )
     } else {
         literal_blocks_with(
             content,
             structured.line_spacing,
-            &RunFormat::with(content, &structured.char_formats),
+            &RunFormat::with(content, &structured.char_formats).with_paragraphs(
+                &structured.para_formats,
+                (structured.space_before, structured.space_after),
+            ),
         )
     };
-    // The typed paragraphs take the Normal style's spacing.
-    blocks.extend(text_blocks.into_iter().map(|mut block| {
-        if let doc::Block::Paragraph { style, .. } = &mut block {
-            style.space_before = structured.space_before;
-            style.space_after = structured.space_after;
-        }
-        block
-    }));
+    // The typed paragraphs carry the Normal style's spacing unless they
+    // have their own (RunFormat::paragraph_style).
+    blocks.extend(text_blocks);
     for b in &structured.blocks {
         match b {
             doc::Block::CoverPage { .. } => {}
@@ -5978,6 +6289,11 @@ fn key_bindings() -> Vec<KeyBinding> {
         // ── File ──
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-n", NewDocument, None),
+        // Word's paragraph alignment.
+        KeyBinding::new("secondary-l", AlignLeft, None),
+        KeyBinding::new("secondary-e", AlignCenter, None),
+        KeyBinding::new("secondary-r", AlignRight, None),
+        KeyBinding::new("secondary-j", AlignJustify, None),
         // Google Docs' Clear formatting.
         KeyBinding::new("secondary-\\", ClearFormatting, None),
         // ── Undo/Redo ──
@@ -6059,6 +6375,8 @@ fn main() {
 
                     let mut initial_formats = document.char_formats.clone();
                     initial_formats.clamp_to(&saved);
+                    let mut initial_paras = document.para_formats.clone();
+                    initial_paras.clamp_to(&saved);
                     let editor = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
                         content: saved,
@@ -6092,6 +6410,7 @@ fn main() {
                         save_task: None,
                         content_rev: 0,
                         formats: initial_formats,
+                        para_formats: initial_paras,
                         styles: document.resolved_styles(),
                         save_state: opened_state(&read_only, &unpersisted),
                         unpersisted,
@@ -6119,9 +6438,12 @@ fn main() {
                         let editor_observer = cx.observe(
                             &editor,
                             |this: &mut SylphApp, editor: Entity<TextInput>, cx| {
-                                let formats = &editor.read(cx).formats;
-                                if this.document.char_formats != *formats {
-                                    this.document.char_formats = formats.clone();
+                                let editor = editor.read(cx);
+                                if this.document.char_formats != editor.formats
+                                    || this.document.para_formats != editor.para_formats
+                                {
+                                    this.document.char_formats = editor.formats.clone();
+                                    this.document.para_formats = editor.para_formats.clone();
                                     cx.notify();
                                 }
                             },
@@ -6159,6 +6481,7 @@ fn main() {
                             dark_mode: false,
                             palette: PaletteState::default(),
                             open_picker: None,
+                            spacing_scope: Default::default(),
                             page_count_memo: Memo::new(),
                             caret_status_memo: Memo::new(),
                             outline_memo: Memo::new(),
@@ -6257,9 +6580,10 @@ mod export_model_tests {
     #[test]
     fn content_parses_headings_paragraphs_and_blank_separators() {
         let blocks = parse_content_blocks("# Title\n\nline one\nline two\n\n## Sub", 1.15);
-        assert_eq!(blocks.len(), 3);
+        // Each line is its own paragraph (every Enter is one, as in Word).
+        assert_eq!(blocks.len(), 4);
         match &blocks[0] {
-            sylph_core::document::Block::Heading { level, runs } => {
+            sylph_core::document::Block::Heading { level, runs, .. } => {
                 assert_eq!(*level, 1);
                 assert_eq!(runs[0].text, "Title");
             }
@@ -6267,12 +6591,13 @@ mod export_model_tests {
         }
         match &blocks[1] {
             sylph_core::document::Block::Paragraph { runs, style } => {
-                assert_eq!(runs[0].text, "line one line two");
+                assert_eq!(runs[0].text, "line one");
                 assert_eq!(style.line_spacing, 1.15);
             }
             b => panic!("expected paragraph, got {b:?}"),
         }
-        match &blocks[2] {
+        assert_eq!(blocks[2].plain_text(), "line two");
+        match &blocks[3] {
             sylph_core::document::Block::Heading { level, .. } => assert_eq!(*level, 2),
             b => panic!("expected heading, got {b:?}"),
         }
@@ -6929,9 +7254,9 @@ mod markdown_wysiwyg_tests {
         assert_eq!(dl.src_to_disp(0), 0); // before `#`
         assert_eq!(dl.src_to_disp(2), 0); // after `# `
         assert_eq!(dl.src_to_disp(3), 1); // inside "Title"
-                                          // Clicks: display start lands on the line start, content maps back
-                                          // into the source content.
-        assert_eq!(dl.disp_to_src(0), 0);
+                                          // A click at the start lands after the hidden `# `, so typing
+                                          // there extends the heading instead of breaking its marker.
+        assert_eq!(dl.disp_to_src(0), 2);
         assert_eq!(dl.disp_to_src(1), 3); // after 'T' → after 'T' in source
         assert_eq!(dl.disp_to_src(5), 7); // end of "Title" = line end
         assert_eq!(dl.disp_to_src(dl.text.len()), "# Title".len());
@@ -7063,7 +7388,12 @@ mod markdown_wysiwyg_tests {
             for s in 0..=line.len() {
                 let d = dl.src_to_disp(s);
                 assert!(d <= dl.text.len(), "line: {line:?}, s: {s}");
-                assert!(dl.disp_to_src(d) <= s, "line: {line:?}, s: {s}");
+                // A click there lands at that display spot or before it on
+                // screen (past hidden syntax in the source, never further).
+                assert!(
+                    dl.src_to_disp(dl.disp_to_src(d)) <= d,
+                    "line: {line:?}, s: {s}"
+                );
             }
         }
     }
@@ -7128,9 +7458,14 @@ mod markdown_wysiwyg_tests {
         .map(String::from)
         .to_vec();
         let dls = build_display_lines(&lines, true);
-        assert_eq!(dls[0].text, "| **a** | b |");
-        assert_eq!(dls[2].text, "| c | *d* |");
-        assert!(dls[0].styles.is_empty());
+        // Rows show their cells (drawn as a grid), pipes hidden; the
+        // delimiter row shows nothing.
+        let sep = table_view::CELL_SEPARATOR;
+        assert_eq!(dls[0].text, format!("a{sep}b"));
+        assert!(dls[0].table_header);
+        assert!(dls[1].table_rule && dls[1].text.is_empty());
+        assert_eq!(dls[2].text, format!("c{sep}d"));
+        assert!(!dls[2].table_header);
         // The table ends at the blank line; later lines render inline.
         assert_eq!(dls[4].text, "after x");
     }
@@ -7155,11 +7490,13 @@ mod markdown_wysiwyg_tests {
                 "canvas rows under {first:?}"
             );
         }
-        // A paragraph line does start one, and its rows stay raw text.
+        // A paragraph line does start one, and its rows are table rows.
         let lines: Vec<String> = ["a | b", "|---|---|", "| **x** | y |"]
             .map(String::from)
             .to_vec();
-        assert_eq!(build_display_lines(&lines, true)[2].text, "| **x** | y |");
+        let row = &build_display_lines(&lines, true)[2];
+        assert!(row.table);
+        assert_eq!(row.text, format!("x{}y", table_view::CELL_SEPARATOR));
     }
 
     #[test]
@@ -7257,17 +7594,16 @@ mod markdown_wysiwyg_tests {
     #[test]
     fn block_status_counts_logical_blocks() {
         use crate::ui::block_status;
-        // A soft-wrapped paragraph is one block; Ln would have said 3.
+        // Every line is its own paragraph block (each Enter is one).
         let p = "one\ntwo\nthree";
-        assert_eq!(block_status(p, p.len()), (1, 1));
+        assert_eq!(block_status(p, p.len()), (3, 3));
 
         let doc = "# H\n\npara a\npara b\n\n- x\n- y";
-        // Caret inside a soft-wrapped paragraph → that paragraph's block.
-        assert_eq!(block_status(doc, doc.find("para b").unwrap()), (2, 3));
+        assert_eq!(block_status(doc, doc.find("para b").unwrap()), (3, 4));
         // The list is one block, whatever line the caret sits on.
-        assert_eq!(block_status(doc, doc.len()), (3, 3));
+        assert_eq!(block_status(doc, doc.len()), (4, 4));
         // A blank line reports the block before it.
-        assert_eq!(block_status(doc, 3), (1, 3));
+        assert_eq!(block_status(doc, 3), (1, 4));
 
         // A table header only counts as a table once its delimiter row is
         // read, so the counter looks one line ahead.
@@ -7633,14 +7969,14 @@ mod paragraph_edge_tests {
     }
 
     #[test]
-    fn markdown_paragraphs_span_consecutive_lines() {
+    fn every_plain_line_is_a_paragraph() {
         let e = edges("# Title\none\ntwo\n\nthree\n- item\n```\ncode\n```", true);
         assert_eq!(
             e,
             [
                 (false, false), // heading: its own style
-                (true, false),
-                (false, true),
+                (true, true),
+                (true, true),
                 (false, false), // blank
                 (true, true),
                 (false, false), // list

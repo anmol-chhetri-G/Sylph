@@ -19,29 +19,99 @@ pub struct CharFormat {
     pub font: Option<String>,
 }
 
-impl CharFormat {
-    pub fn is_empty(&self) -> bool {
+impl SpanFormat for CharFormat {
+    fn is_empty(&self) -> bool {
         self.size.is_none() && self.font.is_none()
     }
 }
 
+/// Horizontal alignment of a paragraph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Alignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+/// Formatting of one paragraph (one line of the text) over its style's:
+/// Word's paragraph formatting. `None` fields follow the style.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParaFormat {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub align: Option<Alignment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_spacing: Option<f32>,
+    /// Points.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_before: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_after: Option<f32>,
+}
+
+impl SpanFormat for ParaFormat {
+    fn is_empty(&self) -> bool {
+        self.align.is_none()
+            && self.line_spacing.is_none()
+            && self.space_before.is_none()
+            && self.space_after.is_none()
+    }
+}
+
+/// What a span can carry: a format with an "unformatted" default.
+pub trait SpanFormat: Clone + Default + PartialEq {
+    fn is_empty(&self) -> bool;
+}
+
 /// One formatted range of the text, in byte offsets `[start, end)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FormatSpan {
+pub struct FormatSpan<F = CharFormat> {
     pub start: usize,
     pub end: usize,
-    pub format: CharFormat,
+    pub format: F,
 }
 
-/// The document's character formatting: sorted, non-overlapping, non-empty
+/// Formatting as ranges over the text: sorted, non-overlapping, non-empty
 /// spans; unformatted text has no span.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct FormatSpans {
-    spans: Vec<FormatSpan>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    transparent,
+    bound(serialize = "F: Serialize", deserialize = "F: Deserialize<'de>")
+)]
+pub struct Spans<F> {
+    spans: Vec<FormatSpan<F>>,
 }
 
-impl FormatSpans {
+impl<F> Default for Spans<F> {
+    fn default() -> Self {
+        Self { spans: Vec::new() }
+    }
+}
+
+/// Character formatting (size, font on words).
+pub type FormatSpans = Spans<CharFormat>;
+
+/// Paragraph formatting: each span covers whole lines, newline included
+/// (see `paragraph_range`), so Enter at a paragraph's end carries its
+/// formatting into the new paragraph, as in Word.
+pub type ParagraphSpans = Spans<ParaFormat>;
+
+/// The range paragraph formatting is stored over for the lines holding
+/// `start..end` of `text`: from the first line's start to the last line's
+/// end, plus its newline when there is one (so an empty line still has a
+/// byte to carry formatting).
+pub fn paragraph_range(text: &str, start: usize, end: usize) -> Range<usize> {
+    let first = text[..start.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |p| p + 1);
+    let end = end.max(start).min(text.len());
+    let last_end = text[end..].find('\n').map_or(text.len(), |p| end + p);
+    first..(last_end + 1).min(text.len())
+}
+
+impl<F: SpanFormat> Spans<F> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -50,12 +120,12 @@ impl FormatSpans {
         self.spans.is_empty()
     }
 
-    pub fn spans(&self) -> &[FormatSpan] {
+    pub fn spans(&self) -> &[FormatSpan<F>] {
         &self.spans
     }
 
     /// The formatting of the character starting at byte `offset`.
-    pub fn format_at(&self, offset: usize) -> CharFormat {
+    pub fn format_at(&self, offset: usize) -> F {
         self.spans
             .iter()
             .find(|s| s.start <= offset && offset < s.end)
@@ -65,8 +135,8 @@ impl FormatSpans {
 
     /// `range` split where the formatting changes, each piece with its
     /// formatting (unformatted pieces get `CharFormat::default()`).
-    pub fn runs(&self, range: Range<usize>) -> Vec<(Range<usize>, CharFormat)> {
-        let mut out: Vec<(Range<usize>, CharFormat)> = Vec::new();
+    pub fn runs(&self, range: Range<usize>) -> Vec<(Range<usize>, F)> {
+        let mut out: Vec<(Range<usize>, F)> = Vec::new();
         let mut pos = range.start;
         for span in &self.spans {
             if span.end <= pos {
@@ -76,7 +146,7 @@ impl FormatSpans {
                 break;
             }
             if span.start > pos {
-                out.push((pos..span.start, CharFormat::default()));
+                out.push((pos..span.start, F::default()));
                 pos = span.start;
             }
             let end = span.end.min(range.end);
@@ -84,18 +154,18 @@ impl FormatSpans {
             pos = end;
         }
         if pos < range.end {
-            out.push((pos..range.end, CharFormat::default()));
+            out.push((pos..range.end, F::default()));
         }
         out
     }
 
     /// Change the formatting of `range` with `change` (e.g. set the size),
     /// keeping whatever else each part already had.
-    pub fn apply(&mut self, range: Range<usize>, change: impl Fn(&mut CharFormat)) {
+    pub fn apply(&mut self, range: Range<usize>, change: impl Fn(&mut F)) {
         if range.is_empty() {
             return;
         }
-        let mut spans: Vec<FormatSpan> = Vec::new();
+        let mut spans: Vec<FormatSpan<F>> = Vec::new();
         for span in &self.spans {
             // Keep the parts outside `range` as they are.
             if span.start < range.start {
@@ -133,7 +203,7 @@ impl FormatSpans {
     /// 14 pt text continues in 14 pt).
     pub fn edit(&mut self, start: usize, removed: usize, inserted: usize) {
         let end = start + removed;
-        let mut spans: Vec<FormatSpan> = Vec::new();
+        let mut spans: Vec<FormatSpan<F>> = Vec::new();
         for span in &self.spans {
             let mut s = span.clone();
             // Remove [start, end).
@@ -187,7 +257,7 @@ impl FormatSpans {
         self.spans
             .retain(|s| s.start < s.end && !s.format.is_empty());
         self.spans.sort_by_key(|s| s.start);
-        let mut merged: Vec<FormatSpan> = Vec::with_capacity(self.spans.len());
+        let mut merged: Vec<FormatSpan<F>> = Vec::with_capacity(self.spans.len());
         for span in self.spans.drain(..) {
             match merged.last_mut() {
                 Some(last) if last.end == span.start && last.format == span.format => {
@@ -290,6 +360,41 @@ mod tests {
         assert_eq!(sizes(&spans), [(1, 3, Some(14.0))]);
         spans.clamp_to("a");
         assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn paragraph_ranges_cover_whole_lines_with_their_newline() {
+        let text = "one\ntwo\n\nfour";
+        assert_eq!(paragraph_range(text, 5, 5), 4..8);
+        assert_eq!(paragraph_range(text, 1, 6), 0..8);
+        assert_eq!(
+            paragraph_range(text, 8, 8),
+            8..9,
+            "an empty line keeps its newline"
+        );
+        assert_eq!(
+            paragraph_range(text, 12, 12),
+            9..13,
+            "the last line has none"
+        );
+    }
+
+    #[test]
+    fn enter_at_a_paragraph_end_keeps_its_formatting() {
+        let text = "centred\nplain";
+        let mut paras = ParagraphSpans::new();
+        paras.apply(paragraph_range(text, 0, 0), |p| {
+            p.align = Some(Alignment::Center)
+        });
+        // Enter at the end of "centred" inserts "\n" at 7, inside the span.
+        paras.edit(7, 0, 1);
+        assert_eq!(paras.format_at(0).align, Some(Alignment::Center));
+        assert_eq!(
+            paras.format_at(8).align,
+            Some(Alignment::Center),
+            "the new paragraph"
+        );
+        assert_eq!(paras.format_at(9).align, None, "plain stays plain");
     }
 
     #[test]

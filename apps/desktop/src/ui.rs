@@ -14,6 +14,7 @@ use gpui::{
     anchored, deferred, div, img, px, rgb, rgba, Context, Div, Focusable, MouseButton, Pixels,
     Rgba, Stateful, Window,
 };
+use sylph_core::format::Alignment;
 
 pub(crate) const UI_FONT: &str = "Hanken Grotesk";
 pub(crate) const PROSE_FONT: &str = "EB Garamond";
@@ -510,6 +511,44 @@ impl SylphApp {
         )
     }
 
+    /// A toolbar button drawing Word's alignment icon: four lines, ragged
+    /// on the unaligned side (all full width for justify).
+    fn align_button(&self, alignment: Alignment, active: bool) -> Div {
+        let color = if active {
+            self.ui_primary()
+        } else {
+            self.ui_text()
+        };
+        let widths: [f32; 4] = match alignment {
+            Alignment::Justify => [14.0, 14.0, 14.0, 14.0],
+            _ => [14.0, 9.0, 14.0, 7.0],
+        };
+        let mut lines = div().w(px(14.0)).flex().flex_col().gap(px(2.0));
+        lines = match alignment {
+            Alignment::Left | Alignment::Justify => lines.items_start(),
+            Alignment::Center => lines.items_center(),
+            Alignment::Right => lines.items_end(),
+        };
+        for width in widths {
+            lines = lines.child(div().w(px(width)).h(px(1.5)).bg(color));
+        }
+        div()
+            .w(px(28.0))
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(2.0))
+            .bg(if active {
+                self.ui_panel_high()
+            } else {
+                self.surface_color()
+            })
+            .hover(|s| s.bg(self.hover_color()))
+            .cursor_pointer()
+            .child(lines)
+    }
+
     fn tool_button(&self, glyph: &str, active: bool) -> Div {
         let text = self.ui_text();
         let primary = self.ui_primary();
@@ -759,6 +798,11 @@ impl SylphApp {
                     Item("Bold", Box::new(BoldText), None),
                     Item("Italic", Box::new(ItalicText), None),
                     Item("Clear formatting", Box::new(crate::ClearFormatting), None),
+                    Separator,
+                    Item("Align left", Box::new(crate::AlignLeft), None),
+                    Item("Centre", Box::new(crate::AlignCenter), None),
+                    Item("Align right", Box::new(crate::AlignRight), None),
+                    Item("Justify", Box::new(crate::AlignJustify), None),
                     Item("Strikethrough", Box::new(StrikethroughText), None),
                     Separator,
                     Item("Normal text", Box::new(NormalText), Some(level == 0)),
@@ -1463,18 +1507,40 @@ impl SylphApp {
         }
 
         let mut align = div().flex().items_center().gap(px(2.0));
-        for (glyph, id) in [
-            ("A", "tool-color"),
-            ("☷", "tool-columns"),
-            ("≣", "tool-list"),
-            ("⇥", "tool-indent"),
-            ("↔", "tool-distribute"),
+        let current_align = self.caret_para_format(cx).align.unwrap_or_default();
+        for (alignment, id, tip) in [
+            (Alignment::Left, "align-left", "Align left (Ctrl+L)"),
+            (Alignment::Center, "align-center", "Centre (Ctrl+E)"),
+            (Alignment::Right, "align-right", "Align right (Ctrl+R)"),
+            (Alignment::Justify, "align-justify", "Justify (Ctrl+J)"),
         ] {
-            align = align.child(with_tip(
-                self.tool_button(glyph, glyph == "A"),
-                id,
-                "Not wired in v1",
-            ));
+            align = align.child(
+                with_tip(
+                    self.align_button(alignment, alignment == current_align),
+                    id,
+                    tip,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_alignment(alignment, cx)),
+                ),
+            );
+        }
+        for (glyph, kind, id, tip) in [
+            ("•", crate::ListKind::Bullet, "list-bullet", "Bulleted list"),
+            (
+                "1.",
+                crate::ListKind::Numbered,
+                "list-numbered",
+                "Numbered list",
+            ),
+        ] {
+            align = align.child(
+                with_tip(self.tool_button(glyph, false), id, tip).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.apply_list(kind, cx)),
+                ),
+            );
         }
         align = align.child(
             self.picker_field(
@@ -1719,7 +1785,7 @@ impl SylphApp {
                     );
                     // Also include structured heading blocks from the rich document.
                     for b in &self.document.blocks {
-                        if let sylph_core::document::Block::Heading { level, runs } = b {
+                        if let sylph_core::document::Block::Heading { level, runs, .. } = b {
                             let s: String = runs.iter().map(|r| r.text.as_str()).collect();
                             if !s.trim().is_empty() {
                                 headings.push((*level, s, None));
@@ -3542,6 +3608,10 @@ impl Render for SylphApp {
             .on_action(cx.listener(Self::new_document))
             .on_action(cx.listener(Self::rename_document))
             .on_action(cx.listener(Self::clear_formatting))
+            .on_action(cx.listener(Self::align_left))
+            .on_action(cx.listener(Self::align_center))
+            .on_action(cx.listener(Self::align_right))
+            .on_action(cx.listener(Self::align_justify))
             .on_action(cx.listener(Self::toggle_dark_mode))
             .on_action(cx.listener(Self::export_docx))
             .on_action(cx.listener(Self::export_pdf))
