@@ -23,9 +23,12 @@ use sylph_storage::Storage;
 mod char_export;
 mod emphasis;
 mod pagination;
+mod redraw;
+mod rich_doc;
 mod rich_row;
 mod table_view;
 mod undo_group;
+mod window_error;
 mod word_count;
 use char_export::RunFormat;
 use rich_row::{line_formats, RowText};
@@ -159,6 +162,9 @@ struct TextInput {
     /// B / I / U / S chosen with only a caret, for the text typed next
     /// (cleared when the caret moves), as in Word.
     pending_emphasis: Vec<(sylph_core::format::Emphasis, bool)>,
+    /// The word a double-click selected, while its drag extends the
+    /// selection by whole words (Word).
+    word_drag: Option<Range<usize>>,
     /// Paragraph formatting over whole lines of `content` (alignment,
     /// this-paragraph spacing), moved along by every edit.
     para_formats: ParagraphSpans,
@@ -955,14 +961,15 @@ impl TextInput {
             return cx.notify();
         }
         let pos = self.index_for_mouse_position(event.position);
+        self.word_drag = None;
         if event.click_count == 2 {
-            let start = self.previous_word_boundary(pos);
-            let end = self.next_word_boundary(pos);
-            if start == end {
-                self.selected_range = pos..self.next_boundary(pos);
+            let word = sylph_core::word_selection(&self.content, pos);
+            self.selected_range = if word.is_empty() {
+                pos..self.next_boundary(pos)
             } else {
-                self.selected_range = start..end;
-            }
+                word
+            };
+            self.word_drag = Some(self.selected_range.clone());
             self.selection_reversed = false;
             self.preferred_column = None;
             self.is_selecting = true;
@@ -994,6 +1001,7 @@ impl TextInput {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_selecting = false;
+        self.word_drag = None;
         if self.column_drag.is_some() {
             self.finish_column_drag(cx);
         }
@@ -1004,7 +1012,15 @@ impl TextInput {
             return self.drag_column_to(event.position, cx);
         }
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            let pos = self.index_for_mouse_position(event.position);
+            if let Some(anchor) = self.word_drag.clone() {
+                (self.selected_range, self.selection_reversed) =
+                    sylph_core::word_drag_selection(&self.content, anchor, pos);
+                // Scroll along, as a plain drag does (select_to).
+                self.ensure_cursor_visible();
+                return cx.notify();
+            }
+            self.select_to(pos, cx);
         }
     }
 
@@ -2244,7 +2260,7 @@ impl Element for TextElement {
                     bottom,
                 ) {
                     canvas_scroll.set_offset(point(canvas_scroll.offset().x, offset));
-                    window.refresh();
+                    redraw::next_frame(window);
                 }
             }
         }
@@ -2260,7 +2276,8 @@ impl Element for TextElement {
         // The page sheets are drawn from the previous layout's count: when
         // text first flows onto a new page (or leaves one), draw again.
         if page_count != input_page_count {
-            window.refresh();
+            redraw::trace(|| format!("pages {input_page_count} -> {page_count}, redraw"));
+            redraw::next_frame(window);
         }
         self.input.update(cx, |input, _cx| {
             input.followed = follow_key;
@@ -2298,6 +2315,7 @@ impl Element for TextElement {
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
         let scroll_offset_y = self.input.read(cx).scroll_offset_y;
+        redraw::trace(|| format!("paint rev {}", self.input.read(cx).content_rev));
         for hitbox in &prepaint.resize_hitboxes {
             window.set_cursor_style(gpui::CursorStyle::ResizeColumn, hitbox);
         }
@@ -6209,7 +6227,9 @@ fn export_model(structured: &doc::Document, content: &str, markdown_on: bool) ->
             blocks.push(b.clone());
         }
     }
-    let text_blocks = if markdown_on {
+    let text_blocks = if structured.rich {
+        rich_doc::text_blocks(structured, content)
+    } else if markdown_on {
         parse_content_blocks_with(
             content,
             structured.line_spacing,
@@ -6535,6 +6555,7 @@ fn main() {
                         formats: initial_formats,
                         para_formats: initial_paras,
                         pending_emphasis: Vec::new(),
+                        word_drag: None,
                         column_drag: None,
                         styles: document.resolved_styles(),
                         save_state: opened_state(&read_only, &unpersisted),
@@ -6645,7 +6666,8 @@ fn main() {
                     })
                 },
             )
-            .expect("Failed to create window");
+            // A clear message and exit 1, not a panic (window_error.rs).
+            .unwrap_or_else(|err| window_error::exit(err));
 
         window
             .update(cx, |view, window, cx| {

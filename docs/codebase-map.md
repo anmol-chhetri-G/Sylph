@@ -75,6 +75,24 @@ Spans<F>  (FormatSpans = Spans<CharFormat>, ParagraphSpans = Spans<ParaFormat>)
 paragraph_range(text, a, b)  → first line start .. last line end + its "\n" (so Enter carries paragraph format)
 ```
 
+`crates/core/src/rich.rs` — the rich-text model (plan cards R1–R7; documents with `rich = true`):
+
+```text
+text      paragraphs, each ending in "\n" (the last one too, Word's paragraph mark); no Markdown syntax
+paras     kind per paragraph: Heading n | ListItem {ordered, level, checked} | Quote n | Code {language}
+          | TableRow {table id} | Caption; None = Normal
+chars     bold / italic / underline / strike / code / link / size / font; on an OBJECT_CHAR (U+FFFC): object id
+objects   id → Image | PageBreak | HorizontalRule | Table(props: column widths %, fills, padding, border, caption)
+          table cells: separated by CELL_SEPARATOR (U+001F) inside a TableRow paragraph
+
+from_blocks(blocks, normal)  → RichText   one paragraph per heading / item / quote / code line / table row /
+                                          caption; objects for images, rules, page breaks; spacing equal to
+                                          Normal's is left to the style; pasted U+FFFC / U+001F removed
+to_blocks(text, chars, paras, objects, normal) → blocks   list items group into lists (new list where a
+                                          top-level item switches numbered/bulleted), code lines by language,
+                                          table rows by table id; an OBJECT_CHAR paragraph → its object's block
+```
+
 ## 2. The editor: `TextInput` (main.rs)
 
 ```text
@@ -180,8 +198,11 @@ emphasis.rs        TextView (text + formats + display lines) decides B/I/U/S tog
 table_view.rs      cells of a pipe table line, display_row, Tab between cells, column widths in
                    the |----|--| dashes, ColumnDrag (resize), TableCommand (insert/delete rows/cols)
 pagination.rs      PageFlow.place / page_of, \newpage editing (backspace/delete), caret scroll
+redraw.rs          next_frame (redraw asked for in prepaint/paint), trace (SYLPH_TRACE_FRAMES=1)
+window_error.rs    message + exit when the window cannot open (GPU driver hint instead of a panic)
 md_edit.rs         list markers (Enter/Tab/Shift+Tab), hanging indent, document outline
 char_export.rs     RunFormat: text slices + char/paragraph formats → export runs (§7)
+rich_doc.rs        rich documents: text_blocks (export), to_rich (Markdown-model document → rich; card R7 uses it)
 rich_row.rs        RowText (segments of shaped text), line_formats, emphasis on runs
 fonts.rs           bundled fonts, BODY_FONTS list, FONT_ALIASES (Times New Roman → Liberation Serif …)
 undo_group.rs      which edits join one undo step
@@ -255,7 +276,8 @@ export_document(format):  Save dialog → snapshot on the UI thread → backgrou
   json = serde_json(export_model(document, text, markdown_on))
   export_model:
      blocks = cover page
-            + parse_content_blocks_with(text, RunFormat::with(text, char_formats).with_paragraphs(para_formats))
+            + rich::to_blocks(text, formats, objects)   (rich documents)
+            | parse_content_blocks_with(text, RunFormat::with(text, char_formats).with_paragraphs(para_formats))
                 (Markdown on: headings, lists, quotes, code, tables (column widths from dashes),
                  images, \newpage; every line its own paragraph)
             | literal_blocks_with(...)  (Markdown off: one paragraph per line, \newpage still breaks)
@@ -302,6 +324,7 @@ fonts_dir: <exe>/../share/sylph/fonts or repo assets/fonts → export.configure(
 ## 10. Checks
 
 ```text
-scripts/verify.sh [python]: fmt · clippy -D warnings · core+storage tests · desktop tests ·
+scripts/doctor.sh:          toolchain · native libraries · .venv (python version, packages, permissions)
+scripts/verify.sh [python]: doctor · fmt · clippy -D warnings · core+storage tests · desktop tests ·
                             (python bridge clippy + tests) · headless exports of fixtures/kitchen-sink.md
 ```

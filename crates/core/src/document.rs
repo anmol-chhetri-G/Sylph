@@ -511,6 +511,66 @@ pub struct Document {
     /// Paragraph formatting (alignment, this-paragraph spacing) as ranges
     /// over whole lines of the editor's text.
     pub para_formats: crate::format::ParagraphSpans,
+    /// The text is rich (no Markdown syntax; headings, lists and tables
+    /// are paragraph kinds, images and page breaks objects; see
+    /// `crate::rich`). `false` for documents still in the Markdown model.
+    pub rich: bool,
+    /// Rich documents' objects by id: what each `OBJECT_CHAR` line and each
+    /// table holds.
+    pub objects: std::collections::BTreeMap<u32, DocObject>,
+}
+
+/// An object in a rich document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DocObject {
+    Image(ImageData),
+    PageBreak,
+    HorizontalRule,
+    /// A table's properties (its rows are `TableRow` paragraphs).
+    Table(TableProps),
+}
+
+/// What a table holds beyond its cells' text, as Google Docs' table
+/// properties: column widths, cell backgrounds, padding, borders.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TableProps {
+    /// Column widths as percentages of the table width, as in
+    /// `TableData::column_widths`; empty (or a count that no longer
+    /// matches the columns) = equal.
+    pub column_widths: Vec<f32>,
+    /// Background colour ("#rrggbb") per cell.
+    pub cell_fills: Vec<CellFill>,
+    /// Space inside each cell, in points.
+    pub cell_padding: Option<f32>,
+    /// Border colour ("#rrggbb") and width in points.
+    pub border: Option<(String, f32)>,
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellFill {
+    pub row: usize,
+    pub column: usize,
+    pub color: String,
+}
+
+impl Document {
+    /// A free object id.
+    pub fn next_object_id(&self) -> u32 {
+        self.objects.keys().next_back().map_or(1, |id| id + 1)
+    }
+
+    /// The Normal style as paragraph formatting: what a paragraph without
+    /// its own spacing or alignment exports with.
+    pub fn normal_paragraph_style(&self) -> ParagraphStyle {
+        ParagraphStyle {
+            line_spacing: self.line_spacing,
+            space_before: self.space_before,
+            space_after: self.space_after,
+            alignment: Default::default(),
+        }
+    }
 }
 
 /// The Heading 1–6 defaults, in points: (size, space before, space after).
@@ -582,6 +642,8 @@ impl Document {
             space_after: NORMAL_SPACE_AFTER,
             char_formats: Default::default(),
             para_formats: Default::default(),
+            rich: false,
+            objects: Default::default(),
         }
     }
 
@@ -601,6 +663,8 @@ impl Document {
             space_after: NORMAL_SPACE_AFTER,
             char_formats: Default::default(),
             para_formats: Default::default(),
+            rich: false,
+            objects: Default::default(),
         }
     }
 
@@ -825,6 +889,8 @@ impl Document {
             space_after: NORMAL_SPACE_AFTER,
             char_formats: Default::default(),
             para_formats: Default::default(),
+            rich: false,
+            objects: Default::default(),
         }
     }
 
@@ -1006,6 +1072,49 @@ mod tests {
         );
         assert_eq!(loaded.heading_styles, <[HeadingStyle; 6]>::default());
         assert_eq!(loaded.style_line_spacing(3), HEADING_LINE_SPACING);
+    }
+
+    #[test]
+    fn test_rich_documents_round_trip_and_old_ones_stay_markdown() {
+        use crate::format::{ParaFormat, ParaKind, SpanFormat};
+        let mut doc = Document::new();
+        doc.rich = true;
+        let id = doc.next_object_id();
+        doc.objects
+            .insert(id, DocObject::Image(ImageData::new("a.png")));
+        doc.objects.insert(
+            doc.next_object_id(),
+            DocObject::Table(TableProps {
+                cell_fills: vec![CellFill {
+                    row: 0,
+                    column: 1,
+                    color: "#ffeeaa".into(),
+                }],
+                ..Default::default()
+            }),
+        );
+        doc.para_formats.apply(0..5, |p| {
+            p.kind = Some(ParaKind::ListItem {
+                ordered: true,
+                level: 1,
+                checked: None,
+            })
+        });
+        let back: Document = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        assert_eq!(back, doc);
+        assert_eq!(back.next_object_id(), 3);
+        // A paragraph kind alone is formatting (not dropped as empty).
+        let heading = ParaFormat {
+            kind: Some(ParaKind::Heading(2)),
+            ..Default::default()
+        };
+        assert!(!heading.is_empty());
+        // Saved before rich documents existed: Markdown model, no objects.
+        let mut old = serde_json::to_value(Document::new()).unwrap();
+        old.as_object_mut().unwrap().remove("rich");
+        old.as_object_mut().unwrap().remove("objects");
+        let loaded: Document = serde_json::from_value(old).unwrap();
+        assert!(!loaded.rich && loaded.objects.is_empty());
     }
 
     #[test]

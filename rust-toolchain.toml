@@ -1,5 +1,9 @@
-# Honoured by rustup (e.g. CI). The author builds with Arch's system Rust,
-# which ignores this file, so keep the pin equal to `rustc --version` there.
+# Honoured by rustup, which the author now builds with (Debian, 2026-10):
+# the first cargo command in the repo installs this toolchain. Run one
+# cargo command at a time until it has finished; two at once can leave a
+# toolchain without cargo (scripts/doctor.sh says how to repair it).
+# A system Rust (Arch's) ignores this file: keep the pin equal to its
+# `rustc --version` when building there.
 # Floor: 1.95 (gpui 0.2.2 is edition 2024; krilla needs >=1.92 and
 # rusqlite_migration 2.6 needs >=1.95, both later in the plan).
 [toolchain]

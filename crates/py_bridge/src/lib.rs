@@ -353,21 +353,40 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("sylph-bridge-paths-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        make_dirs(&dir);
         dir.canonicalize().unwrap()
+    }
+
+    /// `create_dir_all`, with every new directory under the temp dir set to
+    /// 0755. Under a 002 umask (Debian's user-private groups) they would
+    /// be group-writable, which `python_dirs` rightly refuses.
+    fn make_dirs(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let top = std::env::temp_dir().canonicalize().unwrap();
+            let path = path.canonicalize().unwrap();
+            for dir in path
+                .ancestors()
+                .take_while(|d| *d != top && d.starts_with(&top))
+            {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
     }
 
     /// An installed layout: `<root>/bin/sylph` next to
     /// `<root>/lib/sylph/python`, plus a repo and venvs that exist too.
     fn installed_layout(name: &str) -> (PathBuf, PathBuf, PythonEnv) {
         let root = tree(name);
-        std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::create_dir_all(root.join("lib/sylph/python/sylph_py")).unwrap();
+        make_dirs(&root.join("bin"));
+        make_dirs(&root.join("lib/sylph/python/sylph_py"));
         let repo = root.join("repo");
-        std::fs::create_dir_all(repo.join("python")).unwrap();
-        std::fs::create_dir_all(repo.join(".venv/lib/python3.13/site-packages")).unwrap();
+        make_dirs(&repo.join("python"));
+        make_dirs(&repo.join(".venv/lib/python3.13/site-packages"));
         let venv = root.join("venv");
-        std::fs::create_dir_all(venv.join("lib/python3.13/site-packages")).unwrap();
+        make_dirs(&venv.join("lib/python3.13/site-packages"));
         let env = PythonEnv {
             repo: Some(repo),
             sylph_python_dir: Some(root.join("repo/python")),
@@ -1113,13 +1132,13 @@ mod tests {
         let (exe, _, env) = installed_layout("fonts");
         let root = exe.parent().unwrap().parent().unwrap().to_path_buf();
         assert_eq!(fonts_dir(BuildMode::Release, &exe, &env), None);
-        std::fs::create_dir_all(root.join("share/sylph/fonts")).unwrap();
+        make_dirs(&root.join("share/sylph/fonts"));
         assert_eq!(
             fonts_dir(BuildMode::Release, &exe, &env),
             Some(root.join("share/sylph/fonts"))
         );
         // Debug prefers the repo's assets; release never looks there.
-        std::fs::create_dir_all(root.join("repo/assets/fonts")).unwrap();
+        make_dirs(&root.join("repo/assets/fonts"));
         assert_eq!(
             fonts_dir(BuildMode::Debug, &exe, &env),
             Some(root.join("repo/assets/fonts"))

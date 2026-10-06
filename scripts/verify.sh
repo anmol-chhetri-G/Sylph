@@ -21,6 +21,9 @@ stage() {
   fi
 }
 
+# Environment first (scripts/doctor.sh): a missing library or a stale
+# .venv shows here as one line instead of as dozens of failing tests.
+stage env scripts/doctor.sh
 stage fmt cargo fmt --all -- --check
 stage clippy cargo clippy --workspace --all-targets -- -D warnings
 stage test-core-storage cargo test -p sylph-core -p sylph-storage

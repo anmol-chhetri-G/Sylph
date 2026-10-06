@@ -1,6 +1,7 @@
 # Sylph Python export/AI dependencies, pinned (plan 0.12).
-# System Python on Arch is PEP-668 managed — use a venv:
-#   python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt
+# System Python (Arch, Debian) is PEP-668 managed — use a venv, built by the
+# same python3 the bridge links, with a umask that keeps it private:
+#   (umask 022; python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt)
 # The bridge finds the repo .venv itself in debug builds.
 fpdf2==2.8.8
 # fpdf2's text shaping (Devanagari conjuncts, ligatures).

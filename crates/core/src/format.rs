@@ -28,6 +28,17 @@ pub struct CharFormat {
     pub underline: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strike: Option<bool>,
+    /// Inline code (monospace), rich documents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<bool>,
+    /// Link target, rich documents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Rich documents: on an `OBJECT_CHAR`, the id of the object it stands
+    /// for (`Document::objects`). Moving with the text, as formatting
+    /// does, keeps each object where it was put.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<u32>,
 }
 
 /// The on/off character attributes that the B / I / U / S buttons toggle.
@@ -68,6 +79,9 @@ impl SpanFormat for CharFormat {
             && self.italic.is_none()
             && self.underline.is_none()
             && self.strike.is_none()
+            && self.code.is_none()
+            && self.link.is_none()
+            && self.object.is_none()
     }
 }
 
@@ -81,11 +95,46 @@ pub enum Alignment {
     Justify,
 }
 
+/// What a paragraph is, in a rich document (one with no Markdown syntax in
+/// its text): the paragraph's kind replaces `# `, `- `, `> `, ``` and pipe
+/// tables. `None` in `ParaFormat::kind` means a Normal paragraph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParaKind {
+    /// Heading 1–6.
+    Heading(u8),
+    /// A list item: numbered or bulleted, its nesting level (0 = top), and
+    /// a task box when `checked` is set.
+    ListItem {
+        ordered: bool,
+        level: u8,
+        checked: Option<bool>,
+    },
+    /// A quotation, nested `level` deep (1 = one bar).
+    Quote(u8),
+    /// One line of a code block.
+    Code { language: String },
+    /// One row of table `table` (an object id); cells are separated by
+    /// `CELL_SEPARATOR` in the text.
+    TableRow { table: u32 },
+    /// A caption under a figure or table (Word's Caption style).
+    Caption,
+}
+
+/// In a rich document's text: where an object (image, page break, rule)
+/// sits, on a line of its own; its `CharFormat::object` says which.
+pub const OBJECT_CHAR: char = '\u{FFFC}';
+
+/// In a rich document's text: between the cells of a table row.
+pub const CELL_SEPARATOR: char = '\u{1F}';
+
 /// Formatting of one paragraph (one line of the text) over its style's:
 /// Word's paragraph formatting. `None` fields follow the style.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ParaFormat {
+    /// Rich documents: heading, list item, quote, code, table row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ParaKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub align: Option<Alignment>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,7 +148,8 @@ pub struct ParaFormat {
 
 impl SpanFormat for ParaFormat {
     fn is_empty(&self) -> bool {
-        self.align.is_none()
+        self.kind.is_none()
+            && self.align.is_none()
             && self.line_spacing.is_none()
             && self.space_before.is_none()
             && self.space_after.is_none()
@@ -296,6 +346,13 @@ impl<F: SpanFormat> Spans<F> {
             span.end = fix(span.end);
         }
         self.normalize();
+    }
+
+    /// Spans built in text order (non-overlapping), normalized.
+    pub(crate) fn from_ordered(spans: Vec<FormatSpan<F>>) -> Self {
+        let mut out = Self { spans };
+        out.normalize();
+        out
     }
 
     /// Sorted, no empty or formatless spans, adjacent equal spans merged.

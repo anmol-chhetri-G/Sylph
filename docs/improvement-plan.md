@@ -43,7 +43,60 @@ editing.
 | Tables: resize and columns | done | drag column borders (widths stored as delimiter dash counts, exported to PDF/DOCX); right-click: insert/delete rows and columns, delete table; right-click moves the caret like Word |
 | Bold / italic in every body font | done | Hanken Grotesk had no bold or italic face and JetBrains Mono no italic, so Ctrl+B/I did nothing visible in those fonts; all body fonts now ship regular/italic/bold/bold-italic (test enforces it), PDF uses the real faces |
 | Bold/italic edge cases + Word fonts | done | first letter after hidden `**` now gets its formatting (char vs caret mapping); Ctrl+B on Markdown-bold text un-bolds it (hidden syntax ignored); scenario tests in `emphasis.rs`; Times New Roman / Arial / Courier New offered, drawn and embedded with metric-compatible Liberation fonts, DOCX keeps Word names |
+| Rich-text R1 core types | done | paragraph kinds (heading, list item, quote, code, table row, caption), `code` / `link` / `object` character formatting, object store (images, page breaks, rules, table properties), `Document.rich`; old documents load unchanged |
+| Rich-text R2 converter | done | `sylph_core::rich`: export blocks ⇄ rich text; `rich_doc::to_rich` turns a Markdown-model document into a rich one (not called yet: R7); rich documents export through `rich::to_blocks`; the kitchen sink, formatted Markdown, Markdown-off text and inserted blocks export identically both ways |
+| B1 double-click selection | done | double-click selects the word under the pointer and its space (the left edge no longer adds the previous word); dragging after a double-click extends by whole words instead of cutting the word at the pointer and scrolls like a plain drag; `sylph_core::word_selection` and `word_drag_selection`, each with a test |
+| B2 redraws during drawing | done | the caret-follow scroll and a page-count change now ask for the next frame (`redraw::next_frame`; `window.refresh()` is a no-op while GPUI draws, so the sheets, editor height and scroll lagged one input event); a test keeps `window.refresh()` out of the app; `SYLPH_TRACE_FRAMES=1` prints toggles and paints with their revision |
+| Window fails on Intel + NVIDIA Wayland | done | NVIDIA's Vulkan driver fails `vkCreateWaylandSurfaceKHR` (ERROR_OUT_OF_HOST_MEMORY) and the loader asks every driver, so the app panicked; it now exits with a message naming the fix (`VK_LOADER_DRIVERS_DISABLE='*nvidia*'`), tested; `doctor.sh` notes the case. Whether to retry without NVIDIA automatically is the author's call |
+| Dev environment (Debian, 2026-10-06) | done | `scripts/doctor.sh` (toolchain, native libraries, `.venv` version and permissions) runs as verify's first stage; bridge path tests no longer depend on the umask (Debian's 002 made them fail); `.venv` must be built with `umask 022` |
 | everything else | open | |
+
+## Next up (one queue; update when a task lands)
+
+The plan grew in layers: Phases 0–7 (2026-09-27), the roadmap M0–M10
+(2026-10-03), the rich-text cards R1–R7 (2026-10-03) and the B/F/P/T/E
+cards (2026-10-04). Their sections below hold the details; **this queue is
+the order to work in**. Take the first open row, and move rows only on the
+author's word.
+
+| # | Card | State | Gate |
+| --- | --- | --- | --- |
+| 1 | B2: redraw on the next frame instead of `window.refresh()` in prepaint; `SYLPH_TRACE_FRAMES=1` | done (needs VR) | VR: bold that reflows onto a new page draws on the right sheet at once |
+| 2 | F1: font colour and highlight (canvas, PDF, DOCX); one colour table for headings and code | open | VR: colour survives save, reopen and both exports |
+| 3 | R3: canvas draws rich documents (paragraph kinds, computed bullets and numbers) | open | rich documents only exist in tests until R7, so tests build them with `rich_doc::to_rich` |
+| 4 | R4: Enter / Tab / Backspace by paragraph kind; Markdown typing shortcuts | open | |
+| 5 | R5 with T1–T6: tables as rows of cells with properties | open | |
+| 6 | R6: images and page breaks as objects at the caret | open | |
+| 7 | R7: open old documents as rich, after a backup version that also stores the model | open | **touches saved data**: needs the author's go-ahead in the author's own words (AGENTS rule 5), and the blank-line decision below |
+| 8 | B3, B4, P1–P3, F2–F4, E1–E2 | open | |
+| 9 | Roadmap M3, M5–M8 | open | |
+
+Decisions waiting for the author (found in the 2026-10-06 review):
+
+- **Blank lines at R7.** `to_rich` drops empty lines because the export
+  always has. In the editor they are visible spacing, so after R7 they
+  would disappear from the page. Word and Docs keep empty paragraphs;
+  keeping them (and exporting them) is the likely choice.
+- **New cards proposed in [analysis-2026-10-06.md](analysis-2026-10-06.md)**:
+  S1 (text and formatting saved in one transaction; today a crash between
+  the two saves shifts formatting onto other letters) and S2 (versions
+  keep their formatting; Restore drops it today, and R7's backup needs
+  it), both before F1; L1 (lay out once per edit, paint only visible
+  rows) after R3.
+- **Phase 2's block kernel.** Phase 2 (and 4.7, 4.10) describe a
+  `Vec<Block>` model; the rich-text decision keeps one text plus ranges.
+  Either mark Phase 2 superseded by R1–R7 or say which parts still stand.
+
+### Working on a card
+
+1. `scripts/doctor.sh`, then `scripts/verify.sh python`: start from green.
+2. Read the card and its section; grep before trusting line numbers.
+3. Small steps, `cargo check` after each. A bug fix starts with the test
+   that fails. Code moves and behaviour changes are separate cards (and
+   separate commits).
+4. `scripts/verify.sh python` ends in `== ALL PASS`.
+5. Update the status table and this queue; report the files, tests,
+   commands, manual (VR) checks and a commit message per card.
 
 ## University-ready roadmap (adopted 2026-10-03; personal use first)
 
@@ -52,7 +105,13 @@ dissertation chapter — without leaving the app: title page, numbered
 headings, table of contents, figures and tables with captions, citations
 and a bibliography, footnotes, page numbers, and a PDF/DOCX that matches
 the page. Extensive text styling (colour, highlight, super/subscript)
-comes last, as the author asked.
+comes last, as the author asked. *2026-10-04: the author now wants font
+colour and Word/Docs-like editing soon — see "Editing and formatting like
+Word / Docs" below; F1 (colour) moves ahead of R3.*
+
+The table below is from 2026-10-03 morning. Done since then: tables drawn as
+grids, alignment, undo that groups typing, word count, Times New Roman /
+Arial / Courier New, and underline.
 
 ### Where Sylph stands against Word / Google Docs
 
@@ -79,6 +138,9 @@ comes last, as the author asked.
 | Equations, comments, track changes, columns | yes | **no** (later) |
 
 ### Model decision: text + ranges + anchors (the Google Docs model)
+
+*Superseded the same day by the rich-text model below (option (b): no
+Markdown syntax in the text). Kept for its history.*
 
 Keep what works and extend it instead of a big-bang rewrite:
 
@@ -264,6 +326,151 @@ match selection"); all as `CharFormat` fields, same pipeline as size/font.
 **M10 Core rebuild (plan Phases 2–5)** — one layout engine for canvas and
 PDF (exact page parity), true footnote placement, equations, comments,
 track changes, columns.
+
+### Rich-text model (decided 2026-10-03: option (b), branch `feature/rich-text`)
+
+The editor text stops holding Markdown syntax. It becomes plain text (one
+line = one paragraph) plus ranges, like Google Docs' model:
+
+```text
+text            plain characters; U+FFFC marks an object; U+001F separates table cells
+para_formats    per line: kind (Normal | Heading n | ListItem {ordered, level, checked} |
+                Quote level | Code {language} | TableRow {table id}) + align / spacing
+char_formats    per range: bold, italic, underline, strike, code, link, size, font
+objects         id → Image { path, width, caption, alt } | PageBreak | Rule | Table props
+Markdown        only: typing shortcuts ("# ", "- ", "**…**"), import, export
+```
+
+Why: the bugs of the last weeks (bold next to hidden `**`, tables that
+cannot hold colours or merges, images that cannot sit in the text) all
+come from syntax hidden in the text. With no hidden syntax, the screen
+maps 1:1 to the text, and every feature is a range or an object.
+
+Cards (each lands green, the old path keeps working until R7):
+
+| Card | What | Notes |
+| --- | --- | --- |
+| R1 | Core types: `ParaKind` in `ParaFormat`; `code`, `link` in `CharFormat`; object store; `Document.rich` flag | no behaviour change |
+| R2 | Converter Markdown text → rich (text, spans, objects) and rich → export blocks; round-trip tests on `fixtures/kitchen-sink.md` | pure functions |
+| R3 | Canvas renders rich documents: paragraph kinds (heading sizes, bullets/numbers computed, quotes, code), no hidden syntax | old Markdown display kept for old docs |
+| R4 | Editing: Enter / Tab / Backspace by paragraph kind (lists continue, heading → Normal after Enter), style & list commands set kinds, Markdown typing shortcuts autoformat | |
+| R5 | Tables as rows of cells in the text + table props (cell colour, padding, borders), cell-range selection | |
+| R6 | Images and page breaks as objects at the caret; resize, captions | |
+| R7 | Open old documents as rich: **on first open, after the old text and model are saved as a backup version** (author's decision, 2026-10-04); Markdown toggle retired | touches saved data; `save_revision` keeps text only, so revisions must also store the model (schema change at storage start-up, off the UI thread) and Restore must bring the old document back |
+
+Decisions taken while building R1–R2:
+
+- **Paragraph marks.** Every paragraph ends with `'\n'`, the last one too (Word's final paragraph mark). An empty last paragraph so still has a byte to carry its kind: Enter after the last list item gives another item. The empty document is `"\n"`.
+- **Objects.** An `OBJECT_CHAR` is an object only through its `CharFormat::object` id. A `U+FFFC` pasted from Word or LibreOffice is removed on import and never becomes an object. Table rows name their table in `ParaKind::TableRow`.
+- **Table widths.** `TableProps::column_widths` are percentages, as in `TableData`, so the round trip is exact.
+- **Grouping on export.** Consecutive list items are one list until a top-level item switches between numbered and bulleted. Consecutive code lines in one language are one code block.
+- **Normal spacing.** A paragraph whose spacing equals Normal's follows the style after conversion; it does not keep a frozen copy.
+
+Known limits, each exactly as the current export already behaves:
+
+- Blank lines between Markdown blocks are dropped (the export never had them).
+- Inline images keep only their alt text.
+- Two same-type lists, or two same-language code blocks, separated only by a blank line merge into one. Numbering continues instead of restarting; R4 can add a list id (Word's numId) if this matters.
+- `Some(false)` un-bolding on heading words is not carried.
+
+Exporters stay in Python for now (author's decision, 2026-10-04).
+
+### Bold "sometimes doesn't show" (investigated 2026-10-04)
+
+**Verdict: the bold glyphs are not drawn late.** The canvas has no cache. Ctrl+B
+replaces `formats` and notifies, and the next frame's prepaint reads the live
+formats (`line_formats` → `RowText::shape` → `apply_emphasis`). GPUI 0.2.2 on
+Wayland draws on the next compositor frame whenever the window is dirty.
+The "sometimes" comes from *what gets toggled*, plus one real redraw bug that
+is not the glyphs:
+
+1. **Double-click at a word's left edge selects the previous word too.**
+   `previous_word_boundary` jumps back. A probe on "say hello world" with a
+   double-click on the left half of `h` gives `"say hello "`.
+2. **Mouse movement after a double-click shrinks the selection.** `is_selecting`
+   stays true, so a 1 px move before release runs `select_to` by
+   character. The selection becomes word start .. pointer, and Ctrl+B bolds
+   part of the word.
+3. **Caret at a word edge (right after typing a word).** Ctrl+B arms bold
+   for the next typed text, as Word and Docs do. Only the B button and the
+   status bar show it, so it looks like nothing happened, then later typing
+   comes out bold.
+4. **Redraw requests inside prepaint are ignored.** `window.refresh()` at
+   `main.rs` caret-follow scroll and page-count change does nothing while
+   GPUI is drawing. So page sheets, the editor's height (`overflow_hidden`,
+   taken from the previous frame) and caret-follow scrolling lag one input
+   event behind: bold that reflows text onto a new page can draw off-sheet
+   or clip the last rows until the next mouse move or key. The fix is
+   `window.request_animation_frame()`.
+5. **A paragraph mark carries bold into the next paragraph.** A selection
+   that includes the `'\n'` (Shift+Down) makes text typed at the next
+   paragraph's start bold, because `Spans::edit` gives inserted text the
+   previous character's format. Word uses the paragraph's own first
+   character there.
+6. **The decision reads the last frame's display lines.** They are stale
+   only if the text changed in the same frame (rare). Rich documents
+   remove this: there is no hidden syntax to consult.
+7. **Input methods with inline preedit duplicate text** (found while
+   tracing). `marked_text_range` returns `None`, and every preedit update
+   is inserted again. This needs checking with the author's input method.
+
+Zero-code check when it happens: the status bar says **"Bold off"** →
+the decision (3, 6); **"Bold on"** but nothing visible → the range (1, 2) or
+the redraw (4); **nothing** → the shortcut never reached the editor.
+
+### Editing and formatting like Word / Docs (planned 2026-10-04)
+
+**B: bold reliability** (small, do first; each with a test that fails
+without the fix)
+
+| Card | What | Notes |
+| --- | --- | --- |
+| B1 | Double-click selects exactly the word under the pointer (plus its trailing space, like Word); dragging after a double-click extends by whole words | a pure `word_selection(text, pos)` function, tested at word edges, punctuation and Devanagari |
+| B2 | Replace the two in-prepaint `window.refresh()` calls with `window.request_animation_frame()`; `SYLPH_TRACE_FRAMES=1` prints the format revision at toggle and at paint | any leftover case then shows whether it is the decision, the range or the frame |
+| B3 | Typing at a paragraph's start takes that paragraph's first character's format, not the previous `'\n'`'s | `Spans::edit` caller-side rule; scenario test |
+| B4 | IME preedit: track the marked range, replace it on each update, underline it, commit on unmark | test with fcitx5/ibus inline preedit |
+
+**F: character formatting** (a `CharFormat` field → canvas run → export,
+the same pipeline as size and font; works before R3)
+
+| Card | What | Notes |
+| --- | --- | --- |
+| F1 | **Font colour and highlight**: toolbar `A▾` and highlighter `▾` with a Docs-style palette (standard colours, custom hex, Reset), on selections and pending at the caret | canvas `TextRun.color` / `background_color`; DOCX `font.color.rgb`, highlight limited to Word's 16 colours (nearest, else shading); PDF text colour; PDF highlight needs a spike (fpdf2 text flow paints no backgrounds). Also one colour table: headings are blue on the canvas but black in exports, and inline code is green on the canvas but red in the PDF. Heading styles get a colour, default black (Docs, today's exports) |
+| F2 | Superscript / subscript (Ctrl+. / Ctrl+, as Docs) | `RowText` needs a per-segment baseline shift; DOCX `font.superscript`; fpdf2 `char_vpos` (check) |
+| F3 | Clear formatting (Ctrl+\\), format painter, change case (Shift+F3), small caps | clear keeps objects and paragraph kinds |
+| F4 | Styles: Title, Subtitle, Quote, Caption in the Style list; colour / bold / italic as style properties; "Update style to match selection" | |
+
+**P: paragraph layout** (after R3, per AGENTS rule 6)
+
+| Card | What | Notes |
+| --- | --- | --- |
+| P1 | Indents: left/right, first-line, hanging; Ctrl+] / Ctrl+[ (Docs); ruler handles later | `ParaFormat` fields; canvas wrap width and offset; DOCX `paragraph_format`; PDF `text_columns` margins |
+| P2 | Keep with next, keep lines together, widow/orphan control, page break before | pagination rules, DOCX flags |
+| P3 | Lists: numbering format per level (1. a. i.), bullet per level, restart / continue numbering, start at n | a list id (fixes R2's merged-lists limit) |
+| P4 | Paragraph borders and shading; columns | later (M10) |
+
+**T: tables like Docs** (with R5: pipe tables cannot hold cell properties)
+
+| Card | What | Notes |
+| --- | --- | --- |
+| T1 | Cell-range selection: drag across cells selects a rectangle; Shift+arrows / Shift+click extend; selected cells tinted; B/I/U, colour, font, size and alignment apply to every selected cell's text | |
+| T2 | Cell properties: background colour, padding (pt), vertical alignment, text alignment, borders (colour, width); right-click "Cell background" palette and a "Table properties…" dialog | per-cell properties live on the row paragraph (`TableRow { table, cells: Vec<CellProps> }`), so rows carry them through edits, undo and copy; `TableProps` keeps table-wide settings; R1's `cell_fills` is replaced (nothing saves it yet) |
+| T3 | Cell text wraps on the canvas; rows grow to the tallest cell | today the canvas clips while the PDF wraps |
+| T4 | Minimum row height, distribute rows/columns, header row repeats on each page, table alignment and width, sort by column | fpdf2 repeats headings already; DOCX `w:tblHeader` |
+| T5 | Merge / unmerge cells | DOCX `cell.merge`; fpdf2 2.8.8 `colspan` / `rowspan` |
+| T6 | Export parity: the PDF keeps formatting inside cells (today it flattens cells to plain text, so bold/italic in PDF cells are lost); fills, padding, vertical alignment | fpdf2 `row.cell(style=FontFace(...), padding=, v_align=)`; DOCX `w:shd`, `w:tcMar`, `vertical_alignment`, `w:tcBorders` (raw XML) |
+
+**E: wording and editing**
+
+| Card | What | Notes |
+| --- | --- | --- |
+| E1 | Copy/paste keeps formatting inside Sylph; Ctrl+Shift+V pastes plain text | GPUI `ClipboardItem::new_string_with_json_metadata` carries the fragment's spans and objects; paste from Word/Docs (HTML) needs research |
+| E2 | Find & replace: whole words; the replacement takes the replaced text's formatting | |
+| E3 | Spell check, autocorrect, zoom | M7 as planned |
+
+**Order (recommended):** B1, B2 → F1 → R3 → R4 → R5 with T1–T6 → R6 →
+R7 (with backup) → P1–P3, F2–F4, B3, B4, E1–E2 → the rest of the roadmap
+(M3 page furniture, M5 structure, M6 notes and references, M7, M8).
 
 ### Research: tables in Google Docs and Word (2026-10-03)
 

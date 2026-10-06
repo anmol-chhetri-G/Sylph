@@ -67,7 +67,7 @@ next open task card, finish it, update the status table there, then report.
 
 ## Verify ladder
 
-Run `scripts/verify.sh` (V0 + V1 + V2 + headless exports) or
+Run `scripts/verify.sh` (environment check + V0 + V1 + V2 + headless exports) or
 `scripts/verify.sh python` (adds the Python bridge suite, VP). It prints
 PASS/FAIL per stage and ends with `== ALL PASS`. It never launches the GUI
 and never touches git.
@@ -84,8 +84,15 @@ vulkan-icd-loader jq poppler sqlite`.
 Debian/Parrot: `apt install build-essential pkg-config libxkbcommon-dev
 libxkbcommon-x11-dev libfontconfig1-dev libfreetype-dev python3-dev
 python3-venv libvulkan1 mesa-vulkan-drivers jq poppler-utils sqlite3`.
-Then `python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt`
-(debug builds find the repo `.venv` themselves).
+Then `(umask 022; python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt)`
+(debug builds find the repo `.venv` themselves; the umask matters on Debian,
+whose default 002 makes site-packages group-writable, which the bridge
+refuses). Rebuild the `.venv` whenever the system `python3` changes version.
+`scripts/doctor.sh` checks all of this; `verify.sh` runs it first.
+Laptops with Intel + NVIDIA under Wayland: if NVIDIA's Vulkan driver fails
+to create surfaces (the app exits with "could not open its window"), run
+`VK_LOADER_DRIVERS_DISABLE='*nvidia*' cargo run -p sylph-desktop`; doctor
+checks this when `vulkaninfo` (Debian: `vulkan-tools`) is installed.
 
 ## Definition of done
 

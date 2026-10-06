@@ -187,17 +187,26 @@ impl TextInput {
                         );
                     self.pending_emphasis.retain(|&(e, _)| e != emphasis);
                     self.pending_emphasis.push((emphasis, on));
+                    crate::redraw::trace(|| {
+                        format!("toggle {emphasis:?} on={on} for the next typed text")
+                    });
                     cx.notify();
                     return on;
                 }
             }
         }
-        let (on, formats) = self.text_view().toggled(range, emphasis);
+        let (on, formats) = self.text_view().toggled(range.clone(), emphasis);
         let formats_before = std::mem::replace(&mut self.formats, formats);
         let selection = self.selected_range.clone();
         self.push_format_step(selection, formats_before, self.para_formats.clone());
         self.redo_stack.clear();
         self.content_rev += 1;
+        crate::redraw::trace(|| {
+            format!(
+                "toggle {emphasis:?} on={on} {range:?} rev {}",
+                self.content_rev
+            )
+        });
         self.schedule_save(cx);
         cx.notify();
         on
