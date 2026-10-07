@@ -267,6 +267,39 @@ mod tests {
     }
 
     #[test]
+    fn colour_and_highlight_ride_on_the_runs_across_bold_and_lines() {
+        let text = "one **two three** four\nfive";
+        let mut spans = FormatSpans::new();
+        let start = text.find("three").unwrap();
+        spans.apply(start..start + 5, |f| f.color = Some("#c0392b".into()));
+        let five = text.find("five").unwrap();
+        spans.apply(five..text.len(), |f| f.highlight = Some("#ffff00".into()));
+        let first = RunFormat::with(text, &spans).runs(&text[..text.find('\n').unwrap()]);
+        let described: Vec<(&str, Option<&str>, Option<&str>)> = first
+            .iter()
+            .map(|r| {
+                (
+                    r.text.as_str(),
+                    r.format.color.as_deref(),
+                    r.format.highlight.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            described,
+            [
+                ("one ", None, None),
+                ("two ", None, None),
+                ("three", Some("#c0392b"), None),
+                (" four", None, None),
+            ]
+        );
+        // Markdown off: literal lines carry them too.
+        let lines = RunFormat::with(text, &spans).literal_runs(&text[five..]);
+        assert_eq!(lines[0].format.highlight.as_deref(), Some("#ffff00"));
+    }
+
+    #[test]
     fn joined_lines_map_back_to_their_source() {
         let text = "first line\nsecond line";
         let spans = sized(text, text.find("second").unwrap()..text.len(), 18.0);

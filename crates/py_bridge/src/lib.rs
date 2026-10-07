@@ -946,6 +946,80 @@ mod tests {
         }
     }
 
+    /// The decompressed content streams of a PDF, joined (fpdf2 deflates
+    /// them), so a test can look for drawing operators.
+    fn pdf_streams(path: &str) -> String {
+        let pdf = std::fs::read(path).expect("readable pdf");
+        let mut out = String::new();
+        let mut at = 0;
+        while let Some(found) = pdf[at..].windows(6).position(|w| w == b"stream") {
+            let mut start = at + found + 6;
+            if pdf[start..].starts_with(b"\r\n") {
+                start += 2;
+            } else if pdf[start..].starts_with(b"\n") {
+                start += 1;
+            }
+            let Some(len) = pdf[start..].windows(9).position(|w| w == b"endstream") else {
+                break;
+            };
+            let data = pdf[start..start + len].to_vec();
+            let inflated = with_python_module("zlib", |zlib| {
+                zlib.call_method1("decompress", (data.as_slice(),))?
+                    .extract::<Vec<u8>>()
+            });
+            if let Ok(bytes) = inflated {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            at = start + len + 9;
+        }
+        out
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "python-tests"),
+        ignore = "needs the Python venv: --features python-tests"
+    )]
+    fn test_colour_and_highlight_reach_the_exports() {
+        // Red text, Word's yellow highlight, a custom highlight (not one of
+        // Word's 16), a coloured link, and two colours that are not colours.
+        let doc = r##"{"body_font": "EB Garamond", "blocks": [
+            {"Paragraph": {"runs": [
+                {"text": "red", "styles": [], "color": "#c0392b"},
+                {"text": "yellow", "styles": [], "highlight": "#ffff00"},
+                {"text": "custom", "styles": [], "highlight": "#abcdef"},
+                {"text": "link", "styles": [{"Link": "https://example.com"}], "color": "#00aa00"},
+                {"text": "junk", "styles": [], "color": "nope", "highlight": "#12345"}
+            ], "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}
+        ]}"##;
+        let r = export_rich_docx(doc, &tmp("paint.docx"));
+        assert!(r.starts_with("Exported"), "docx: {r}");
+        let body = docx_document_xml(&tmp("paint.docx"));
+        assert!(body.contains(r#"<w:color w:val="C0392B"/>"#), "{body}");
+        assert!(body.contains(r#"<w:highlight w:val="yellow"/>"#), "{body}");
+        // A colour Word's highlighter lacks is exact shading, not the nearest.
+        assert!(body.contains(r#"w:fill="ABCDEF""#), "{body}");
+        // The link takes the author's colour over its default blue.
+        let link = &body[body.find("<w:hyperlink").unwrap()..];
+        assert!(link.contains(r#"<w:color w:val="00AA00"/>"#), "{link}");
+        assert!(!link.contains("0563C1"), "{link}");
+        // Bad values are ignored, not exported and not an error.
+        assert!(!body.contains("nope") && !body.contains("12345"), "{body}");
+
+        let r = export_rich_pdf(doc, &tmp("paint.pdf"));
+        assert!(r.starts_with("Exported"), "pdf: {r}");
+        // The text colour is drawn; the highlight cannot be, and says so.
+        assert!(pdf_streams(&tmp("paint.pdf")).contains("0.7529 0.2235 0.1686 rg"));
+        assert!(r.contains("Warning: highlight is not drawn in PDF"), "{r}");
+        // No highlight, no warning.
+        let plain = r##"{"body_font": "EB Garamond", "blocks": [
+            {"Paragraph": {"runs": [{"text": "red", "styles": [], "color": "#c0392b"}],
+             "style": {"line_spacing": 1.15, "space_before": 0.0, "space_after": 8.0}}}
+        ]}"##;
+        let r = export_rich_pdf(plain, &tmp("paint2.pdf"));
+        assert!(!r.contains("Warning"), "{r}");
+    }
+
     #[test]
     #[cfg_attr(
         not(feature = "python-tests"),

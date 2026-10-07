@@ -20,6 +20,18 @@ pub(crate) enum Picker {
     Font,
     Size,
     LineSpacing,
+    /// Font colour and highlight palettes (`colour_controls`).
+    TextColor,
+    Highlight,
+}
+
+impl Picker {
+    pub(crate) fn for_paint(paint: crate::colour_controls::Paint) -> Self {
+        match paint {
+            crate::colour_controls::Paint::Text => Picker::TextColor,
+            crate::colour_controls::Paint::Highlight => Picker::Highlight,
+        }
+    }
 }
 
 /// Font sizes the size dropdown offers, in points (Word's list).
@@ -374,7 +386,7 @@ impl SylphApp {
         }
     }
 
-    fn picker_panel(&self, picker: Picker, cx: &mut Context<Self>) -> impl IntoElement {
+    fn picker_panel(&self, picker: Picker, cx: &mut Context<Self>) -> AnyElement {
         let level = self.caret_style(cx);
         let style = style_name(level);
         let (header, rows): (String, Vec<AnyElement>) = match picker {
@@ -459,6 +471,13 @@ impl SylphApp {
                 };
                 (header, rows)
             }
+            Picker::TextColor | Picker::Highlight => {
+                let paint = match picker {
+                    Picker::Highlight => crate::colour_controls::Paint::Highlight,
+                    _ => crate::colour_controls::Paint::Text,
+                };
+                return self.colour_panel(paint, cx).into_any_element();
+            }
             Picker::LineSpacing => {
                 let resolved = self.document.resolved_style(level);
                 let style_spacing = self.document.style_line_spacing(level);
@@ -526,6 +545,11 @@ impl SylphApp {
                 (header, rows)
             }
         };
+        self.picker_shell(header, rows).into_any_element()
+    }
+
+    /// The dropdown's frame: a header over `rows`, below its field.
+    pub(crate) fn picker_shell(&self, header: String, rows: Vec<AnyElement>) -> impl IntoElement {
         let panel = div()
             .absolute()
             .top(px(30.0))
@@ -749,7 +773,7 @@ impl SylphApp {
         row.into_any_element()
     }
 
-    fn picker_heading(&self, title: &str) -> AnyElement {
+    pub(crate) fn picker_heading(&self, title: &str) -> AnyElement {
         div()
             .px(px(8.0))
             .py(px(4.0))
@@ -757,7 +781,7 @@ impl SylphApp {
             .into_any_element()
     }
 
-    fn picker_separator(&self) -> AnyElement {
+    pub(crate) fn picker_separator(&self) -> AnyElement {
         div()
             .h(px(1.0))
             .my(px(4.0))
@@ -765,7 +789,7 @@ impl SylphApp {
             .into_any_element()
     }
 
-    fn picker_row(
+    pub(crate) fn picker_row(
         &self,
         text: String,
         font: Option<String>,

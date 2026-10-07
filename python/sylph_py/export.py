@@ -245,8 +245,45 @@ def _link_url(styles):
     return None
 
 
+def _hex_rgb(value):
+    """(r, g, b) of a stored "#rrggbb", or None when it is anything else:
+    a bad colour in a document must never stop an export."""
+    import re
+    if not isinstance(value, str) or not re.fullmatch(r'#?[0-9a-fA-F]{6}', value):
+        return None
+    digits = value.lstrip('#')
+    return int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
+
+
+def _word_highlight(rgb):
+    """Word's highlight colour (WD_COLOR_INDEX) that is exactly `rgb`, or
+    None: Word's highlighter has only 16 colours."""
+    from docx.enum.text import WD_COLOR_INDEX as C
+    return {
+        (255, 255, 0): C.YELLOW, (0, 255, 0): C.BRIGHT_GREEN,
+        (0, 255, 255): C.TURQUOISE, (255, 0, 255): C.PINK,
+        (0, 0, 255): C.BLUE, (255, 0, 0): C.RED, (0, 0, 128): C.DARK_BLUE,
+        (0, 128, 128): C.TEAL, (0, 128, 0): C.GREEN, (128, 0, 128): C.VIOLET,
+        (128, 0, 0): C.DARK_RED, (128, 128, 0): C.DARK_YELLOW,
+        (128, 128, 128): C.GRAY_50, (192, 192, 192): C.GRAY_25,
+        (0, 0, 0): C.BLACK, (255, 255, 255): C.WHITE,
+    }.get(rgb)
+
+
+def _shading_el(rgb):
+    """A run's background as `w:shd` (any colour; exact)."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), '%02X%02X%02X' % rgb)
+    return shd
+
+
 def _add_hyperlink_docx(paragraph, text, url, *, bold=False, italic=False,
-                        code=False, strike=False, size=None, font=None):
+                        code=False, strike=False, size=None, font=None,
+                        color=None, highlight=None):
     """Append a real OOXML hyperlink run to a paragraph."""
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
@@ -272,9 +309,10 @@ def _add_hyperlink_docx(paragraph, text, url, *, bold=False, italic=False,
         r_pr.append(OxmlElement('w:i'))
     if strike:
         r_pr.append(OxmlElement('w:strike'))
-    color = OxmlElement('w:color')
-    color.set(qn('w:val'), '0563C1')
-    r_pr.append(color)
+    color_el = OxmlElement('w:color')
+    link_rgb = _hex_rgb(color)
+    color_el.set(qn('w:val'), '%02X%02X%02X' % link_rgb if link_rgb else '0563C1')
+    r_pr.append(color_el)
     if code or size:
         size_el = OxmlElement('w:sz')
         # Half-points; code keeps its 10 pt.
@@ -283,6 +321,10 @@ def _add_hyperlink_docx(paragraph, text, url, *, bold=False, italic=False,
     underline = OxmlElement('w:u')
     underline.set(qn('w:val'), 'single')
     r_pr.append(underline)
+    # Schema order: the shading follows the underline.
+    back = _hex_rgb(highlight)
+    if back:
+        r_pr.append(_shading_el(back))
     run_el.append(r_pr)
     text_el = OxmlElement('w:t')
     text_el.set(qn('xml:space'), 'preserve')
@@ -308,6 +350,8 @@ def _add_styled_run_docx(paragraph, run_data):
             strike='Strikethrough' in styles,
             size=run_data.get('size'),
             font=run_data.get('font'),
+            color=run_data.get('color'),
+            highlight=run_data.get('highlight'),
         )
         return
     run = paragraph.add_run(text)
@@ -327,6 +371,18 @@ def _add_styled_run_docx(paragraph, run_data):
         run.font.size = Pt(float(run_data['size']))
     if run_data.get('font'):
         run.font.name = run_data['font']
+    rgb = _hex_rgb(run_data.get('color'))
+    if rgb:
+        from docx.shared import RGBColor
+        run.font.color.rgb = RGBColor(*rgb)
+    back = _hex_rgb(run_data.get('highlight'))
+    if back:
+        word_colour = _word_highlight(back)
+        if word_colour is not None:
+            run.font.highlight_color = word_colour
+        else:
+            # Not one of Word's 16: exact shading instead of the nearest.
+            run._r.get_or_add_rPr().append(_shading_el(back))
 
 
 def markdown_to_html(text: str) -> str:
@@ -499,6 +555,15 @@ def _strings(value):
             yield from _strings(item)
 
 
+def _has_key(value, key) -> bool:
+    """Whether a dict anywhere in the JSON `value` has `key`."""
+    if isinstance(value, dict):
+        return key in value or any(_has_key(v, key) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_key(v, key) for v in value)
+    return False
+
+
 def _pdf_output(pdf, output_path: str, source) -> List[str]:
     """Write the PDF and return warnings for characters of `source` (the
     exported text or JSON value) that no bundled font covers, which print
@@ -514,6 +579,10 @@ def _pdf_output(pdf, output_path: str, source) -> List[str]:
     invisible = lambda c: c < 0x20 or chr(c).isspace() or c in (0x200C, 0x200D) or 0xFE00 <= c <= 0xFE0F
     lost = sorted(c for c in used - covered if not invisible(c))
     warnings = []
+    if _has_key(source, 'highlight'):
+        # fpdf2's text flow paints no background behind a run (checked
+        # against 2.8.8); the colour is exported to DOCX only.
+        warnings.append('highlight is not drawn in PDF (use DOCX)')
     if lost:
         warnings.append(
             'no bundled font has ' + ' '.join(f'{chr(c)} (U+{c:04X})' for c in lost[:10])
@@ -1331,6 +1400,11 @@ def _write_pdf_runs(pdf, runs, spacing=None, default_style='', default_color=(0,
                     pdf.set_text_color(*(default_color if emphasis == default_style else (0, 0, 0)))
                 if url is not None:
                     pdf.set_text_color(0, 90, 180)
+                # The author's own colour wins over code, link and style.
+                rgb = _hex_rgb(run_data.get('color'))
+                if rgb:
+                    pdf.set_text_color(*rgb)
+                if url is not None:
                     paragraph.write(run_data['text'], link=url)
                 else:
                     paragraph.write(run_data['text'])

@@ -78,6 +78,76 @@ pub(crate) fn empty_row(cells: usize) -> String {
     format!("|{}", "  |".repeat(cells.max(1)))
 }
 
+/// Wrap one cell's display `text` into lines (T3). `base` is the text's
+/// offset in the row's display text, so the ranges returned are row ranges.
+/// `break_at(rest)` says where `rest` stops fitting the column: `None` when
+/// all of it fits, else the byte where the first character that does not fit
+/// starts. A line ends after the last space before that (a word is never cut
+/// unless it alone is wider than the column) and always holds a character,
+/// so wrapping ends. An empty cell is one empty line.
+pub(crate) fn wrap_cell(
+    text: &str,
+    base: usize,
+    mut break_at: impl FnMut(&str) -> Option<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let rest = &text[start..];
+        let first = rest.chars().next().map_or(1, char::len_utf8);
+        let cut = match break_at(rest) {
+            Some(at) if rest.len() > first => {
+                let mut at = at.min(rest.len());
+                while !rest.is_char_boundary(at) {
+                    at -= 1;
+                }
+                let cut = match at {
+                    0 => first,
+                    _ => rest[..at].rfind(' ').map_or(at, |space| space + 1),
+                };
+                cut.max(first)
+            }
+            _ => rest.len(),
+        };
+        lines.push(base + start..base + start + cut);
+        start += cut;
+    }
+    if lines.is_empty() {
+        lines.push(base..base);
+    }
+    lines
+}
+
+/// The visual row (index into `rows`) that shows display byte `disp` of
+/// logical line `line_idx`. `rows` gives each row's line, its first display
+/// byte, and, for a table row, the pieces of cells it shows (T3). A text row
+/// is the last one starting at or before `disp`; a table row is the last one
+/// with a piece containing `disp` (a wrap point belongs to the later line,
+/// as in text), else the line's first row (a separator byte).
+pub(crate) fn visual_row_of<'a>(
+    rows: impl Iterator<Item = (usize, usize, &'a [std::ops::Range<usize>])>,
+    line_idx: usize,
+    disp: usize,
+) -> usize {
+    let mut first = None;
+    let mut found = None;
+    for (ri, (line, disp_start, pieces)) in rows.enumerate() {
+        if line != line_idx {
+            continue;
+        }
+        first.get_or_insert(ri);
+        let here = if pieces.is_empty() {
+            disp >= disp_start
+        } else {
+            pieces.iter().any(|p| p.start <= disp && disp <= p.end)
+        };
+        if here {
+            found = Some(ri);
+        }
+    }
+    found.or(first).unwrap_or(0)
+}
+
 /// Shown between two cells of a row's display text (never drawn): it
 /// gives every cell, even an empty one, its own caret positions.
 pub(crate) const CELL_SEPARATOR: &str = "\u{1f}";
@@ -580,7 +650,117 @@ pub(crate) fn escape_cell_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cell_at, cell_ranges, empty_row};
+    use super::{cell_at, cell_ranges, empty_row, visual_row_of, wrap_cell};
+
+    #[test]
+    fn the_caret_is_on_the_visual_line_that_shows_its_cell_text() {
+        // One table row (line 3) wrapped into three visual lines over two
+        // cells: cell A = bytes 0..9 in lines 0 and 1, cell B = 10..30 in
+        // lines 0, 1 and 2. A text line (line 4) follows.
+        let a: Vec<std::ops::Range<usize>> = vec![0..5, 5..9];
+        let b: Vec<std::ops::Range<usize>> = vec![10..16, 16..23, 23..30];
+        let line0 = vec![a[0].clone(), b[0].clone()];
+        let line1 = vec![a[1].clone(), b[1].clone()];
+        let line2 = vec![b[2].clone()];
+        let rows = [
+            (3, 0, line0.as_slice()),
+            (3, 0, line1.as_slice()),
+            (3, 0, line2.as_slice()),
+            (4, 0, &[][..]),
+        ];
+        let at = |disp| visual_row_of(rows.iter().copied(), 3, disp);
+        assert_eq!(at(2), 0, "inside A's first line");
+        assert_eq!(at(7), 1, "inside A's second line");
+        assert_eq!(at(9), 1, "the end of A, where it stopped");
+        assert_eq!(at(12), 0, "inside B's first line");
+        assert_eq!(at(20), 1);
+        assert_eq!(at(28), 2, "B's third line, which A has no piece in");
+        assert_eq!(at(30), 2, "the end of B");
+        // A wrap point belongs to the later line, as for text.
+        assert_eq!(at(5), 1);
+        assert_eq!(at(16), 1);
+        // A byte no piece shows (past the cells) falls back to the first line.
+        assert_eq!(at(31), 0);
+        // Other lines still pick the last row starting at or before it.
+        assert_eq!(visual_row_of(rows.iter().copied(), 4, 5), 3);
+    }
+
+    /// Every character is 10 wide; a column holds `chars` characters.
+    fn wrapped(text: &str, base: usize, chars: usize) -> Vec<std::ops::Range<usize>> {
+        wrap_cell(text, base, |rest| {
+            let mut width = 0;
+            for (i, _) in rest.char_indices() {
+                width += 10;
+                if width > chars * 10 {
+                    return Some(i);
+                }
+            }
+            None
+        })
+    }
+
+    fn lines<'a>(text: &'a str, ranges: &[std::ops::Range<usize>], base: usize) -> Vec<&'a str> {
+        ranges
+            .iter()
+            .map(|r| &text[r.start - base..r.end - base])
+            .collect()
+    }
+
+    #[test]
+    fn a_long_cell_wraps_at_spaces_and_covers_every_byte() {
+        let text = "Decoded payload, the loaded implant, keys";
+        let ranges = wrapped(text, 0, 14);
+        assert_eq!(
+            lines(text, &ranges, 0),
+            ["Decoded ", "payload, the ", "loaded ", "implant, keys"]
+        );
+        // The lines are contiguous and end where the text ends.
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
+        assert_eq!(ranges.last().unwrap().end, text.len());
+    }
+
+    #[test]
+    fn ranges_are_offsets_in_the_row_not_the_cell() {
+        let ranges = wrapped("aaa bbb", 40, 4);
+        assert_eq!(ranges, vec![40..44, 44..47]);
+    }
+
+    #[test]
+    fn short_empty_and_unbreakable_cells() {
+        assert_eq!(wrapped("fits", 0, 10), vec![0..4]);
+        // An empty cell is one empty line, so it still has a place to click.
+        assert_eq!(wrapped("", 7, 10), vec![7..7]);
+        // A word wider than the column is cut, not looped on.
+        let ranges = wrapped("abcdefghij", 0, 4);
+        assert_eq!(lines("abcdefghij", &ranges, 0), ["abcd", "efgh", "ij"]);
+        // A column narrower than one character still moves forward.
+        let ranges = wrap_cell("abc", 0, |_| Some(0));
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn wrapping_never_splits_a_character() {
+        let text = "नमस्ते दुनिया café 😀😀😀";
+        for chars in 1..12 {
+            let ranges = wrapped(text, 0, chars);
+            assert_eq!(ranges.first().unwrap().start, 0);
+            assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
+            assert_eq!(ranges.last().unwrap().end, text.len());
+            for r in &ranges {
+                assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end));
+                assert!(r.end > r.start, "a line holds a character");
+            }
+        }
+    }
+
+    #[test]
+    fn a_break_index_inside_a_character_is_snapped_back() {
+        // The measure may point into the middle of a multibyte character.
+        let ranges = wrap_cell("é é é", 0, |rest| (rest.len() > 3).then_some(1));
+        assert!(ranges.iter().all(|r| "é é é".is_char_boundary(r.start)));
+        assert_eq!(ranges.last().unwrap().end, "é é é".len());
+    }
 
     fn texts(line: &str) -> Vec<&str> {
         cell_ranges(line).into_iter().map(|r| &line[r]).collect()

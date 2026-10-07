@@ -32,7 +32,7 @@ pub(crate) enum MenuEntry {
 
 /// Hover tooltip for toolbar buttons: a small dark chip with the action's
 /// name (and honest notes on controls that are present but not wired yet).
-struct ToolbarTip(&'static str);
+pub(crate) struct ToolbarTip(pub(crate) &'static str);
 
 impl Render for ToolbarTip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -1482,6 +1482,12 @@ impl SylphApp {
                 ),
             );
         }
+
+        // Text colour and highlight: palettes, on the selection or the
+        // text typed next.
+        emphasis = emphasis
+            .child(self.paint_button(crate::colour_controls::Paint::Text, cx))
+            .child(self.paint_button(crate::colour_controls::Paint::Highlight, cx));
 
         let mut align = div().flex().items_center().gap(px(2.0));
         let current_align = self.caret_para_format(cx).align.unwrap_or_default();

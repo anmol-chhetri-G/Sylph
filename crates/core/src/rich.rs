@@ -411,6 +411,8 @@ fn export_run(text: String, format: &CharFormat) -> TextRun {
         format: CharFormat {
             size: format.size,
             font: format.font.clone(),
+            color: format.color.clone(),
+            highlight: format.highlight.clone(),
             ..Default::default()
         },
     }
@@ -424,6 +426,8 @@ fn run_format(run: &TextRun) -> CharFormat {
     CharFormat {
         size: run.format.size,
         font: run.format.font.clone(),
+        color: run.format.color.clone(),
+        highlight: run.format.highlight.clone(),
         bold: set(
             run.format.bold,
             has(SpanStyle::Bold) || has(SpanStyle::BoldItalic),
@@ -578,6 +582,8 @@ mod tests {
         let mut sized = TextRun::plain("big");
         sized.format.size = Some(20.0);
         sized.format.font = Some("Lora".into());
+        sized.format.color = Some("#c0392b".into());
+        sized.format.highlight = Some("#ffff00".into());
         let mut figure = ImageData::new("figs/plot.png");
         figure.alt_text = "A plot".into();
         figure.caption = Some("Figure 1".into());

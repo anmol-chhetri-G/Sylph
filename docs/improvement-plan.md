@@ -49,6 +49,10 @@ editing.
 | B2 redraws during drawing | done | the caret-follow scroll and a page-count change now ask for the next frame (`redraw::next_frame`; `window.refresh()` is a no-op while GPUI draws, so the sheets, editor height and scroll lagged one input event); a test keeps `window.refresh()` out of the app; `SYLPH_TRACE_FRAMES=1` prints toggles and paints with their revision |
 | Window fails on Intel + NVIDIA Wayland | done | NVIDIA's Vulkan driver fails `vkCreateWaylandSurfaceKHR` (ERROR_OUT_OF_HOST_MEMORY) and the loader asks every driver, so the app panicked; it now exits with a message naming the fix (`VK_LOADER_DRIVERS_DISABLE='*nvidia*'`), tested; `doctor.sh` notes the case. Whether to retry without NVIDIA automatically is the author's call |
 | Dev environment (Debian, 2026-10-06) | done | `scripts/doctor.sh` (toolchain, native libraries, `.venv` version and permissions) runs as verify's first stage; bridge path tests no longer depend on the umask (Debian's 002 made them fail); `.venv` must be built with `umask 022` |
+| F1 font colour and highlight | done (needs VR) | `A▾` and `▰▾` in the format bar: palette (Automatic / None, Docs' 40 swatches, custom hex), on the selection or, with only a caret, on the text typed next; stored as `CharFormat::color` / `highlight` ("#rrggbb"), so they follow edits, undo and "Clear formatting". Canvas paints them; DOCX writes `w:color`, Word's own highlight when the colour is one of its 16 and exact `w:shd` otherwise; PDF writes the text colour. **PDF highlight is not drawn**: spike on fpdf2 2.8.8 found its text flow paints no per-run background (underline/strikethrough are drawn after the text, but there is no fill hook short of patching its private `_render_styled_text_line`), so the PDF export says "Warning: highlight is not drawn in PDF (use DOCX)"; the Markdown export has no colour. One colour table (`sylph_core::colors`): the canvas now draws inline code red and links blue as the PDF does, and headings and code blocks in the page's text colour (black on the light page, as exported) instead of blue/green. Open: a heading *style* colour property (comes with F4's style properties) |
+| Highlight painted on the canvas (F1 fix) | done (needs VR) | GPUI's `ShapedLine::paint` draws glyphs only; a run's background needs `paint_background`, which `RowText::paint` never called, so highlight did not show (the F1 test only checked the run's fields). It now paints every segment's background before any text. No automated test (needs a window) |
+| Table click lands in the clicked cell | done | `DisplayLine::src_to_disp` put a caret at a cell's first byte (a click left of its text, or any empty cell) at the end of the cell before it, so only the first cell could be clicked. It now follows `disp_to_src`: the caret at the end of hidden or replaced syntax belongs to the text after it. Same fix puts the caret after a list bullet in an empty item. Tests fail without it |
+| T3 table cells wrap | done (needs VR) | a table row wraps each cell to its column and is as tall as its tallest cell: one visual line per wrapped line, every cell with a segment on every line (so clicks map to the right cell), caret row found by the pieces a line shows (`table_view::visual_row_of`), only the first/last line draws the top/bottom border. Pure `wrap_cell` and `visual_row_of` have tests; the layout itself needs a window. Known: a selection across wrapped lines is painted across the whole row until T1 redoes selection; Up/Down still move by logical line; a wrapped row may split across pages |
 | everything else | open | |
 
 ## Next up (one queue; update when a task lands)
@@ -62,7 +66,7 @@ author's word.
 | # | Card | State | Gate |
 | --- | --- | --- | --- |
 | 1 | B2: redraw on the next frame instead of `window.refresh()` in prepaint; `SYLPH_TRACE_FRAMES=1` | done (needs VR) | VR: bold that reflows onto a new page draws on the right sheet at once |
-| 2 | F1: font colour and highlight (canvas, PDF, DOCX); one colour table for headings and code | open | VR: colour survives save, reopen and both exports |
+| 2 | F1: font colour and highlight (canvas, PDF, DOCX); one colour table for headings and code | done (needs VR; PDF highlight is a warning, see status) | VR: colour survives save, reopen and both exports |
 | 3 | R3: canvas draws rich documents (paragraph kinds, computed bullets and numbers) | open | rich documents only exist in tests until R7, so tests build them with `rich_doc::to_rich` |
 | 4 | R4: Enter / Tab / Backspace by paragraph kind; Markdown typing shortcuts | open | |
 | 5 | R5 with T1–T6: tables as rows of cells with properties | open | |
@@ -86,6 +90,22 @@ Decisions waiting for the author (found in the 2026-10-06 review):
 - **Phase 2's block kernel.** Phase 2 (and 4.7, 4.10) describe a
   `Vec<Block>` model; the rich-text decision keeps one text plus ranges.
   Either mark Phase 2 superseded by R1–R7 or say which parts still stand.
+
+### Requested 2026-10-07 (after F1 review; order waiting for the author)
+
+Found while trying F1: a pasted Markdown table of five long columns (the
+author's incident-response ranking table) cannot be clicked or edited cell by
+cell, because the canvas clips long cell text (T3) and has no cell selection.
+
+| Card | What | Notes |
+| --- | --- | --- |
+| T3 | **Cell text wraps; rows grow to the tallest cell** (**done, needs VR**; see the status table) | the canvas lays a table row out as one line and clips; the PDF and DOCX wrap. Wrapped rows are several `PrepRow`s of one logical line: caret row, Up/Down, selection painting and borders must know that |
+| T1 | **Cell selection like Docs / Word**: drag across cells selects a rectangle (tinted), Shift+arrows / Shift+click extend, Delete clears them, B/I/U / colour / size apply to every selected cell | as T1 below |
+| E1a | **Paste tables**: Markdown table text (works as text today, becomes a grid when Markdown is on); a rectangle copied out of a table pastes as a table; Word / Docs HTML tables need research (GPUI clipboard has text and JSON metadata, no HTML read) | pasting a table into a table fills cells from the caret cell |
+| FS | **Format sets**: name and save a whole set of styles (Normal and Heading 1–6: font, size, line spacing, space before/after, colour, bold), keep several ("College", "Office") and apply one to a document | needs style properties: colour and bold on styles (F4); stored per user, not per document, so it touches storage: schema change needs the author's go-ahead (AGENTS rule 5 applies to saved documents, not to a new table, but say so) |
+| D1 | **Dark mode tweak**: the dark theme is too dark; adjust the palette (surfaces, borders, page) | VR only; list the colours in `ui.rs` `dark_mode` branches first |
+| G1 | **Margin lines off by default**, with a View toggle to show them | today the page's margin guides are always drawn; the setting is saved |
+| H1 | **Header and footer editing**: click the top / bottom margin of a page to edit; left / centre / right text; page number field | roadmap M3 (model, canvas, PDF `header()` / `footer()`, DOCX section header/footer); the PDF has only "Page n/N" today |
 
 ### Working on a card
 

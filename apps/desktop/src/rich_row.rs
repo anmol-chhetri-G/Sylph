@@ -260,25 +260,33 @@ impl RowText {
             .map(|s| s.shaped.descent)
             .fold(px(0.0), |a, b| a.max(b));
         let baseline = (line_height - ascent - descent) / 2.0 + ascent;
-        for seg in &self.segments {
-            let own =
-                (line_height - seg.shaped.ascent - seg.shaped.descent) / 2.0 + seg.shaped.ascent;
-            let at = point(origin.x + seg.x, origin.y + baseline - own);
-            match seg.cell {
-                // A table cell's text never spills into its neighbour.
-                Some((left, right)) => {
-                    let mask = gpui::ContentMask {
-                        bounds: gpui::Bounds::from_corners(
-                            point(origin.x + left, origin.y),
-                            point(origin.x + right, origin.y + line_height),
-                        ),
+        // Backgrounds (highlight) first, then every segment's text: GPUI's
+        // `ShapedLine::paint` draws glyphs only, so a run's background is a
+        // separate call.
+        for background in [true, false] {
+            for seg in &self.segments {
+                let own = (line_height - seg.shaped.ascent - seg.shaped.descent) / 2.0
+                    + seg.shaped.ascent;
+                let at = point(origin.x + seg.x, origin.y + baseline - own);
+                let draw = |window: &mut Window, cx: &mut App| {
+                    let _ = if background {
+                        seg.shaped.paint_background(at, line_height, window, cx)
+                    } else {
+                        seg.shaped.paint(at, line_height, window, cx)
                     };
-                    window.with_content_mask(Some(mask), |window| {
-                        let _ = seg.shaped.paint(at, line_height, window, cx);
-                    });
-                }
-                None => {
-                    let _ = seg.shaped.paint(at, line_height, window, cx);
+                };
+                match seg.cell {
+                    // A table cell's text never spills into its neighbour.
+                    Some((left, right)) => {
+                        let mask = gpui::ContentMask {
+                            bounds: gpui::Bounds::from_corners(
+                                point(origin.x + left, origin.y),
+                                point(origin.x + right, origin.y + line_height),
+                            ),
+                        };
+                        window.with_content_mask(Some(mask), |window| draw(window, cx));
+                    }
+                    None => draw(window, cx),
                 }
             }
         }
@@ -389,7 +397,24 @@ fn slice_formats(
 
 /// Bold / italic / underline / strikethrough from character formatting on
 /// a run; `Some(false)` turns off what the style or Markdown gave it.
+/// The canvas colour of a colour-table entry.
+pub(crate) fn hsla_of_rgb([r, g, b]: sylph_core::colors::Rgb) -> gpui::Hsla {
+    gpui::rgb(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)).into()
+}
+
+/// The canvas colour of a stored "#rrggbb" (`None` when it is not one).
+pub(crate) fn hsla_of_hex(hex: &str) -> Option<gpui::Hsla> {
+    sylph_core::colors::parse_hex(hex).map(hsla_of_rgb)
+}
+
 fn apply_emphasis(run: &mut TextRun, format: &CharFormat) {
+    // Colour first: underline and strikethrough follow the text's colour.
+    if let Some(color) = format.color.as_deref().and_then(hsla_of_hex) {
+        run.color = color;
+    }
+    if let Some(color) = format.highlight.as_deref().and_then(hsla_of_hex) {
+        run.background_color = Some(color);
+    }
     match format.bold {
         Some(true) => run.font.weight = gpui::FontWeight::BOLD,
         Some(false) => run.font.weight = gpui::FontWeight::NORMAL,
@@ -420,5 +445,92 @@ fn apply_emphasis(run: &mut TextRun, format: &CharFormat) {
         }
         Some(false) => run.strikethrough = None,
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_emphasis, hsla_of_hex};
+    use gpui::{hsla, px, TextRun};
+    use sylph_core::format::CharFormat;
+
+    fn run() -> TextRun {
+        TextRun {
+            len: 3,
+            font: gpui::font("Lora"),
+            color: hsla(0.0, 0.0, 0.2, 1.0),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    }
+
+    /// A table row of three cells at columns 0–100, 100–200, 200–300, each
+    /// holding two bytes of text plus the separator byte between cells (so
+    /// the cells start at display bytes 0, 3 and 6). The shaped lines are
+    /// empty: only which cell a click picks is tested.
+    fn table_row() -> super::RowText {
+        let seg = |start: usize, left: f32| super::Segment {
+            start,
+            x: px(left + 6.0),
+            shaped: gpui::ShapedLine::default(),
+            cell: Some((px(left), px(left + 100.0))),
+        };
+        super::RowText {
+            segments: vec![seg(0, 0.0), seg(3, 100.0), seg(6, 200.0)],
+        }
+    }
+
+    #[test]
+    fn a_click_in_a_table_cell_picks_that_cell() {
+        let row = table_row();
+        // Anywhere inside a column (even past its text) is that cell.
+        assert_eq!(row.closest_index_for_x(px(50.0)), 0);
+        assert_eq!(row.closest_index_for_x(px(150.0)), 3);
+        assert_eq!(row.closest_index_for_x(px(299.0)), 6);
+        // Right of the table: the last cell, never a panic.
+        assert_eq!(row.closest_index_for_x(px(500.0)), 6);
+        // And the caret of a byte in cell 2 is drawn in cell 2.
+        assert!(row.x_for_index(4) >= px(100.0));
+        assert!(row.x_for_index(7) >= px(200.0));
+    }
+
+    #[test]
+    fn hex_becomes_a_canvas_colour_and_junk_does_not() {
+        let red: gpui::Rgba = hsla_of_hex("#ff0000").unwrap().into();
+        assert_eq!((red.r, red.g, red.b, red.a), (1.0, 0.0, 0.0, 1.0));
+        assert!(hsla_of_hex("red").is_none());
+        assert!(hsla_of_hex("#12345").is_none());
+    }
+
+    #[test]
+    fn colour_and_highlight_paint_the_run() {
+        let mut r = run();
+        let format = CharFormat {
+            color: Some("#00ff00".into()),
+            highlight: Some("#ffff00".into()),
+            underline: Some(true),
+            ..Default::default()
+        };
+        apply_emphasis(&mut r, &format);
+        assert_eq!(r.color, hsla_of_hex("#00ff00").unwrap());
+        assert_eq!(r.background_color, hsla_of_hex("#ffff00"));
+        // The underline takes the new colour, not the old one.
+        assert_eq!(r.underline.unwrap().color, Some(r.color));
+    }
+
+    #[test]
+    fn no_colour_keeps_the_style_colour_and_a_bad_one_is_ignored() {
+        let mut r = run();
+        let before = r.color;
+        apply_emphasis(&mut r, &CharFormat::default());
+        assert_eq!((r.color, r.background_color), (before, None));
+        let bad = CharFormat {
+            color: Some("nope".into()),
+            highlight: Some("#zzz".into()),
+            ..Default::default()
+        };
+        apply_emphasis(&mut r, &bad);
+        assert_eq!((r.color, r.background_color), (before, None));
     }
 }

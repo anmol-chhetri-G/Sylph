@@ -11,7 +11,7 @@ flowchart LR
   subgraph desktop["apps/desktop (GPUI app)"]
     main["main.rs: TextInput editor, SylphApp, Markdown parse/display, export model, main()"]
     ui["ui.rs: the window's views (menus, toolbar, canvas, inspector, dialogs)"]
-    mods["modules: rich_row, emphasis, style_controls, table_view, pagination, char_export, md_edit, fonts, …"]
+    mods["modules: rich_row, colour_controls, emphasis, style_controls, table_view, pagination, char_export, md_edit, fonts, …"]
   end
   core["crates/core: Document model, FormatSpans / ParagraphSpans, text helpers"]
   storage["crates/storage: SQLite (text rows + model JSON)"]
@@ -74,6 +74,12 @@ Spans<F>  (FormatSpans = Spans<CharFormat>, ParagraphSpans = Spans<ParaFormat>)
 
 paragraph_range(text, a, b)  → first line start .. last line end + its "\n" (so Enter carries paragraph format)
 ```
+
+`crates/core/src/colors.rs` — the one colour table: `CODE_TEXT` / `LINK_TEXT` (canvas = PDF; a test keeps
+`export.py` in step), the Docs palette (`PALETTE`, 10 columns), `parse_hex` / `to_hex` / `normalize_hex`.
+Colours are stored as "#rrggbb" in `CharFormat`; export runs carry them as `"color"` / `"highlight"` beside
+`"size"` / `"font"`; DOCX writes `w:color` and `w:highlight` (Word's 16) or exact `w:shd`; the PDF writes text
+colour only (fpdf2's text flow paints no background; the export reports a warning).
 
 `crates/core/src/rich.rs` — the rich-text model (plan cards R1–R7; documents with `rich = true`):
 
@@ -194,6 +200,8 @@ Module by module:
 ```text
 style_controls.rs  Style / Font / Size / Spacing pickers. Selection → character format;
                    caret only → the caret's style (or "This paragraph" for spacing). Alignment.
+colour_controls.rs  text-colour and highlight palettes (format bar `A▾`, `▰▾`), pending colour at a caret,
+                   custom-hex box (its own key handler); colour is `CharFormat::color` / `highlight`
 emphasis.rs        TextView (text + formats + display lines) decides B/I/U/S toggles (§6)
 table_view.rs      cells of a pipe table line, display_row, Tab between cells, column widths in
                    the |----|--| dashes, ColumnDrag (resize), TableCommand (insert/delete rows/cols)

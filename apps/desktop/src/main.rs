@@ -21,6 +21,7 @@ use sylph_core::{
 use sylph_storage::Storage;
 
 mod char_export;
+mod colour_controls;
 mod emphasis;
 mod pagination;
 mod redraw;
@@ -162,6 +163,8 @@ struct TextInput {
     /// B / I / U / S chosen with only a caret, for the text typed next
     /// (cleared when the caret moves), as in Word.
     pending_emphasis: Vec<(sylph_core::format::Emphasis, bool)>,
+    /// Text colour / highlight chosen with only a caret, likewise.
+    pending_paint: colour_controls::PendingPaint,
     /// The word a double-click selected, while its drag extends the
     /// selection by whole words (Word).
     word_drag: Option<Range<usize>>,
@@ -194,6 +197,7 @@ impl TextInput {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = snap_to_char_boundary(&self.content, offset.min(self.content.len()));
         self.pending_emphasis.clear();
+        self.pending_paint.clear();
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         self.preferred_column = None;
@@ -204,6 +208,7 @@ impl TextInput {
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = snap_to_char_boundary(&self.content, offset.min(self.content.len()));
         self.pending_emphasis.clear();
+        self.pending_paint.clear();
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -1292,6 +1297,7 @@ impl TextInput {
         self.apply_edit(start, end, new_text, cx);
         // Bold / italic chosen with only a caret apply to typed text.
         self.apply_pending_emphasis(start..start + new_text.len());
+        self.apply_pending_paint(start..start + new_text.len());
         self.redo_stack.clear();
         let now = std::time::Instant::now();
         // Typing and runs of Backspace/Delete join the previous step, so
@@ -1619,6 +1625,11 @@ struct PrepRow {
     /// Draw the row as a table row: its cells' borders (and a header's
     /// shading) around the box.
     table: Option<TableRowGeom>,
+    /// A table row's visual lines each show one piece of every cell: the
+    /// display ranges this one shows (a cell with fewer lines has none
+    /// here). Empty for other rows. Caret and selection find their row by
+    /// these, as a table row's own `disp_start` is 0.
+    pieces: Vec<Range<usize>>,
 }
 
 /// A table row's grid on the canvas.
@@ -1629,6 +1640,10 @@ struct TableRowGeom {
     header: bool,
     /// Display line index of the table's header row.
     header_line: usize,
+    /// First and last visual line of the table row: only they draw its
+    /// top and bottom borders (a wrapped row is one box).
+    top: bool,
+    bottom: bool,
 }
 
 /// Padding inside a table cell, in px: above/below the text, and left.
@@ -1860,6 +1875,16 @@ impl Element for TextElement {
             // Wrap the *display* text (Markdown ON wraps rendered text,
             // not source), recording each row's display range.
             let mut ranges: Vec<(usize, usize)> = Vec::new();
+            // A table row's columns, and each cell's wrapped lines.
+            let table_edges: Vec<gpui::Pixels> = {
+                let mut edges = vec![px(0.0)];
+                for fraction in &table_fractions {
+                    let last = *edges.last().unwrap_or(&px(0.0));
+                    edges.push(last + available_width * *fraction);
+                }
+                edges
+            };
+            let mut cell_lines: Option<Vec<Vec<Range<usize>>>> = None;
             // A list item's wrapped lines hang under its text, not under
             // its bullet (Word's hanging indent).
             let hang = if dl.kind == DisplayKind::List {
@@ -1938,6 +1963,53 @@ impl Element for TextElement {
                         d0 = dl.text.len();
                     }
                 }
+            } else if dl.table && !dl.table_rule && word_wrap && available_width > px(0.0) {
+                // A table row wraps each cell to its column and is as many
+                // visual lines tall as its tallest cell (T3). Every visual
+                // line shows one piece of every cell.
+                let lines_of_cells: Vec<Vec<Range<usize>>> = dl
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .map(|(k, cell)| {
+                        let width = match (table_edges.get(k), table_edges.get(k + 1)) {
+                            (Some(&left), Some(&right)) => right - left,
+                            _ => px(0.0),
+                        };
+                        let limit = width - px(2.0 * TABLE_CELL_PAD_X);
+                        // A column with no room (cells past the header's
+                        // columns) is not wrapped.
+                        if limit < px(8.0) {
+                            return vec![cell.clone()];
+                        }
+                        table_view::wrap_cell(&dl.text[cell.clone()], cell.start, |rest| {
+                            let from = cell.end - rest.len();
+                            let measured = RowText::shape(
+                                window,
+                                rest,
+                                &[TextRun {
+                                    len: rest.len(),
+                                    font: font.clone(),
+                                    color: text_color,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }],
+                                row_font_size,
+                                &line_formats(dl, from..cell.end, &char_formats),
+                            );
+                            (measured.width() > limit).then(|| measured.closest_index_for_x(limit))
+                        })
+                    })
+                    .collect();
+                let height = lines_of_cells
+                    .iter()
+                    .map(Vec::len)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                ranges = vec![(0, dl.text.len()); height];
+                cell_lines = Some(lines_of_cells);
             } else {
                 ranges.push((0, dl.text.len()));
             }
@@ -1959,24 +2031,31 @@ impl Element for TextElement {
                 let row_formats = line_formats(dl, d0..d1, &char_formats);
                 // Justify spreads every row but a paragraph's last.
                 let justify = align == Alignment::Justify && r + 1 < row_count;
-                let mut boundaries = vec![px(0.0)];
-                for fraction in &table_fractions {
-                    let last = *boundaries.last().unwrap_or(&px(0.0));
-                    boundaries.push(last + available_width * *fraction);
-                }
+                let boundaries = table_edges.clone();
                 let shaped = if dl.table && !dl.table_rule {
                     let end = *boundaries.last().unwrap_or(&px(0.0));
                     let cells: Vec<(Range<usize>, gpui::Pixels, gpui::Pixels)> = dl
                         .cells
                         .iter()
                         .enumerate()
-                        .map(
-                            |(k, range)| match (boundaries.get(k), boundaries.get(k + 1)) {
-                                (Some(&left), Some(&right)) => (range.clone(), left, right - left),
+                        .map(|(k, range)| {
+                            // This visual line's piece of the cell; a cell
+                            // with fewer lines keeps an empty place at its
+                            // end, so a click there still lands in it.
+                            let piece = match &cell_lines {
+                                Some(all) => all
+                                    .get(k)
+                                    .and_then(|lines| lines.get(r))
+                                    .cloned()
+                                    .unwrap_or(range.end..range.end),
+                                None => range.clone(),
+                            };
+                            match (boundaries.get(k), boundaries.get(k + 1)) {
+                                (Some(&left), Some(&right)) => (piece, left, right - left),
                                 // Cells past the header's columns: no room.
-                                _ => (range.clone(), end, px(0.0)),
-                            },
-                        )
+                                _ => (piece, end, px(0.0)),
+                            }
+                        })
                         .collect();
                     RowText::shape_cells(
                         window,
@@ -2065,7 +2144,14 @@ impl Element for TextElement {
                         boundaries: boundaries.clone(),
                         header: dl.table_header,
                         header_line: table_header_line,
+                        top: r == 0,
+                        bottom: r + 1 == row_count,
                     }),
+                    pieces: match (&cell_lines, dl.table && !dl.table_rule) {
+                        (Some(all), _) => all.iter().filter_map(|l| l.get(r).cloned()).collect(),
+                        (None, true) => dl.cells.clone(),
+                        (None, false) => Vec::new(),
+                    },
                 });
             }
             // A page-break line ends its page: what follows starts the next.
@@ -2096,16 +2182,12 @@ impl Element for TextElement {
             dl.src_to_disp(offset.saturating_sub(dl.src_offset))
         };
         let row_of = |line_idx: usize, disp: usize| -> usize {
-            let mut found = rows
-                .iter()
-                .position(|r| r.line_idx == line_idx)
-                .unwrap_or(0);
-            for (ri, r) in rows.iter().enumerate() {
-                if r.line_idx == line_idx && disp >= r.disp_start {
-                    found = ri;
-                }
-            }
-            found
+            table_view::visual_row_of(
+                rows.iter()
+                    .map(|r| (r.line_idx, r.disp_start, r.pieces.as_slice())),
+                line_idx,
+                disp,
+            )
         };
         let x_of = |ri: usize, disp: usize| -> gpui::Pixels {
             let r = &rows[ri];
@@ -2363,8 +2445,13 @@ impl Element for TextElement {
                         line,
                     ));
                 }
-                for y in [top, top + row.box_height] {
-                    window.paint_quad(fill(Bounds::new(point(left, y), size(width, edge)), line));
+                // A wrapped table row is one box: only its first line draws
+                // the top border and its last the bottom one.
+                for (draw, y) in [(table.top, top), (table.bottom, top + row.box_height)] {
+                    if draw {
+                        window
+                            .paint_quad(fill(Bounds::new(point(left, y), size(width, edge)), line));
+                    }
                 }
             }
             if let Some(color) = row.rule_color {
@@ -2580,6 +2667,8 @@ struct SylphApp {
     palette: PaletteState,
     /// The open format-bar dropdown (Style, Font, Line spacing).
     open_picker: Option<Picker>,
+    /// The colour palettes' custom-hex box.
+    colour_ui: colour_controls::ColourUi,
     /// What the Spacing dropdown changes (this paragraph or the style).
     spacing_scope: style_controls::SpacingScope,
     /// Pages the export produces, keyed by (text revision, Markdown mode,
@@ -5206,13 +5295,26 @@ impl DisplayLine {
     /// a hidden marker clamp to the marker's display start, so a caret in
     /// `# ` sits at the visible text start instead of a phantom position.
     fn src_to_disp(&self, src: usize) -> usize {
-        for seg in &self.segments {
+        for (i, seg) in self.segments.iter().enumerate() {
             if src <= seg.src_end {
-                return if seg.identity {
-                    seg.disp_start + (src - seg.src_start).min(seg.disp_end - seg.disp_start)
-                } else {
-                    seg.disp_start
-                };
+                if seg.identity {
+                    return seg.disp_start
+                        + (src - seg.src_start).min(seg.disp_end - seg.disp_start);
+                }
+                // At the end of hidden or replaced syntax the caret belongs
+                // to the text after it, as `disp_to_src` places it: the
+                // first character of a table cell is in that cell, not at
+                // the end of the cell before (the separator is replaced
+                // syntax), and the start of a list item is after its bullet.
+                if src == seg.src_end {
+                    return match self.segments.get(i + 1) {
+                        Some(next) if next.identity && next.src_start == src => next.disp_start,
+                        // More syntax follows (the next separator of an empty
+                        // cell) or nothing does (an empty item): after this.
+                        _ => seg.disp_end,
+                    };
+                }
+                return seg.disp_start;
             }
         }
         self.text.len()
@@ -5599,21 +5701,23 @@ fn display_runs(
     font: gpui::Font,
     base: gpui::Hsla,
 ) -> Vec<TextRun> {
-    let color_code = hsla(120.0 / 360.0, 0.5, 0.35, 1.0);
-    let color_link = hsla(210.0 / 360.0, 0.8, 0.45, 1.0);
+    // The colour table (`sylph_core::colors`): exports draw inline code
+    // red and links blue, headings and code blocks in the text colour.
+    let color_code = rich_row::hsla_of_rgb(sylph_core::colors::CODE_TEXT);
+    let color_link = rich_row::hsla_of_rgb(sylph_core::colors::LINK_TEXT);
     let (font, base) = match dl.kind {
         DisplayKind::Rule | DisplayKind::Fence | DisplayKind::PageBreak => return Vec::new(),
         DisplayKind::Code => {
             return vec![TextRun {
                 len: range.len(),
                 font,
-                color: color_code,
+                color: base,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             }]
         }
-        DisplayKind::Heading => (font.bold(), hsla(210.0 / 360.0, 0.8, 0.4, 1.0)),
+        DisplayKind::Heading => (font.bold(), base),
         DisplayKind::Quote => (font.italic(), hsla(0.0, 0.0, 0.5, 1.0)),
         DisplayKind::List | DisplayKind::Paragraph => (font, base),
     };
@@ -6555,6 +6659,7 @@ fn main() {
                         formats: initial_formats,
                         para_formats: initial_paras,
                         pending_emphasis: Vec::new(),
+                        pending_paint: Default::default(),
                         word_drag: None,
                         column_drag: None,
                         styles: document.resolved_styles(),
@@ -6570,6 +6675,7 @@ fn main() {
                              _window: &mut Window,
                              cx: &mut Context<SylphApp>| {
                                 this.on_find_keystroke(event, _window, cx);
+                                this.on_colour_keystroke(event, _window, cx);
                                 this.on_title_keystroke(event, _window, cx);
                                 this.on_ai_keystroke(event, _window, cx);
                                 this.on_palette_keystroke(event, _window, cx);
@@ -6627,6 +6733,7 @@ fn main() {
                             dark_mode: false,
                             palette: PaletteState::default(),
                             open_picker: None,
+                            colour_ui: Default::default(),
                             spacing_scope: Default::default(),
                             page_count_memo: Memo::new(),
                             caret_status_memo: Memo::new(),
@@ -7352,6 +7459,41 @@ mod markdown_wysiwyg_tests {
 
     fn off(line: &str) -> DisplayLine {
         display_line(line, false, false)
+    }
+
+    #[test]
+    fn a_caret_at_a_cells_first_character_is_drawn_in_that_cell() {
+        // Clicking left of a cell's text (or in an empty cell) puts the
+        // caret at the cell's first source byte, which used to be drawn at
+        // the end of the cell before it: only the first cell could be
+        // clicked, and the others were reached with the arrow keys.
+        let line = "| A | B |  | D |";
+        let dl = table_view::display_row(line, false, false);
+        assert_eq!(dl.text, "A\u{1f}B\u{1f}\u{1f}D");
+        let cells = dl.cells.clone();
+        assert_eq!(cells, vec![0..1, 2..3, 4..4, 5..6]);
+        for (k, cell) in cells.iter().enumerate() {
+            let src = dl.disp_to_src(cell.start);
+            assert_eq!(dl.src_to_disp(src), cell.start, "cell {k} start");
+            assert_eq!(
+                dl.src_to_disp(dl.disp_to_src(cell.end)),
+                cell.end,
+                "cell {k} end"
+            );
+        }
+        // The first source byte of "B" in particular.
+        assert_eq!(dl.src_to_disp(line.find('B').unwrap()), 2);
+    }
+
+    #[test]
+    fn a_caret_at_a_list_items_start_is_after_its_bullet() {
+        let bullet = "• ".len();
+        let dl = on("- item");
+        assert_eq!(dl.src_to_disp(2), bullet);
+        // An empty item still puts the caret after the bullet.
+        assert_eq!(on("- ").src_to_disp(2), bullet);
+        // Hidden syntax is unchanged: the heading's text starts at 0.
+        assert_eq!(on("## Title").src_to_disp(3), 0);
     }
 
     #[test]

@@ -28,6 +28,12 @@ pub struct CharFormat {
     pub underline: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strike: Option<bool>,
+    /// Text colour as "#rrggbb" (`None`: the style's, black by default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Highlight (background) colour as "#rrggbb".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<String>,
     /// Inline code (monospace), rich documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<bool>,
@@ -79,6 +85,8 @@ impl SpanFormat for CharFormat {
             && self.italic.is_none()
             && self.underline.is_none()
             && self.strike.is_none()
+            && self.color.is_none()
+            && self.highlight.is_none()
             && self.code.is_none()
             && self.link.is_none()
             && self.object.is_none()
@@ -387,6 +395,26 @@ mod tests {
             .iter()
             .map(|s| (s.start, s.end, s.format.size))
             .collect()
+    }
+
+    #[test]
+    fn colour_and_highlight_are_formatting_that_survives_json() {
+        let mut spans = FormatSpans::new();
+        spans.apply(0..4, |f| f.color = Some("#c0392b".into()));
+        spans.apply(2..6, |f| f.highlight = Some("#ffff00".into()));
+        // They are real formatting: not "empty", split and merge like size.
+        assert_eq!(spans.spans().len(), 3);
+        assert_eq!(spans.format_at(3).color.as_deref(), Some("#c0392b"));
+        assert_eq!(spans.format_at(3).highlight.as_deref(), Some("#ffff00"));
+        assert_eq!(spans.format_at(5).color, None);
+        let json = serde_json::to_string(&spans).unwrap();
+        assert_eq!(serde_json::from_str::<FormatSpans>(&json).unwrap(), spans);
+        // Resetting both makes the text plain again.
+        spans.apply(0..6, |f| {
+            f.color = None;
+            f.highlight = None;
+        });
+        assert!(spans.is_empty());
     }
 
     #[test]
